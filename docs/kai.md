@@ -74,6 +74,41 @@ The attention backend resolves to `triton` automatically on Turing. Pipe the log
 `grep --line-buffered` if you filter it; a block-buffered `grep` hides the "Scheduler is idle"
 line and makes a healthy server look stuck.
 
+## Speculative decoding with the checkpoint's MTP head (`--spec-mtp K`)
+
+Upstream FreeToken has no speculative decoding. This fork adds it for the Qwen3.5-MoE family
+using the MTP (multi-token prediction) head the checkpoints ship under `mtp.*` (one
+full-attention decoder layer plus `fc` / norms; Ornith-1.5-35B-A3B-NVFP4 carries it in bf16).
+
+```bash
+ft serve ... --max-running-req 1 --spec-mtp 3
+```
+
+How it works, per decode step:
+
+1. The head drafted `K` tokens after the previous step. The target runs one extend forward
+   over `[t_last, d_1, ..., d_K]` (K+1 rows) and samples every row as usual.
+2. Draft `d_i` is accepted while it equals the target's sample at row `i-1`; the sample after
+   the last accepted draft is the correction. So 1 to K+1 tokens are committed per step, and
+   with greedy drafts the output distribution is the target's own (`temperature 0` gives the
+   same text with and without `--spec-mtp`).
+3. The GDN recurrent / conv states are rolled back to the last accepted row (the verify pass
+   runs the per-token recurrent kernel and keeps every intermediate state); the KV rows of the
+   rejected positions are simply overwritten by the next window.
+4. The head runs over the window (its own KV slab, layer `num_layers`), then chains `K` greedy
+   drafts one token at a time through the shared `lm_head`.
+
+What it costs: one more full-attention KV layer (11 instead of 10 on Ornith), ~80 MB of bf16
+head weights, and one more expert-bank layer -- the head's 256 bf16 experts (1.6 GB in the
+checkpoint) are quantized to NVFP4 at load and appended to the offload cache (~0.43 GB of
+pinned host memory). Loading reads 1.6 GB of bf16 experts through host RAM once.
+
+Scope: single running request (`--max-running-req 1`); the verify window and the draft chain
+run eagerly (no CUDA graph yet), so on a launch-bound GPU the average tok/s may not improve
+while the per-step maximum does; modelopt MIXED_PRECISION checkpoints only (fp8 attention +
+NVFP4 experts, the Ornith / Qwen3.6-35B-A3B-NVFP4 format). The `Spec decode` line in the
+decode status shows the mean accepted length.
+
 ## Environment variables added by this fork
 
 | Variable | Default | Meaning |
@@ -83,11 +118,16 @@ line and makes a healthy server look stuck.
 | `FREETOKEN_FP8_SCRATCH_GEMM` | arch (on below Ampere) | fp8 W8A16 prefill GEMM as dequant + cuBLAS instead of the inline-dequant Triton kernel |
 | `FREETOKEN_NVFP4_MOE_SCRATCH` | arch (on below Ampere) | NVFP4 prefill MoE as chunked dequant + per-expert cuBLAS instead of the inline-dequant kernel |
 | `FREETOKEN_NVFP4_MOE_ARITH` | arch (on below Ampere) | Arithmetic (gather-free) e2m1 dequant in the prefill MoE kernel; bit-identical, speed knob only |
+| `FT_SPEC_TRACE` | `0` | Log the first n verify windows of `--spec-mtp` (input ids, drafts, samples, accepted, next drafts, top-3 logits) |
+| `FT_SPEC_PROFILE` | off | Per-phase wall time of the verify step (target forward, sample, rollback, head window, head chain), logged every 20 steps |
+| `FT_SPEC_PLAIN` | off | Drafts are produced but never verified (plain decode; measures the head's own cost) |
+| `FT_SPEC_MAX_DRAFTS` | unset | Cap the drafts per verify window; `0` gives one-row windows (verify path vs plain decode parity checks) |
 
 ## Known limitations
 
-- Video, the Anthropic / Responses adapters (still text-only), and speculative decoding with image
-  prompts are not covered.
+- Video and the Anthropic / Responses adapters (still text-only) are not covered.
+- `--spec-mtp` serves one request at a time, runs eagerly (no CUDA graph for the verify window
+  yet) and reads the head from modelopt MIXED_PRECISION checkpoints only.
 - Image prompts bypass the shared prefix cache (by upstream design), so a conversation with images
   is prefilled in full every turn.
 - On Turing, use `--dtype float16`. Prefill has a fixed cost of ~5 s per chunk on the 2060 under
