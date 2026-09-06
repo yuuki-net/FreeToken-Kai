@@ -57,9 +57,10 @@ def test_linear_routes_large_m_through_scratch_when_preferred(monkeypatch):
     torch.testing.assert_close(out.float(), ref, rtol=2e-2, atol=2e-2)
 
 
-def test_linear_keeps_small_m_on_the_inline_kernel(monkeypatch):
-    """A few rows (an MTP verify window, a small decode batch) skip the scratch: the full
-    weight dequant would cost more traffic than the inline kernel's single fp8 read."""
+def test_small_m_threshold_routes_to_the_inline_kernel(monkeypatch):
+    """Rows below _SCRATCH_GEMM_MIN_M take the inline kernel (the knob defaults to 2, so a
+    4-row MTP window still uses the scratch: the inline kernel's e4m3 unpack is far slower
+    on Turing)."""
     torch.manual_seed(0)
     w = torch.randn(64, 128) * 0.02
     q, s = _quant(w)
@@ -74,6 +75,8 @@ def test_linear_keeps_small_m_on_the_inline_kernel(monkeypatch):
     monkeypatch.setattr(fp8mod, "e4m3_native", lambda: False)
     monkeypatch.setattr(fp8mod, "e4m3_kernel_view", lambda w: w)
     monkeypatch.setattr(fp8mod, "_gemm", fake_gemm)
-    monkeypatch.setattr(fp8mod, "_gemm_scratch", lambda *a, **k: pytest.fail("scratch used for M=4"))
+    monkeypatch.setattr(fp8mod, "_SCRATCH_GEMM_MIN_M", 8)
+    monkeypatch.setattr(fp8mod, "_gemm_scratch", lambda *a, **k: pytest.fail("scratch used below the threshold"))
     out = fp8mod.fp8_pertensor_linear(a, q, s)
     assert calls == [(4, 128)] and out.shape == (4, 64)
+    assert fp8mod.__dict__["_SCRATCH_GEMM_MIN_M"] == 8

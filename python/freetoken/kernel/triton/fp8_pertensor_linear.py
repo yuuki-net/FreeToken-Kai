@@ -218,11 +218,11 @@ def _gemm_kernel(
     tl.store(c_ptrs, acc.to(compute_type), mask=m_mask[:, None] & n_mask[None, :])
 
 
-# Below this many rows the scratch path loses: dequantising the whole [N, K] weight to fp16
-# (read 1 B + write 2 B + the scale pass + cuBLAS reading 2 B per element) is ~10 GB of traffic
-# per forward of a 1.3B-parameter dense stack, while the inline kernel reads the fp8 bytes once.
-# An MTP verify window (K+1 = 4..8 rows) and small decode batches take the inline kernel.
-_SCRATCH_GEMM_MIN_M = 64
+# Every M > 1 takes the scratch path below Ampere. Measured on the RTX 2060 with a 4-row MTP
+# verify window: the inline kernel's software e4m3 unpack costs ~400 ms per forward of the
+# 1.3B-parameter dense stack (its 0.15 TFLOPS is unpack-bound, not tile-bound), the scratch
+# path ~40 ms. The threshold stays as a knob (2 = always scratch for M > 1).
+_SCRATCH_GEMM_MIN_M = 2
 
 
 @functools.cache
