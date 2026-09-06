@@ -171,11 +171,15 @@ class PrefillAdder:
         _slice = slice(cached_len, cached_len + chunk_size)
         device_ids = self.table_manager.token_pool[table_idx, _slice]
         device_ids.copy_(_maybe_pinned(pending_req.input_ids[_slice]), non_blocking=True)
-        if is_chunked and pending_req.mm_embeds is not None:
-            raise NotImplementedError(
-                "Multimodal prompts must fit in a single prefill chunk; increase "
-                "--max-extend-tokens or shrink the prompt."
-            )
+        mm_embeds = pending_req.mm_embeds
+        if mm_embeds is not None and (is_chunked or cached_len > 0):
+            if pending_req.mm_slots is None:
+                # offline path: soft tokens without a placeholder map cannot be split
+                raise NotImplementedError(
+                    "Multimodal prompts must fit in a single prefill chunk; increase "
+                    "--max-extend-tokens or shrink the prompt."
+                )
+            mm_embeds = chunk_mm_embeds(mm_embeds, pending_req.mm_slots, cached_len, chunk_size)
         req = CLS(
             input_ids=pending_req.input_ids[: cached_len + chunk_size],
             table_idx=table_idx,
@@ -184,7 +188,7 @@ class PrefillAdder:
             uid=pending_req.uid,
             cache_handle=cache_handle,
             sampling_params=pending_req.sampling_params,
-            mm_embeds=pending_req.mm_embeds,
+            mm_embeds=mm_embeds,
             mm_rope=pending_req.mm_rope,
         )
         # Hybrid GDN per-request state slots (None for non-hybrid). On a fresh admit these are
@@ -237,6 +241,19 @@ class PrefillAdder:
         return None
 
 
+def chunk_mm_embeds(
+    mm_embeds: torch.Tensor, slots: torch.Tensor, cached_len: int, chunk_size: int
+) -> torch.Tensor:
+    """This chunk's share of a prompt's soft tokens: the rows for the image placeholders
+    inside ``[cached_len, cached_len + chunk_size)``, in prompt order (``slots`` marks the
+    placeholder positions of the whole prompt). A chunk without placeholders gets an empty
+    ``[0, hidden]`` slice rather than None, so the request stays multimodal for the cache
+    manager (image placeholders share a token id and must never enter the prefix cache)."""
+    before = int(slots[:cached_len].sum())
+    inside = int(slots[cached_len : cached_len + chunk_size].sum())
+    return mm_embeds[before : before + inside]
+
+
 @dataclass
 class PrefillManager:
     cache_manager: CacheManager
@@ -249,6 +266,7 @@ class PrefillManager:
             PendingReq(
                 req.uid, req.input_ids, req.sampling_params,
                 mm_embeds=req.mm_embeds, mm_rope=getattr(req, "mm_rope", None),
+                mm_slots=getattr(req, "mm_slots", None),
             )
         )
 

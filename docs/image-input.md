@@ -17,8 +17,9 @@ is multimodal and its vision tower is loaded (`FREETOKEN_LOAD_VISION=1`; Gemma 4
 * Those tensors reach the scheduler in `UserMsg.mm_inputs`; on admission it runs
   `model.encode_images` and attaches the soft-token embeddings (`mm_embeds`), which the model
   scatters at the placeholder positions during prefill.
-* Limits inherited from the offline path: a prompt with images must fit one prefill chunk
-  (`--max-extend-tokens`), and multimodal requests bypass the shared prefix cache.
+* A prompt with images may span several prefill chunks (each chunk scatters the soft tokens
+  of the placeholders it contains); such a prompt is scheduled alone and bypasses the shared
+  prefix cache, so every turn of a conversation that carries images is prefilled in full.
 * A text-only checkpoint, a missing vision tower, an undecodable file, or a placeholder /
   feature count mismatch fails **that request** with a 400-class error; text-only requests
   are unaffected.

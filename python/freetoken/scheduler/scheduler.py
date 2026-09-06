@@ -868,6 +868,7 @@ class Scheduler(SchedulerIOMixin):
             return rope
         msg.mm_rope = rope
         msg.mm_embeds = embeds
+        msg.mm_slots = msg.input_ids == image_token_id  # for chunked prefill
         msg.mm_inputs = None
         return None
 
@@ -950,15 +951,15 @@ class Scheduler(SchedulerIOMixin):
 
 
 def _prefill_rope_table(batch: Batch) -> torch.Tensor | None:
-    """The image prompt's own cos/sin table for its (single, solo, uncached) prefill chunk:
-    rope lookups index it by logical position, which is why the prompt runs alone from 0."""
+    """The image prompt's own cos/sin table for its prefill chunks: rope lookups index it by
+    logical position, which is why the prompt runs alone (its chunks may be several; the
+    table covers the whole prompt)."""
     if not batch.is_prefill or len(batch.padded_reqs) != 1:
         return None
     req = batch.padded_reqs[0]
     rope = getattr(req, "mm_rope", None)
     if rope is None or rope.cos_sin is None:
         return None
-    assert req.cached_len == 0, "an image prompt is never prefix-cached"
     return rope.cos_sin
 
 

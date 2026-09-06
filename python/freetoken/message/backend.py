@@ -42,6 +42,7 @@ class UserMsg(BaseBackendMsg):
     mm_inputs: Dict[str, torch.Tensor] | None = None
     # Set in-process by the scheduler from mm_inputs (never serialized).
     mm_rope: object | None = None
+    mm_slots: object | None = None  # bool [prompt_len]: the image placeholder rows
 
 
 @dataclass

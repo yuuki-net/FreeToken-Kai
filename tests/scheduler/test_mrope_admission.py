@@ -69,11 +69,19 @@ def test_rope_positions_are_none_when_no_request_has_a_delta():
     assert _make_rope_positions(batch, torch.device("cpu")) is None
 
 
-def test_prefill_table_only_for_a_solo_uncached_image_prompt():
+def test_prefill_table_only_for_a_solo_image_prompt_including_continuation_chunks():
     table = torch.zeros(9, 64)
-    solo = SimpleNamespace(is_prefill=True, padded_reqs=[_req(0, 9, MMRope(delta=-3, cos_sin=table))])
+    solo = SimpleNamespace(is_prefill=True, padded_reqs=[_req(0, 4, MMRope(delta=-3, cos_sin=table))])
     assert _prefill_rope_table(solo) is table
+    later_chunk = SimpleNamespace(is_prefill=True, padded_reqs=[_req(4, 9, MMRope(delta=-3, cos_sin=table))])
+    assert _prefill_rope_table(later_chunk) is table
     decode = SimpleNamespace(is_prefill=False, padded_reqs=solo.padded_reqs)
     assert _prefill_rope_table(decode) is None
     pair = SimpleNamespace(is_prefill=True, padded_reqs=solo.padded_reqs + [_req(0, 2)])
     assert _prefill_rope_table(pair) is None
+
+
+def test_admission_records_the_placeholder_rows_for_chunking():
+    msg = _msg()
+    assert _sched()._encode_multimodal(msg) is None
+    assert msg.mm_slots.tolist() == [False, False] + [True] * 6 + [False]

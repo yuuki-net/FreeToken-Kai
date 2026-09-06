@@ -19,6 +19,7 @@ class PendingReq:
     chunked_req: ChunkedReq | None = None
     mm_embeds: torch.Tensor | None = None
     mm_rope: MMRope | None = None
+    mm_slots: torch.Tensor | None = None  # bool [prompt_len]: image placeholder rows (chunking)
 
     @property
     def input_len(self) -> int:
