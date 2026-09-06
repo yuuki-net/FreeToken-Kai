@@ -261,6 +261,82 @@ def fused_experts_decode_nvfp4_serial(
 
 
 @functools.cache
+def _scratch_moe_preferred() -> bool:
+    """Prefill MoE below Ampere: dequant + cuBLAS instead of the in-kernel-dequant GEMM. Measured
+    on an RTX 2060 (T=2785, 256 experts, top-8): the Triton kernel tops out at 0.57 TFLOPS in
+    every tile configuration tried, cuBLAS fp16 runs at 19 TFLOPS on the same card.
+    ``FREETOKEN_NVFP4_MOE_SCRATCH=0/1`` overrides anywhere."""
+    env = os.environ.get("FREETOKEN_NVFP4_MOE_SCRATCH")
+    if env is not None:
+        return env == "1"
+    from freetoken.utils import is_pre_ampere
+
+    return is_pre_ampere()
+
+
+_SCRATCH_EXPERTS_PER_CHUNK = 32  # 32 experts x (2I x H + H x I) fp16 ~ 200 MB for Qwen3.5-35B-A3B
+
+
+def _fused_experts_nvfp4_scratch(
+    hidden_states: torch.Tensor,
+    gate_up_packed: torch.Tensor,
+    gate_up_scale: torch.Tensor,
+    gate_up_global: torch.Tensor,
+    down_packed: torch.Tensor,
+    down_scale: torch.Tensor,
+    down_global: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    num_experts: int,
+    apply_router_weight_on_input: bool,
+) -> torch.Tensor:
+    """silu-gated prefill MoE as per-expert cuBLAS GEMMs over dequantised fp16/bf16 experts.
+    Routes are grouped by expert once (argsort), experts are dequantised in chunks, and each
+    expert's rows go through ``x @ W_gu^T -> silu(gate) * up -> @ W_d^T``; the route weights and
+    the sum over a token's routes are applied in fp32. One host sync per layer (route counts),
+    which prefill tolerates."""
+    from freetoken.kernel.triton.nvfp4_dequant import dequant_nvfp4
+
+    M, H = hidden_states.shape
+    top_k = topk_ids.shape[1]
+    dt = hidden_states.dtype
+    dev = hidden_states.device
+    inter = gate_up_packed.shape[1] // 2
+    flat_ids = topk_ids.reshape(-1).to(torch.int64)
+    flat_w = topk_weights.reshape(-1).to(torch.float32)
+    order = torch.argsort(flat_ids)
+    counts = torch.bincount(flat_ids.clamp(min=0), minlength=num_experts)
+    starts = torch.cumsum(counts, 0) - counts
+    counts_cpu = counts.tolist()
+    starts_cpu = starts.tolist()
+    out = torch.zeros(M, H, dtype=torch.float32, device=dev)
+    for base in range(0, num_experts, _SCRATCH_EXPERTS_PER_CHUNK):
+        top = min(base + _SCRATCH_EXPERTS_PER_CHUNK, num_experts)
+        if not any(counts_cpu[base:top]):
+            continue
+        slots = torch.arange(base, top, dtype=torch.int32, device=dev)
+        w_gu = dequant_nvfp4(gate_up_packed, gate_up_scale, gate_up_global, slots, dtype=dt)
+        w_d = dequant_nvfp4(down_packed, down_scale, down_global, slots, dtype=dt)
+        for j, e in enumerate(range(base, top)):
+            n = counts_cpu[e]
+            if n == 0:
+                continue
+            rows = order[starts_cpu[e] : starts_cpu[e] + n]
+            tok = rows // top_k
+            x_e = hidden_states.index_select(0, tok)
+            if apply_router_weight_on_input:
+                x_e = (x_e.float() * flat_w[rows][:, None]).to(dt)
+            h = x_e @ w_gu[j].t()
+            a = torch.nn.functional.silu(h[:, :inter]) * h[:, inter:]
+            y = (a @ w_d[j].t()).float()
+            if not apply_router_weight_on_input:
+                y = y * flat_w[rows][:, None]
+            out.index_add_(0, tok, y)
+        del w_gu, w_d
+    return out.to(dt)
+
+
+@functools.cache
 def _arith_dequant() -> bool:
     """Prefill MoE kernel dequant: arithmetic (no LUT gathers) below Ampere by default --
     measured 0.56 TFLOPS for the LUT path on an RTX 2060 against 16 TFLOPS for the dense
@@ -346,6 +422,12 @@ def fused_experts_nvfp4(
     ``[0, num_experts)``: full-layer banks with position == expert id (the
     materialized ``[:E]`` slot view or the overlap double buffer), raw ids."""
     M, H = hidden_states.shape
+    if activation == "silu" and _scratch_moe_preferred():
+        return _fused_experts_nvfp4_scratch(
+            hidden_states, gate_up_packed, gate_up_scale, gate_up_global,
+            down_packed, down_scale, down_global, topk_weights, topk_ids, num_experts,
+            apply_router_weight_on_input,
+        )
     top_k = topk_ids.shape[1]
     two_i = gate_up_packed.shape[1]
     inter = two_i // 2
