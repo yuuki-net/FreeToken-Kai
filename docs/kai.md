@@ -28,7 +28,7 @@ for Claude. Bug reports about this fork go to this repository, not to FlashML.
 
 | Machine | Model | Result |
 |---|---|---|
-| RTX 2060 6 GB, 32 GB RAM, Windows 11 + WSL2 (`memory=24GB`) | `ornith-ai/Ornith-1.5-35B-A3B-NVFP4` (35B MoE, 3B active, vision) | Text and image input work. Decode 25-37 tok/s (`--moe-backend hybrid`, `--dtype float16`). Prefill: a 2785-token prompt in ~8.5 s (68 s before the Turing GEMM changes); ~5 s of that is the per-chunk expert streaming, the rest ~1.3 ms/token |
+| RTX 2060 6 GB, 32 GB RAM, Windows 11 + WSL2 (`memory=24GB`) | `ornith-ai/Ornith-1.5-35B-A3B-NVFP4` (35B MoE, 3B active, vision) | Text and image input work. Decode 25-39 tok/s (`--moe-backend hybrid`, `--dtype float16`), 64k of context with `--host-embedding`. Prefill: a 2062-token prompt in ~7.8 s (68 s before the Turing GEMM changes); ~5 s of that is the per-chunk expert streaming, the rest ~1.3 ms/token; a follow-up turn behind a cached prefix answers in 2-3 s |
 | same | `openai/gpt-oss-20b` (MXFP4) | 13-14 tok/s with the Turing patch alone |
 | RTX 3060 12 GB x2, 128 GB RAM, Linux | `RadixArk/Qwen3.8-Flash-Next-NVFP4` (125B MoE, vision) | Image input validated end to end (colour probe 6/6, chunked prefill, M-RoPE). That machine runs a private pipeline-parallel build that is **not** part of this fork; the image code here is the same |
 
@@ -128,6 +128,22 @@ for a graph to remove. Result 8-22 tok/s versus 25-37 tok/s plain. Speculative d
 off when a multi-row forward costs about as much as a single-row one -- experts resident on
 the GPU -- which a 6 GB card cannot offer for a 35B MoE. Treat `--spec-mtp` on Turing/offload
 setups as a correctness-verified feature, not a speed-up.
+
+## 64k of context on 6 GB: `--host-embedding`
+
+The input embedding table (250k x 2048 fp16 = 1 GB on Ornith) can live in pinned host
+memory; the GPU gathers the rows it needs in place over PCIe (one row per decode step, 16 MB
+per 4096-token prefill chunk), inside the CUDA graphs like any other kernel. The freed VRAM
+goes to KV pages: on the RTX 2060 that is the difference between 12k and 64k of context.
+
+```bash
+ft serve ... --host-embedding --kv-reserve-tokens 65536 --max-seq-len-override 65536 --memory-ratio 0.82
+```
+
+Measured on the 2060 (Ornith, fp16, hybrid): 65,606 KV tokens allocated (1.25 GiB) with
+0.44 GiB of VRAM still free after the graphs, decode 37-39 tok/s, host RAM +1 GB (pinned; it
+counts against the pin quota, so two or three more bank layers decode on the CPU). Untied
+vocabularies only (Ornith's is untied); Qwen3.5-MoE family.
 
 ## Environment variables added by this fork
 
