@@ -417,6 +417,9 @@ _SPEC_CHECK_STEP_LEFT = [int(os.environ.get("FT_SPEC_CHECK_STEP", "0") or 0)]
 # FT_SPEC_PROFILE=1: synchronize between the phases of a verify step and log their mean wall
 # time every 20 steps (the syncs themselves add a little, so read it as a breakdown, not a total)
 _SPEC_PROFILE = os.environ.get("FT_SPEC_PROFILE") == "1"
+# FT_STEP_PROFILE=1: the same phase timer for every decode step (and verify window), on every
+# pipeline rank -- where a step's time goes between the ranks' forwards and the hand-offs
+_STEP_PROFILE = os.environ.get("FT_STEP_PROFILE") == "1"
 
 
 class _SpecProfiler:
@@ -454,7 +457,7 @@ class _SpecProfiler:
         n = self.steps
         total = sum(self.totals.values())
         parts = " ".join(f"{k}={1000 * v / n:.1f}" for k, v in ((k, self.totals[k]) for k in self.order))
-        logger.warning(f"spec profile (ms/step over {n} steps, total {1000 * total / n:.1f}): {parts}")
+        logger.warning(f"step profile (ms/step over {n} steps, total {1000 * total / n:.1f}): {parts}")
         self.totals = {k: 0.0 for k in self.order}
         self.steps = 0
 
@@ -1455,7 +1458,7 @@ class Engine:
         if check:
             self.ctx.debug_layer_outs = []
         prof = None
-        if _SPEC_PROFILE and batch.spec_verify:
+        if (_SPEC_PROFILE and batch.spec_verify) or (_STEP_PROFILE and (batch.spec_verify or not batch.is_prefill)):
             prof = self._spec_profiler
             if prof is None:
                 prof = self._spec_profiler = _SpecProfiler()
@@ -1522,11 +1525,14 @@ class Engine:
                     self.model.spec_rollback(batch, len(spec_res.accepted), self.ctx)
                     if prof is not None:
                         prof.mark("rollback")
-                        prof.step()
                 next_tokens_cpu = torch.tensor(spec_res.accepted[:1], dtype=torch.int32)
             else:
                 next_tokens_cpu = pp.recv_tokens(batch.size)
+                if prof is not None:
+                    prof.mark("wait_tokens")
             next_tokens_gpu = next_tokens_cpu.to(self.device)
+            if prof is not None:
+                prof.step()
             if check:
                 _SPEC_CHECK_STEP_LEFT[0] -= 1
                 self._spec_check_step(batch, snap, v_outs, v_final)
@@ -1565,6 +1571,8 @@ class Engine:
                 next_tokens_cpu = next_tokens_gpu.cpu()  # synchronous: read on the host below
             else:
                 next_tokens_cpu = next_tokens_gpu.to("cpu", non_blocking=True)
+            if prof is not None:
+                prof.mark("sample")
             if spec:
                 token = int(next_tokens_cpu[0])
                 drafts = []
@@ -1580,8 +1588,9 @@ class Engine:
         if pp is not None and not batch.pp_no_tokens:
             # (the first rank did not wait for a chunk-only batch's tokens: nothing to send)
             pp.send_tokens(pack_spec_message(spec_res, self.spec_k) if spec else next_tokens_cpu)
-        if prof is not None and batch.spec_verify:
-            prof.mark("send_tokens")
+        if prof is not None:
+            if pp is not None and not batch.pp_no_tokens:
+                prof.mark("send_tokens")
             prof.step()
         if check:
             _SPEC_CHECK_STEP_LEFT[0] -= 1

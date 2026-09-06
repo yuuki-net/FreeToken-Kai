@@ -189,6 +189,7 @@ vocabularies only (Ornith's is untied); Qwen3.5-MoE family.
 | `FREETOKEN_STAGED_COPY` / `FREETOKEN_STAGED_COPY_MB` | on / `32` | Whole-layer prefill copies of non-pinned bank layers go through two pinned staging buffers of this size |
 | `FT_SPEC_TRACE` | `0` | Log the first n verify windows of `--spec-mtp` (input ids, drafts, samples, accepted, next drafts, top-3 logits) |
 | `FT_SPEC_PROFILE` | off | Per-phase wall time of the verify step (target forward, sample, rollback, head window, head chain), logged every 20 steps |
+| `FT_STEP_PROFILE` | off | The same phase timer for every decode step on every pipeline rank (receive, forward, sample, send, wait for tokens), logged every 20 steps; where a `--pp-size` step's time goes |
 | `FT_SPEC_PLAIN` | off | Drafts are produced but never verified (plain decode; measures the head's own cost) |
 | `FT_SPEC_MAX_DRAFTS` | unset | Cap the drafts per verify window; `0` gives one-row windows (verify path vs plain decode parity checks) |
 | `FT_SPEC_CHECK_STEP` | `0` | Cross-check the first n one-row verify windows against the plain decode path from the same state (per-layer residual, final logits, GDN state) |
