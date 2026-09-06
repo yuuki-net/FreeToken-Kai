@@ -30,6 +30,7 @@ from freetoken.layers import (
     VocabParallelEmbedding,
 )
 from freetoken.models.blocks import BaseLLMModel
+from freetoken.models.pipeline import RemoteLayer as _RemoteLayer
 from freetoken.utils import nvtx_annotate
 
 from .attention import Qwen4ExpAttention
@@ -62,14 +63,6 @@ def build_linear_mixer(config: ModelConfig, layer_id: int) -> BaseOP:
         expert_quant="none" if config.expert_quant == "fp8_block" else config.expert_quant,
         attn_quant=config.attn_quant,
     )
-
-
-class _RemoteLayer(BaseOP):
-    """Placeholder for a decoder layer another pipeline rank runs: keeps the state-dict
-    numbering global (``layers.<global id>``) while owning no weights and never executing."""
-
-    def forward(self, *args, **kwargs):
-        raise RuntimeError("a remote pipeline layer was invoked on this rank")
 
 
 class Qwen4ExpDecoderLayer(BaseOP):

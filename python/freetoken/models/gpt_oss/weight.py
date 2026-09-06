@@ -253,6 +253,17 @@ def _expert_layer_and_name(key: str) -> tuple[int, str] | None:
     return layer_id, parts[5]
 
 
+def _bank_window(config) -> tuple[int, int]:
+    """The expert-bank layers ``[lo, hi)`` this process serves: every layer, or under the
+    pipeline engine this rank's window (banks are indexed rank-locally, ``layer - lo``)."""
+    from freetoken.distributed import try_get_pp_info
+
+    pp = try_get_pp_info()
+    if pp is None:
+        return 0, config.num_layers
+    return pp.bank_window(int(getattr(config, "first_k_dense_replace", 0)))
+
+
 def _empty_mxfp4_triton_banks(
     config,
     *,
@@ -271,7 +282,8 @@ def _empty_mxfp4_triton_banks(
         rank=tp_info.rank,
         world_size=tp_info.size,
     )
-    num_layers, E = config.num_layers, config.num_experts
+    lo, hi = _bank_window(config)
+    num_layers, E = hi - lo, config.num_experts
     hidden_blocks = config.hidden_size // 32
     intermediate_blocks = local_intermediate // 32
     specs = {
@@ -379,6 +391,7 @@ def load_mxfp4_triton_banks_streaming(
     )
     tp_end = max(tp_start, tp_end)
     banks, _hb = _empty_mxfp4_triton_banks(config, dtype=dtype, tp_info=tp_info)
+    lo, hi = _bank_window(config)  # this rank's layers; bank index = layer - lo
     seen: set[tuple[int, str]] = set()
     all_expert_sources = (
         "gate_up_proj_blocks",
@@ -435,14 +448,17 @@ def load_mxfp4_triton_banks_streaming(
                     layer_id, source_name = info
                     if layer_id < 0 or layer_id >= config.num_layers:
                         raise ValueError(f"Unexpected GPT-OSS expert layer in checkpoint: {name}")
+                    if not (lo <= layer_id < hi):
+                        continue  # another pipeline rank's layer
                     seen.add((layer_id, source_name))
+                    local = layer_id - lo
 
                     if source_name == "down_proj_bias":
                         if tp_info.rank == 0:
                             raw = f.get_tensor(name)
-                            banks["down_bias"][layer_id].copy_(raw)
+                            banks["down_bias"][local].copy_(raw)
                         if tracker is not None:
-                            tracker.note(layer_id)
+                            tracker.note(local)
                         continue
 
                     plan = copy_plan.get(source_name)
@@ -450,9 +466,9 @@ def load_mxfp4_triton_banks_streaming(
                         raise ValueError(f"Unexpected GPT-OSS expert source: {name}")
                     bank_name, source_slice, copy_fn = plan
                     raw = _read_safetensor_slice(f, name, source_slice)
-                    copy_fn(banks[bank_name][layer_id], raw)
+                    copy_fn(banks[bank_name][local], raw)
                     if tracker is not None:
-                        tracker.note(layer_id)
+                        tracker.note(local)
 
     if layer_sink is not None:
         _load(layer_sink)
@@ -464,14 +480,14 @@ def load_mxfp4_triton_banks_streaming(
 
     expected = {
         (layer_id, source_name)
-        for layer_id in range(config.num_layers)
+        for layer_id in range(lo, hi)
         for source_name in all_expert_sources
     }
     missing = expected - seen
     if missing:
         raise ValueError(f"Missing GPT-OSS expert tensors: {sorted(missing)[:8]}")
     assert all(
-        len(per_layer) == config.num_layers
+        len(per_layer) == hi - lo
         and all(t.is_contiguous() and t.size(0) == config.num_experts for t in per_layer)
         for per_layer in banks.values()
     )
@@ -504,6 +520,7 @@ def load_mxfp4_triton_banks_streaming_parallel(
     )
     tp_end = max(tp_start, tp_end)
     banks, _hb = _empty_mxfp4_triton_banks(config, dtype=dtype, tp_info=tp_info)
+    lo, hi = _bank_window(config)  # this rank's layers; bank index = layer - lo
     all_expert_sources = (
         "gate_up_proj_blocks", "gate_up_proj_scales", "gate_up_proj_bias",
         "down_proj_blocks", "down_proj_scales", "down_proj_bias",
@@ -527,7 +544,7 @@ def load_mxfp4_triton_banks_streaming_parallel(
 
     def _is_expert(name: str) -> bool:
         info = _expert_layer_and_name(name)
-        return info is not None and 0 <= info[0] < config.num_layers
+        return info is not None and lo <= info[0] < hi  # only this rank's layers are read
 
     from freetoken.moe.host_banks import LayerCompletionTracker, PinPipeline
 
@@ -539,16 +556,17 @@ def load_mxfp4_triton_banks_streaming_parallel(
         for name, whole in iter_expert_tensors_parallel(model_path, _is_expert, workers=workers, chunk=chunk):
             layer_id, source_name = _expert_layer_and_name(name)
             seen.add((layer_id, source_name))
+            local = layer_id - lo
             if source_name == "down_proj_bias":
                 if tp_info.rank == 0:
-                    banks["down_bias"][layer_id].copy_(whole)
+                    banks["down_bias"][local].copy_(whole)
                 if tracker is not None:
-                    tracker.note(layer_id)
+                    tracker.note(local)
                 continue
             bank_name, source_slice, copy_fn = copy_plan[source_name]
-            copy_fn(banks[bank_name][layer_id], whole[source_slice])
+            copy_fn(banks[bank_name][local], whole[source_slice])
             if tracker is not None:
-                tracker.note(layer_id)
+                tracker.note(local)
 
     if layer_sink is not None:
         _load(layer_sink)
@@ -558,12 +576,12 @@ def load_mxfp4_triton_banks_streaming_parallel(
     else:
         _load(None)
 
-    expected = {(layer_id, src) for layer_id in range(config.num_layers) for src in all_expert_sources}
+    expected = {(layer_id, src) for layer_id in range(lo, hi) for src in all_expert_sources}
     missing = expected - seen
     if missing:
         raise ValueError(f"Missing GPT-OSS expert tensors: {sorted(missing)[:8]}")
     assert all(
-        len(per_layer) == config.num_layers
+        len(per_layer) == hi - lo
         and all(t.is_contiguous() and t.size(0) == config.num_experts for t in per_layer)
         for per_layer in banks.values()
     )
