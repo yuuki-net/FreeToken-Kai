@@ -127,12 +127,15 @@ class TokenizeManager:
             except Exception as exc:  # noqa: BLE001
                 if "torchvision" not in str(exc).lower():
                     raise
-                # the torch image backend needs torchvision; the Qwen-VL family also ships a
-                # PIL backend (older transformers spell the switch use_fast=False)
-                try:
-                    proc = AutoProcessor.from_pretrained(self.model_path, backend="pil")
-                except Exception:  # noqa: BLE001
-                    proc = AutoProcessor.from_pretrained(self.model_path, use_fast=False)
+                # AutoProcessor also builds the *video* processor, which needs torchvision even
+                # for image-only use. Qwen-VL checkpoints get a processor made of the PIL image
+                # processor + the tokenizer instead (the template places the image tokens, the
+                # image processor sizes the grid, the placeholders are repeated to match).
+                from .qwen_vl_lite import QwenVLLiteProcessor
+
+                proc = QwenVLLiteProcessor.from_pretrained(self.model_path, self.tokenizer)
+                if proc is None:
+                    raise
         except Exception as exc:  # noqa: BLE001 -- text-only checkpoints have no processor
             reason = " ".join(str(exc).split())[:300]
             # a missing library is the server's problem, not a text-only checkpoint: keep the
@@ -177,10 +180,12 @@ class TokenizeManager:
         total pixels). ``FT_IMAGE_MAX_PIXELS`` (default 1024*1024, about 1k soft tokens)
         bounds both the CPU vision cost and the prompt length."""
         size = getattr(getattr(proc, "image_processor", None), "size", None)
-        if not isinstance(size, dict) or "longest_edge" not in size:
+        # a dict in preprocessor_config.json, a SizeDict on a built processor
+        get = size.get if isinstance(size, dict) else (lambda k, d=None: getattr(size, k, d))
+        if size is None or get("longest_edge") is None:
             return {}
         max_pixels = int(os.environ.get("FT_IMAGE_MAX_PIXELS", str(1024 * 1024)))
-        shortest = int(size.get("shortest_edge") or 0)
+        shortest = int(get("shortest_edge") or 0)
         return {"size": {"shortest_edge": min(shortest, max_pixels) if shortest else 0, "longest_edge": max_pixels}}
 
     def _tokenize_multimodal(
