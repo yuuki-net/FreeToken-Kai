@@ -251,6 +251,8 @@ def _dequant_scratch(numel: int, dtype: torch.dtype, device: torch.device) -> to
     key = (dtype, str(device))
     buf = _SCRATCH_BUFFERS.get(key)
     if buf is None or buf.numel() < numel:
+        if device.type == "cuda":  # grow only with an idle GPU (see the docstring)
+            torch.cuda.synchronize(device)
         buf = _SCRATCH_BUFFERS[key] = torch.empty(numel, dtype=dtype, device=device)
     return buf
 

@@ -288,6 +288,11 @@ def _scratch_buffer(name: str, shape, dtype: torch.dtype, device: torch.device) 
     key = (name, tuple(int(d) for d in shape), dtype, str(device))
     buf = _SCRATCH_BUFFERS.get(key)
     if buf is None:
+        # first allocation only: let the queued work drain first. Growing an expandable
+        # segment while kernels and copies are in flight is what failed with "device not
+        # ready" on WSL2; a one-time sync per buffer costs nothing afterwards.
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
         buf = _SCRATCH_BUFFERS[key] = torch.empty(shape, dtype=dtype, device=device)
     return buf
 
