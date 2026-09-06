@@ -98,6 +98,19 @@ line and makes a healthy server look stuck.
 - DeepStack vision checkpoints (Qwen3-VL proper) are refused; only checkpoints with an empty
   `deepstack_visual_indexes` are supported.
 
+## Related work
+
+- [trev222/pocketai-freetoken-sm75](https://github.com/trev222/pocketai-freetoken-sm75) reached
+  Turing first (RTX 2070 Max-Q, Windows, FreeToken PR #24 era): a standalone compatibility harness
+  that swaps the unsupported Triton kernels for PyTorch ops and its own batch-one MoE backend, with
+  Qwen3.6-35B-A3B NVFP4 decoding at ~32 tok/s. Its report lists prompt caching, streaming and a
+  serial-prefill bottleneck (30 s TTFT at 1.5k tokens) as open. This fork takes the other route:
+  keep upstream's server and kernels, change the six places that break, and validate each kernel
+  against a reference so prompt caching, streaming and the OpenAI/Open WebUI path stay upstream's.
+- Upstream PR #131 (GGUF: all quant types, Qwen3.5-MoE GGUF) compiles its vendored GGUF kernels for
+  sm_75+, but targets the GGUF expert path on Ampere-class cards; the flashinfer attention and
+  Triton fallbacks that fail on Turing are not part of it.
+
 ## Keeping up with upstream
 
 The fork is a dozen commits on top of `af71ba4`, touching a small set of files (see `git log
