@@ -103,21 +103,31 @@ head weights, and one more expert-bank layer -- the head's 256 bf16 experts (1.6
 checkpoint) are quantized to NVFP4 at load and appended to the offload cache (~0.43 GB of
 pinned host memory). Loading reads 1.6 GB of bf16 experts through host RAM once.
 
-Scope: single running request (`--max-running-req 1`); the verify window and the draft chain
-run eagerly (no CUDA graph); modelopt MIXED_PRECISION checkpoints only (fp8 attention + NVFP4
-experts, the Ornith / Qwen3.6-35B-A3B-NVFP4 format). The `Spec decode` line in the decode
-status shows the mean accepted length.
+Scope: single running request (`--max-running-req 1`); modelopt MIXED_PRECISION checkpoints
+only (fp8 attention + NVFP4 experts, the Ornith / Qwen3.6-35B-A3B-NVFP4 format). The `Spec
+decode` line in the decode status shows the mean accepted length.
+
+CUDA graphs: the K+1-row verify window and the draft head (window pass + one chain step) are
+captured at startup and replayed per step, the way the decode step is; windows shorter than
+K+1 rows (the output budget's tail) and a capture failure fall back to the eager path with a
+log line. An attention backend takes part by implementing `init_spec_capture` / `stage_spec`
+(the Triton backend does, so `--attention-backend triton` gets the graphs on any GPU). The
+window graph keeps the K+1 per-token GDN states of every layer resident (~250 MB at K=3 on a
+30-layer GDN stack); when less than `FT_SPEC_GRAPH_MIN_FREE_MB` (256) of VRAM is left after
+capture the graphs are dropped again, because a starved allocator makes the step slower than
+eager.
 
 Measured on the RTX 2060 (Ornith, fp16, `--moe-backend hybrid`, K=3): the head is good
 (2.5 tokens accepted per step on average, up to 4), and the verify path matches plain decode
 within fp16 rounding (`FT_SPEC_CHECK_STEP`: per-layer residual divergence 1e-4 at layer 0 to
 1e-2 at layer 39, identical top-3 logits, GDN state after rollback within 1e-3). But it does
-**not** make decoding faster there: a 4-row verify forward costs ~145 ms against ~45 ms for one
-row, because with the experts on the CPU every row pays its own expert traffic (~27 ms per
-token), which is the dominant cost. Result 8-22 tok/s versus 25-37 tok/s plain. Speculative
-decoding pays off when a multi-row forward costs about as much as a single-row one -- experts
-resident on the GPU -- which a 6 GB card cannot offer for a 35B MoE. Treat `--spec-mtp` on
-Turing/offload setups as a correctness-verified feature, not a speed-up.
+**not** make decoding faster there: a 4-row verify forward costs ~130-150 ms (graph and eager
+alike) against ~45 ms for one row, because with the experts on the CPU every row pays its own
+expert traffic (~27 ms per token), which is the dominant cost; there is little launch overhead
+for a graph to remove. Result 8-22 tok/s versus 25-37 tok/s plain. Speculative decoding pays
+off when a multi-row forward costs about as much as a single-row one -- experts resident on
+the GPU -- which a 6 GB card cannot offer for a 35B MoE. Treat `--spec-mtp` on Turing/offload
+setups as a correctness-verified feature, not a speed-up.
 
 ## Environment variables added by this fork
 
@@ -132,6 +142,10 @@ Turing/offload setups as a correctness-verified feature, not a speed-up.
 | `FT_SPEC_PROFILE` | off | Per-phase wall time of the verify step (target forward, sample, rollback, head window, head chain), logged every 20 steps |
 | `FT_SPEC_PLAIN` | off | Drafts are produced but never verified (plain decode; measures the head's own cost) |
 | `FT_SPEC_MAX_DRAFTS` | unset | Cap the drafts per verify window; `0` gives one-row windows (verify path vs plain decode parity checks) |
+| `FT_SPEC_CHECK_STEP` | `0` | Cross-check the first n one-row verify windows against the plain decode path from the same state (per-layer residual, final logits, GDN state) |
+| `FT_SPEC_NO_GRAPH` / `FT_SPEC_NO_MTP_GRAPH` | off | Keep the verify window / the draft head eager (A/B runs) |
+| `FT_SPEC_GRAPH_MIN_FREE_MB` | `256` | Drop the verify-window graphs when less VRAM than this is left after capture (`0` keeps them) |
+| `FREETOKEN_PREMAP_VRAM` | off | Pre-map the remaining VRAM into the allocator cache at startup; an experiment that did not help on the 2060 (per-stream pools), left as a knob |
 
 ## Known limitations
 
@@ -143,6 +157,12 @@ Turing/offload setups as a correctness-verified feature, not a speed-up.
 - On Turing, use `--dtype float16`. Prefill has a fixed cost of ~5 s per chunk on the 2060 under
   WSL (the experts of the CPU-side layers are streamed from pageable host memory each chunk);
   beyond that it is ~1.3 ms per token.
+- Under WSL2 on a full 6 GB card, PyTorch's expandable-segment allocator intermittently died
+  with `CUDA driver error: device not ready` when it had to release cached segments while
+  other streams were busy. The Turing prefill scratches (MoE dequant chunks, fp8 dequant) are
+  therefore fixed-size and allocated once at startup, before the graphs, so serving never
+  grows or shrinks segments through the driver; keep `--memory-ratio 0.80` there so the
+  planner leaves ~0.5 GiB for them.
 - The Triton attention backend is used on Turing; flashinfer's JIT attention fails there at
   head_dim 256.
 - DeepStack vision checkpoints (Qwen3-VL proper) are refused; only checkpoints with an empty
