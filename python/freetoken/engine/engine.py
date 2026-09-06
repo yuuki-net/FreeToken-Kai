@@ -32,6 +32,7 @@ from .config import EngineConfig
 from .graph import GraphRunner, get_free_memory
 from .sample import BatchSamplingArgs, Sampler
 from .spec import SpecResult, accept_drafts
+from .spec_graph import spec_graph_applicable
 from freetoken.kvcache import create_kv_pool, resolve_pool_class
 from freetoken.kvcache.base import CacheRebuildRejected
 from freetoken.kvcache.cache_status import _supports_swa_ratio
@@ -405,6 +406,7 @@ class Engine:
         # the offload cache's extra bank layer (see _quantize_mtp_experts / _append_mtp_bank)
         self.spec_k = int(getattr(config, "spec_mtp", 0) or 0)
         self._spec_profiler = None
+        self._spec_graph = None  # SpecVerifyGraph once captured (end of __init__)
         self._mtp_raw: Dict[str, torch.Tensor] = {}
         self._mtp_bank_host: Dict[str, torch.Tensor] | None = None
         self._mtp_bank_bytes = 0
@@ -555,6 +557,46 @@ class Engine:
         if config.attention_backend.split(",")[0] == "triton":
             # Prefill runs on the first comma part; warm its autotune cache.
             self._warmup_prefill()
+        if self.spec_k > 0:
+            self._capture_spec_graph()
+
+    def _capture_spec_graph(self) -> None:
+        """Capture the K+1-row verify window as a CUDA graph (see engine/spec_graph), then the
+        draft head's window pass and chain step. Needs the decode graphs enabled (same
+        static-buffer machinery) and an attention backend that stages the window;
+        FT_SPEC_NO_GRAPH=1 keeps the eager path for A/B runs, FT_SPEC_NO_MTP_GRAPH=1 keeps the
+        head eager. A capture failure logs and falls back to the eager path."""
+        from .spec_graph import SpecVerifyGraph
+
+        self._spec_graph = None
+        if os.environ.get("FT_SPEC_NO_GRAPH") == "1":
+            logger.info("--spec-mtp: FT_SPEC_NO_GRAPH=1, the verify window stays eager")
+            return
+        if self.graph_runner.max_graph_bs == 0 or not hasattr(self.attn_backend, "stage_spec"):
+            logger.info(
+                "--spec-mtp: no CUDA graph for the verify window (decode graphs disabled, or the "
+                f"attention backend {type(self.attn_backend).__name__} does not stage it); eager"
+            )
+            return
+        rows = self.spec_k + 1
+        try:
+            self.attn_backend.init_spec_capture(rows)
+            sg = SpecVerifyGraph(self, rows)
+            sg.capture()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"--spec-mtp: verify-window graph capture failed, staying eager: {exc!r}")
+            if self.moe_offload_cache is not None:
+                self.moe_offload_cache.reset()
+            return
+        self._spec_graph = sg
+        if self.model.mtp is not None and os.environ.get("FT_SPEC_NO_MTP_GRAPH") != "1":
+            try:
+                sg.capture_mtp()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(f"--spec-mtp: draft-head graph capture failed, the head stays eager: {exc!r}")
+                sg.g_window = sg.g_chain = None
+                if self.moe_offload_cache is not None:
+                    self.moe_offload_cache.reset()
 
     def _init_communication(self, config: EngineConfig) -> torch.distributed.ProcessGroup:
         if config.tp_info.size == 1 or config.use_pynccl:
@@ -1119,6 +1161,9 @@ class Engine:
             dummy_req=self.dummy_req,
             moe_offload_cache=self.moe_offload_cache,
         )
+        if self.spec_k > 0:
+            # the verify-window graph addressed the old pools / page table: capture it again
+            self._capture_spec_graph()
 
     def forward_batch(self, batch: Batch, args: BatchSamplingArgs) -> ForwardOutput:
         assert torch.cuda.current_stream() == self.stream
@@ -1134,8 +1179,15 @@ class Engine:
                 # single-request decode step runs eagerly instead
                 use_graph = False
         rows = batch.input_ids.numel() if batch.is_prefill else batch.size
+        # the captured K+1-row verify window (engine/spec_graph); shorter windows stay eager
+        sg = self._spec_graph
+        if sg is not None and not (batch.spec_verify and spec_graph_applicable(batch, rows, sg.rows)):
+            sg = None
         # diagnostics: cross-check a one-row verify window against the plain decode path
-        check = _SPEC_CHECK_STEP_LEFT[0] > 0 and batch.spec_verify and rows == 1 and not use_graph
+        check = (
+            _SPEC_CHECK_STEP_LEFT[0] > 0 and batch.spec_verify and rows == 1
+            and not use_graph and sg is None
+        )
         snap = self._spec_snapshot(batch.reqs[0]) if check else None
         if check:
             self.ctx.debug_layer_outs = []
@@ -1145,8 +1197,16 @@ class Engine:
             if prof is None:
                 prof = self._spec_profiler = _SpecProfiler()
             prof.start()
-        with self.ctx.forward_batch(batch), self.model.forward_host_ctx(batch, use_graph):
-            logits = self.graph_runner.replay(batch) if use_graph else self.model.forward()
+        if sg is not None:
+            sg.stage(batch)
+        with self.ctx.forward_batch(batch), self.model.forward_host_ctx(batch, use_graph or sg is not None):
+            if sg is not None:
+                logits = sg.replay()
+            else:
+                logits = self.graph_runner.replay(batch) if use_graph else self.model.forward()
+        if sg is not None:
+            # the rollback reads the GDN stashes recorded at capture (rewritten by the replay)
+            self.ctx.spec_stash = sg.stash
         if prof is not None:
             prof.mark("target_forward")
         if check:
@@ -1173,7 +1233,7 @@ class Engine:
             if prof is not None:
                 prof.mark("rollback")
             drafts = self._mtp_draft(
-                batch, rows, row=len(accepted) - 1, next_token=accepted[-1], prof=prof,
+                batch, rows, row=len(accepted) - 1, next_token=accepted[-1], prof=prof, sg=sg,
             )
             spec_res = SpecResult(accepted, drafts)
             if _SPEC_TRACE_LEFT[0] > 0:
@@ -1319,14 +1379,30 @@ class Engine:
     # ------------------------------------------------------------------ MTP draft head
     def _mtp_draft(
         self, batch: Batch, rows: int, *, row: int, next_token: int, draft: bool = True, prof=None,
+        sg=None,
     ) -> list:
         """Run the draft head over this forward's rows (fills its KV for them) and, when
-        ``draft``, chain ``spec_k`` greedy draft tokens from ``row`` (the last accepted row) on."""
+        ``draft``, chain ``spec_k`` greedy draft tokens from ``row`` (the last accepted row) on.
+        ``sg`` is the replayed verify-window graph, when the target ran as one: its final hidden
+        state lives in the graph's static buffer, and its draft-head graphs take over the whole
+        drafting when captured."""
         mtp = self.model.mtp
         if mtp is None:
             return []
         req = batch.reqs[0]
-        hidden = self.model.last_hidden[:rows]
+        rope = getattr(req, "mm_rope", None)
+        delta = int(rope.delta) if rope is not None else 0
+        if sg is not None and draft and sg.mtp_ready and rows == sg.rows:
+            # successor ids of the window rows: the drafts, then the target's sample; the
+            # drafting row's successor is the sample (see the eager path below)
+            next_ids = list(req.spec_drafts)[: rows - 1] + [next_token]
+            next_ids[row] = next_token
+            return sg.mtp_draft(
+                req, row=row, next_ids=next_ids, pos_row=req.cached_len + row, rope_delta=delta, prof=prof,
+            )
+        # a replayed window leaves its hidden state in the graph's static buffer (the model
+        # attribute still points at the last eager forward's tensor)
+        hidden = (sg.hidden if sg is not None else self.model.last_hidden)[:rows]
         ids = batch.input_ids[:rows]
         tail = torch.tensor([next_token], dtype=ids.dtype, device=ids.device)
         next_ids = torch.cat([ids[1:], tail]) if rows > 1 else tail
@@ -1345,8 +1421,6 @@ class Engine:
         if prof is not None:
             prof.mark("mtp_window")
         pos_row = int(batch.positions[row].item())
-        rope = getattr(req, "mm_rope", None)
-        delta = int(rope.delta) if rope is not None else 0
         for j in range(1, self.spec_k):
             p = pos_row + j
             if p + 1 > (req.spec_alloc_len or 0):

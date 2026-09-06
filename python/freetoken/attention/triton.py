@@ -349,3 +349,39 @@ class TritonAttentionBackend(BaseAttnBackend):
         assert isinstance(metadata, TritonMetadata)
         assert self.capture is not None and bs in self.capture_bs
         self._point_to_capture(metadata, bs)
+
+    # ----- CUDA graph (MTP verify window) --------------------------------------------------
+    def init_spec_capture(self, rows: int) -> None:
+        """Static addressing of the K+1-row verify window of one request (engine/spec_graph):
+        one page-table row's KV indices, a two-entry kv indptr, the constant query indptr and
+        token->request map, and the prefix length. Restaged per replay by ``stage_spec``."""
+        width = get_global_ctx().page_table.shape[1]
+        dev = self.device
+        self._spec = {
+            "rows": rows,
+            "indices": torch.zeros(width, dtype=torch.int32, device=dev),
+            "indptr": torch.zeros(2, dtype=torch.int32, device=dev),
+            "cu_q": torch.tensor([0, rows], dtype=torch.int32, device=dev),
+            "prefix": torch.zeros(1, dtype=torch.int32, device=dev),
+            "q_to_req": torch.zeros(rows, dtype=torch.int32, device=dev),
+        }
+
+    def stage_spec(self, md, *, table_idx: int, kv_len: int) -> None:
+        """Copy this step's window addressing into the static spec buffers and point ``md``
+        at them (the captured kernels read the buffers; an eager forward on the same batch,
+        e.g. the draft head, reads them through ``md`` too)."""
+        s = getattr(self, "_spec", None)
+        assert s is not None, "init_spec_capture() first"
+        assert isinstance(md, TritonMetadata) and not md.is_decode
+        rows = s["rows"]
+        page_table = get_global_ctx().page_table
+        s["indices"][:kv_len].copy_(page_table[table_idx, :kv_len])
+        s["indptr"][1:].fill_(kv_len)
+        s["prefix"].fill_(kv_len - rows)
+        md.indices = s["indices"]
+        md.indptr = s["indptr"]
+        md.cu_seqlens_q_gpu = s["cu_q"]
+        md.prefix_lens = s["prefix"]
+        md.q_to_req = s["q_to_req"]
+        md.max_q_len = rows
+        md.swa_indices = None

@@ -251,6 +251,20 @@ def test_channels_first_copy_never_aliases_the_conv_input():
     assert one.transpose(0, 1).contiguous().data_ptr() == one.data_ptr()
 
 
+def test_spec_graph_applicable_only_for_full_windows():
+    from freetoken.engine.spec_graph import spec_graph_applicable
+
+    def batch(rows, cached=100, verify=True, n=1):
+        req = SimpleNamespace(cached_len=cached, device_len=cached + rows)
+        return SimpleNamespace(spec_verify=verify, reqs=[req] * n)
+
+    assert spec_graph_applicable(batch(4), 4, 4)
+    assert not spec_graph_applicable(batch(2), 2, 4)            # short window (budget tail)
+    assert not spec_graph_applicable(batch(4, verify=False), 4, 4)
+    assert not spec_graph_applicable(batch(4, cached=0), 4, 4)  # no cached prefix to continue
+    assert not spec_graph_applicable(batch(4, n=2), 4, 4)
+
+
 def _build(cfg):
     from freetoken.layers import set_rope_device
     from freetoken.models.qwen3_5_moe.model import Qwen3_5MoEForCausalLM
