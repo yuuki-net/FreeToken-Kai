@@ -33,8 +33,11 @@ def _reference(x, w_gu, w_d, w, ids, on_input):
 
 
 @pytest.mark.parametrize("on_input", [False, True])
-def test_scratch_prefill_matches_reference(monkeypatch, on_input):
+@pytest.mark.parametrize("rows_per_block", [64, 3])  # 3: several blocks per chunk, shrinking prefixes
+def test_scratch_prefill_matches_reference(monkeypatch, on_input, rows_per_block):
     torch.manual_seed(0)
+    monkeypatch.setattr(fm, "_SCRATCH_ROWS_PER_BLOCK", rows_per_block)
+    fm._SCRATCH_BUFFERS.clear()
     w_gu, w_d = _fake_weights(1)
 
     def fake_dequant(packed, scale, glob, slots, out=None, *, dtype=torch.bfloat16):

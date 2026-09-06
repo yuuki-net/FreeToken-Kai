@@ -275,6 +275,7 @@ def _scratch_moe_preferred() -> bool:
 
 
 _SCRATCH_EXPERTS_PER_CHUNK = 32  # 32 experts x (2I x H + H x I) fp16 ~ 200 MB for Qwen3.5-35B-A3B
+_SCRATCH_ROWS_PER_BLOCK = 64     # rows per expert per bmm; bounds the loop's buffers (~45 MB total)
 _SCRATCH_BUFFERS: dict = {}
 
 
@@ -304,12 +305,19 @@ def _fused_experts_nvfp4_scratch(
     num_experts: int,
     apply_router_weight_on_input: bool,
 ) -> torch.Tensor:
-    """silu-gated prefill MoE as batched cuBLAS GEMMs over dequantised fp16/bf16 experts.
-    Routes are grouped by expert once (argsort); per chunk of experts the routed rows are gathered
-    into a padded ``[experts, L_max, H]`` block and go through two ``bmm`` calls
-    (``x @ W_gu^T -> silu(gate) * up -> @ W_d^T``); the route weights and the sum over a token's
-    routes are applied in fp32. The padding waste (L_max vs the mean rows per expert) is cheap
-    next to launching one GEMM per expert. One host sync per layer (route counts)."""
+    """silu-gated prefill MoE as batched cuBLAS GEMMs over dequantised fp16/bf16 experts, with a
+    bounded working set. Routes are grouped by expert once (argsort); experts are processed in
+    chunks of 32, ordered by their route count so the experts of a chunk have similar queue
+    lengths; each chunk's queues are walked in blocks of ``_SCRATCH_ROWS_PER_BLOCK`` rows and
+    every block goes through two ``bmm`` calls (``x @ W_gu^T -> silu(gate) * up -> @ W_d^T``)
+    over the experts that still have rows in it (a prefix of the chunk, thanks to the ordering).
+    The route weights and the sum over a token's routes are applied in fp32.
+
+    Every device tensor of the loop lives in a persistent buffer sized by the block, not by the
+    prompt: on a full 6 GB card the earlier per-chunk temporaries (``[experts, L_max, H]`` fp32,
+    100+ MB for a 4096-token chunk) made the caching allocator release expandable segments,
+    which surfaces as ``CUDA driver error: device not ready``. One host sync per layer (route
+    counts)."""
     from freetoken.kernel.triton.nvfp4_dequant import dequant_nvfp4
 
     M, H = hidden_states.shape
@@ -317,21 +325,29 @@ def _fused_experts_nvfp4_scratch(
     dt = hidden_states.dtype
     dev = hidden_states.device
     inter = gate_up_packed.shape[1] // 2
+    C, LB = _SCRATCH_EXPERTS_PER_CHUNK, _SCRATCH_ROWS_PER_BLOCK
     flat_ids = topk_ids.reshape(-1).to(torch.int64)
     flat_w = topk_weights.reshape(-1).to(torch.float32)
     order = torch.argsort(flat_ids)
     counts = torch.bincount(flat_ids.clamp(min=0), minlength=num_experts)
     starts = torch.cumsum(counts, 0) - counts
     counts_cpu = counts.tolist()
-    starts_cpu = starts.tolist()
+    # experts by queue length, longest first; idle experts drop out
+    by_len = sorted((e for e in range(num_experts) if counts_cpu[e] > 0), key=lambda e: -counts_cpu[e])
     out = torch.zeros(M, H, dtype=torch.float32, device=dev)
-    for base in range(0, num_experts, _SCRATCH_EXPERTS_PER_CHUNK):
-        top = min(base + _SCRATCH_EXPERTS_PER_CHUNK, num_experts)
-        l_max = max(counts_cpu[base:top])
-        if l_max == 0:
-            continue
-        slots = torch.arange(base, top, dtype=torch.int32, device=dev)
-        n = top - base
+    if not by_len:
+        return out.to(dt)
+    x_buf = _scratch_buffer("x", (C * LB, H), dt, dev)
+    h_buf = _scratch_buffer("h", (C, LB, 2 * inter), dt, dev)
+    a_buf = _scratch_buffer("a", (C, LB, inter), dt, dev)
+    y16_buf = _scratch_buffer("y16", (C, LB, H), dt, dev)
+    y32_buf = _scratch_buffer("y32", (C, LB, H), torch.float32, dev)
+    ar = torch.arange(LB, device=dev)
+    last = order.numel() - 1
+    for c0 in range(0, len(by_len), C):
+        chunk = by_len[c0 : c0 + C]
+        n = len(chunk)
+        slots = torch.tensor(chunk, dtype=torch.int32, device=dev)
         w_gu = dequant_nvfp4(
             gate_up_packed, gate_up_scale, gate_up_global, slots,
             out=_scratch_buffer("gate_up", (n, 2 * inter, H), dt, dev), dtype=dt,
@@ -340,22 +356,27 @@ def _fused_experts_nvfp4_scratch(
             down_packed, down_scale, down_global, slots,
             out=_scratch_buffer("down", (n, H, inter), dt, dev), dtype=dt,
         )
-        # padded route table for the chunk: pos[j, l] = the l-th route of expert base+j
-        ar = torch.arange(l_max, device=dev)
-        valid = ar[None, :] < counts[base:top, None]                       # [c, L]
-        pos = (starts[base:top, None] + ar[None, :]).clamp(max=order.numel() - 1)
-        rows = order[pos]                                                  # [c, L] flat route ids
-        tok = (rows // top_k) * valid                                      # padding rows -> token 0
-        rw = flat_w[rows] * valid                                          # padding rows -> weight 0
-        x_pad = hidden_states.index_select(0, tok.reshape(-1)).view(top - base, l_max, H)
-        if apply_router_weight_on_input:
-            x_pad = (x_pad.float() * rw[..., None]).to(dt)
-        h = torch.bmm(x_pad, w_gu.transpose(1, 2))                         # [c, L, 2I]
-        a = torch.nn.functional.silu(h[..., :inter]) * h[..., inter:]
-        y = torch.bmm(a, w_d.transpose(1, 2)).float()                      # [c, L, H]
-        y = y * (valid[..., None] if apply_router_weight_on_input else rw[..., None])
-        out.index_add_(0, tok.reshape(-1), y.reshape(-1, H))
-        del x_pad, h, a, y
+        e_ids = slots.long()
+        for l0 in range(0, counts_cpu[chunk[0]], LB):
+            # experts of the chunk with rows in this block: a prefix (queues sorted, longest first)
+            na = sum(1 for e in chunk if counts_cpu[e] > l0)
+            ids = e_ids[:na]
+            # padded route table of the block: pos[j, l] = route l0 + l of expert ids[j]
+            valid = (l0 + ar)[None, :] < counts[ids][:, None]                     # [na, LB]
+            pos = (starts[ids][:, None] + l0 + ar[None, :]).clamp(max=last)
+            rows = order[pos]                                                      # flat route ids
+            tok = (rows // top_k) * valid                                          # padding -> token 0
+            rw = flat_w[rows] * valid                                              # padding -> weight 0
+            xb = torch.index_select(hidden_states, 0, tok.reshape(-1), out=x_buf[: na * LB]).view(na, LB, H)
+            if apply_router_weight_on_input:
+                xb = (xb.float() * rw[..., None]).to(dt)
+            hb = torch.bmm(xb, w_gu[:na].transpose(1, 2), out=h_buf[:na])          # [na, LB, 2I]
+            gate, up = hb[..., :inter], hb[..., inter:]
+            torch.mul(torch.nn.functional.silu(gate, inplace=True), up, out=a_buf[:na])
+            yb = torch.bmm(a_buf[:na], w_d[:na].transpose(1, 2), out=y16_buf[:na])  # [na, LB, H]
+            scale = valid.to(torch.float32) if apply_router_weight_on_input else rw
+            torch.mul(yb, scale[..., None], out=y32_buf[:na])
+            out.index_add_(0, tok.reshape(-1), y32_buf[:na].reshape(-1, H))
     return out.to(dt)
 
 
