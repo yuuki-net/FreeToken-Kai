@@ -240,13 +240,30 @@ def _scratch_gemm_preferred() -> bool:
     return is_pre_ampere()
 
 
+_SCRATCH_BUFFERS: dict = {}
+
+
+def _dequant_scratch(numel: int, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
+    """One persistent flat buffer per (dtype, device), grown to the largest projection seen.
+    Allocating a fresh 50 MB scratch per projection per forward made the caching allocator
+    grow and shrink segments under load, which on a full card (RTX 2060 6 GB under WSL2)
+    intermittently died with ``CUDA driver error: device not ready``."""
+    key = (dtype, str(device))
+    buf = _SCRATCH_BUFFERS.get(key)
+    if buf is None or buf.numel() < numel:
+        buf = _SCRATCH_BUFFERS[key] = torch.empty(numel, dtype=dtype, device=device)
+    return buf
+
+
 def _gemm_scratch(a: torch.Tensor, weight: torch.Tensor, weight_scale: torch.Tensor,
                   out_dtype: torch.dtype) -> torch.Tensor:
     """M>1 W8A16 GEMM as dequant + cuBLAS: ``weight`` [N, K] fp8 (the fp8 tensor, not the
-    uint8 view) is expanded to a per-call ``[N, K]`` scratch in the activation dtype with the
-    per-row scale folded in (so the product stays in fp16 range), then ``a @ w.t()``. The
-    scratch is ~50 MB for a 12288 x 2048 projection and is freed on return."""
-    w = weight.to(a.dtype) * weight_scale.to(a.dtype)[:, None]
+    uint8 view) is expanded into a persistent ``[N, K]`` scratch in the activation dtype with
+    the per-row scale folded in (so the product stays in fp16 range), then ``a @ w.t()``."""
+    n, k = weight.shape
+    w = _dequant_scratch(n * k, a.dtype, a.device)[: n * k].view(n, k)
+    w.copy_(weight)  # fp8 -> activation dtype
+    w.mul_(weight_scale.to(a.dtype)[:, None])
     return (a @ w.t()).to(out_dtype)
 
 
