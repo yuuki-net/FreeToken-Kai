@@ -352,6 +352,9 @@ class ModelConfig:
     # Extra per-request tensors riding the LinearStatePool slots (see SlotStateSpec);
     # () for models without any. Requires a linear-attention group to ride on.
     slot_states: Tuple[SlotStateSpec, ...] = ()
+    # MTP draft head served as decoder layer ``mtp_layer_id`` (== num_layers): it joins the
+    # full-attention group for KV allocation and the model builds the head. None = no head.
+    mtp_layer_id: int | None = None
 
     @property
     def is_moe(self) -> bool:
@@ -512,3 +515,23 @@ class ModelConfig:
             for group in self.kv_cache_group_specs()
             if group.num_layers > 0
         ]
+
+
+def with_mtp_layer(config: ModelConfig, layer_id: int) -> ModelConfig:
+    """``config`` with the MTP draft head registered as one more full-attention decoder
+    layer (``layer_id``, normally ``num_layers``): it joins the full-attention group so the
+    paged KV pool backs its slab, and ``mtp_layer_id`` tells the model to build the head.
+    ``num_layers`` is unchanged (the head is not part of the decoder stack); the head's
+    expert layer is appended to the offload cache by the engine."""
+    from dataclasses import replace
+
+    groups = []
+    for group in config.attention_groups:
+        if isinstance(group, FullAttentionGroupConfig):
+            ids = tuple(group.layer_ids) + (layer_id,)
+            fields = {"layer_ids": ids}
+            if getattr(group, "num_index_layers", 0):
+                fields["num_index_layers"] = len(ids)
+            group = replace(group, **fields)
+        groups.append(group)
+    return replace(config, attention_groups=tuple(groups), mtp_layer_id=layer_id)

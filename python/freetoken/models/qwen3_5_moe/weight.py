@@ -58,7 +58,19 @@ _GEMMA_NORM_SUFFIXES = (
     ".post_attention_layernorm.weight",
     ".self_attn.q_norm.weight",
     ".self_attn.k_norm.weight",
+    # the MTP draft head's norms (same (1+w) RMSNorm as the decoder)
+    ".pre_fc_norm_embedding.weight",
+    ".pre_fc_norm_hidden.weight",
 )
+
+# The MTP draft head's routed experts (bf16 in the modelopt checkpoints: ``mtp*`` is on the
+# quantizer's exclude list). Stacked by ``_stack_mtp_experts`` into the two tensors the engine
+# quantizes into an NVFP4 bank layer.
+_MTP_EXPERT_RE = re.compile(
+    r"^mtp\.layers\.0\.mlp\.experts\.(?P<expert>\d+)\.(?P<proj>gate_proj|up_proj|down_proj)\.weight$"
+)
+_MTP_STACKED_GATE_UP = "mtp.layers.0.mlp.experts.gate_up_proj"
+_MTP_STACKED_DOWN = "mtp.layers.0.mlp.experts.down_proj"
 # shared-expert gate/up merge -> shared_expert.gate_up_proj
 _SHARED_GATE = ".mlp.shared_expert.gate_proj.weight"
 _SHARED_UP = ".mlp.shared_expert.up_proj.weight"
@@ -131,9 +143,33 @@ def _load_maybe_quantized(f, raw_name: str, keyset: set[str]) -> torch.Tensor:
     return tensor
 
 
-def _rename(raw_name: str) -> str | None:
-    """HF key -> FreeToken state-dict key, or None to skip."""
-    if raw_name.startswith(("mtp.", "model.visual.", "visual.")):
+def _stack_mtp_experts(parts: dict[int, dict[str, torch.Tensor]]) -> list[tuple[str, torch.Tensor]]:
+    """Per-expert ``{e: {gate_proj, up_proj, down_proj}}`` -> ``[(gate_up [E, 2I, H]),
+    (down [E, H, I])]`` (bf16, on the parts' device), consuming ``parts`` as it goes so the
+    peak is one stacked copy plus what is not yet stacked."""
+    if not parts:
+        return []
+    e = len(parts)
+    assert set(parts) == set(range(e)), sorted(parts)[:5]
+    g0, u0, d0 = (parts[0][k] for k in ("gate_proj", "up_proj", "down_proj"))
+    inter, hidden = g0.shape
+    assert u0.shape == (inter, hidden) and d0.shape == (hidden, inter), (g0.shape, u0.shape, d0.shape)
+    gate_up = torch.empty(e, 2 * inter, hidden, dtype=g0.dtype, device=g0.device)
+    down = torch.empty(e, hidden, inter, dtype=d0.dtype, device=d0.device)
+    for i in range(e):
+        p = parts.pop(i)
+        gate_up[i, :inter].copy_(p["gate_proj"])
+        gate_up[i, inter:].copy_(p["up_proj"])
+        down[i].copy_(p["down_proj"])
+    return [(_MTP_STACKED_GATE_UP, gate_up), (_MTP_STACKED_DOWN, down)]
+
+
+def _rename(raw_name: str, keep_mtp: bool = False) -> str | None:
+    """HF key -> FreeToken state-dict key, or None to skip. ``mtp.*`` (the draft head) is
+    dropped unless ``keep_mtp`` (--spec-mtp); its keys are already in the model's own naming."""
+    if raw_name.startswith("mtp."):
+        return raw_name if keep_mtp else None
+    if raw_name.startswith(("model.visual.", "visual.")):
         return None
     # ModelOpt FP8 KV-cache static scales (full-attention layers only). FreeToken keeps the
     # KV cache in the engine's native precision (>= the checkpoint's quantized KV), so these
@@ -149,7 +185,7 @@ def _rename(raw_name: str) -> str | None:
 
 
 def _is_gemma_norm(name: str) -> bool:
-    return name == "model.norm.weight" or name.endswith(_GEMMA_NORM_SUFFIXES)
+    return name in ("model.norm.weight", "mtp.norm.weight") or name.endswith(_GEMMA_NORM_SUFFIXES)
 
 
 def _try_fuse(
@@ -176,9 +212,15 @@ def iter_weights(
     *,
     include_moe_experts: bool,
     include_non_moe: bool,
+    include_mtp: bool = False,
 ) -> Iterator[tuple[str, torch.Tensor]]:
     hf_config = cached_load_hf_config(model_path)
     config = parse_config(hf_config)
+    if include_mtp and config.attn_quant != "fp8_pertensor":
+        raise NotImplementedError(
+            "--spec-mtp: the MTP draft head is read from modelopt MIXED_PRECISION checkpoints "
+            "(fp8 attention + NVFP4 experts, e.g. Ornith-1.5-35B-A3B-NVFP4) only"
+        )
     if _compressed_tensors_nvfp4(hf_config):
         # Dense compressed-tensors NVFP4 (e.g. Qwen3.6-27B): attn (q/k/v/o, GDN out_proj) +
         # dense MLP are W4A16 NVFP4; GDN in_proj_*, lm_head, norms bf16.
@@ -207,6 +249,7 @@ def iter_weights(
             include_non_moe=include_non_moe, include_moe_experts=include_moe_experts,
             dense_nvfp4=config.dense_quant == "nvfp4",
             lmhead_nvfp4=config.lm_head_quant == "nvfp4",
+            include_mtp=include_mtp,
         )
         return
     tp_info = get_tp_info()
@@ -308,6 +351,8 @@ _PT_FP8_FUSE: dict[str, tuple[str, ...]] = {
 # bf16 (unquantized) GDN b|a projections fused -> in_proj_ba (matches the fp8 split).
 _PT_BF16_FUSE: dict[str, tuple[str, ...]] = {
     ".linear_attn.in_proj_ba": (".linear_attn.in_proj_b", ".linear_attn.in_proj_a"),
+    # the MTP draft head's attention is bf16 (the decoder's q/k/v are fp8, fused above)
+    ".self_attn.qkv_proj": (".self_attn.q_proj", ".self_attn.k_proj", ".self_attn.v_proj"),
 }
 
 
@@ -426,7 +471,7 @@ def _dense_nvfp4_emit(
 
 def _iter_weights_attn_fp8(
     model_path: str, device: torch.device, *, include_non_moe: bool, include_moe_experts: bool,
-    dense_nvfp4: bool = False, lmhead_nvfp4: bool = False,
+    dense_nvfp4: bool = False, lmhead_nvfp4: bool = False, include_mtp: bool = False,
 ) -> Iterator[tuple[str, torch.Tensor]]:
     """Dense pass for the modelopt MIXED_PRECISION Qwen3.5 checkpoint.
 
@@ -438,7 +483,12 @@ def _iter_weights_attn_fp8(
     (shared_expert, lm_head): kept native FP4 -- ``.weight`` (uint8) + ``.weight_scale``
     (fp8 block) + ``.weight_global`` (fp16 per-row) for the W4A16 kernels -- when
     ``dense_nvfp4`` else dequantized to bf16. Routed NVFP4 experts are excluded (served by
-    the offload cache). Gemma (1+w) norms get +1."""
+    the offload cache). Gemma (1+w) norms get +1.
+
+    ``include_mtp`` (--spec-mtp): the draft head ``mtp.*`` is yielded too. Its dense tensors
+    are bf16 (q|k|v fused, shared gate|up merged, norms +1 like the decoder's); its per-expert
+    bf16 routed experts are gathered on the host and yielded last as two stacked tensors
+    (``mtp.layers.0.mlp.experts.{gate_up_proj,down_proj}``) for the engine to quantize."""
     if get_tp_info().size > 1:
         raise NotImplementedError("qwen3_5_moe weight loading currently supports TP=1 only")
     if not include_non_moe:
@@ -449,6 +499,7 @@ def _iter_weights_attn_fp8(
     bf16_buf: dict[str, dict[int, torch.Tensor]] = {}
     shared_buf: dict[str, dict[str, torch.Tensor]] = {}
     nvfp4_shared_buf: dict[str, dict[str, tuple]] = {}
+    mtp_experts: dict[int, dict[str, torch.Tensor]] = {}
 
     for file in tqdm(
         iter_weight_files(model_path),
@@ -459,11 +510,16 @@ def _iter_weights_attn_fp8(
             keyset = set(f.keys())
             for raw_name in f.keys():
                 if _NVFP4_EXPERT_RE.search(raw_name):
+                    m = _MTP_EXPERT_RE.match(raw_name) if include_mtp else None
+                    if m is not None:
+                        # the head's experts: bf16, off the GPU at once (1.6 GB for 256 x 512)
+                        slots = mtp_experts.setdefault(int(m.group("expert")), {})
+                        slots[m.group("proj")] = _load_maybe_quantized(f, raw_name, keyset).to("cpu")
                     continue  # routed experts -> offload cache
                 if raw_name.endswith(_SCALE_SUFFIXES):
                     continue  # scales consumed with their .weight
 
-                name = _rename(raw_name)
+                name = _rename(raw_name, keep_mtp=include_mtp)
                 if name is None:
                     continue
                 if _PACKED_EXPERT_PATTERN.match(name) is not None:
@@ -529,6 +585,10 @@ def _iter_weights_attn_fp8(
     assert not bf16_buf, f"Incomplete bf16 fusions: {list(bf16_buf.keys())}"
     assert not shared_buf, f"Incomplete shared-expert merges: {list(shared_buf.keys())}"
     assert not nvfp4_shared_buf, f"Incomplete NVFP4 shared-expert merges: {list(nvfp4_shared_buf.keys())}"
+    if include_mtp:
+        stacked = _stack_mtp_experts(mtp_experts)
+        assert stacked, "--spec-mtp: the checkpoint has no mtp.layers.0.mlp.experts.* tensors"
+        yield from stacked
 
 
 # ======================================================================================

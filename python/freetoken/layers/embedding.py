@@ -104,7 +104,7 @@ class ParallelLMHead(VocabParallelEmbedding):
         ctx = get_global_ctx()
         batch = ctx.batch
         bs = batch.size
-        if batch.is_prefill:
+        if batch.is_prefill and not getattr(batch, "spec_all_rows", False):
             indices = batch.attn_metadata.get_last_indices(bs)
             x = x[indices].contiguous()
             del indices
@@ -123,3 +123,9 @@ class ParallelLMHead(VocabParallelEmbedding):
         output_tensor = output_tensor.permute(1, 0, 2).contiguous()
         output_tensor = output_tensor.reshape(input_shape[:1] + (self.tp_size * input_shape[1],))
         return output_tensor[:, : self.num_embeddings]
+
+    def logits(self, x: torch.Tensor) -> torch.Tensor:
+        """Raw head GEMM over the rows given (no batch bookkeeping; TP=1). The MTP draft head
+        scores its own hidden states through the shared head with this."""
+        module = self.tied_embedding or self
+        return F.linear(x, module.weight, self.bias)

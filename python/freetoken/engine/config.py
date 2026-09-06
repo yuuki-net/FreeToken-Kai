@@ -77,6 +77,10 @@ class EngineConfig:
     distributed_timeout: float = 60.0
     use_dummy_weight: bool = False
     use_pynccl: bool = True
+    # --spec-mtp K: MTP speculative decoding with K drafts per step (0 = off). The draft head
+    # (the checkpoint's mtp.* block) is built as one extra full-attention layer (id =
+    # num_layers) with its own KV slab and one extra expert-bank layer. Single request.
+    spec_mtp: int = 0
     max_seq_len_override: int | None = None
     num_page_override: int | None = None  # if not None, will override the number of pages
     # KV capacity in tokens; resolved into num_page_override by _adjust_config once page_size
@@ -91,7 +95,13 @@ class EngineConfig:
     def model_config(self) -> ModelConfig:
         spec = get_model_spec(self.hf_config.architectures[0])
         parse_config = _load_attr(spec.module, spec.parse_config)
-        return parse_config(self.hf_config)
+        config = parse_config(self.hf_config)
+        if self.spec_mtp > 0:
+            from freetoken.models.config import with_mtp_layer
+
+            # the draft head joins the full-attention group as layer num_layers
+            config = with_mtp_layer(config, config.num_layers)
+        return config
 
     @property
     def max_seq_len(self) -> int:

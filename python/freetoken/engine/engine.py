@@ -3,6 +3,8 @@ from __future__ import annotations
 import gc
 import math
 import os
+import re
+import time
 from datetime import timedelta
 from typing import Any, Dict, Iterable, NamedTuple, Tuple
 
@@ -29,6 +31,7 @@ from freetoken.utils import (
 from .config import EngineConfig
 from .graph import GraphRunner, get_free_memory
 from .sample import BatchSamplingArgs, Sampler
+from .spec import SpecResult, accept_drafts
 from freetoken.kvcache import create_kv_pool, resolve_pool_class
 from freetoken.kvcache.base import CacheRebuildRejected
 from freetoken.kvcache.cache_status import _supports_swa_ratio
@@ -295,16 +298,117 @@ def _materialize_loaded_weight_state_dict(
     return state_dict
 
 
+def _drop_unknown_mtp(weights, model_state: Dict[str, torch.Tensor]):
+    """A checkpoint's mtp.* tensors the built model has no buffer for are dropped here (the
+    draft head is only built under --spec-mtp; readers that keep mtp.* only do so then)."""
+    dropped = 0
+    for key, weight in weights:
+        if key.startswith("mtp.") and key not in model_state:
+            dropped += 1
+            del weight
+            continue
+        yield key, weight
+    if dropped:
+        logger.info_rank0(f"skipped {dropped} MTP head tensors the model does not declare")
+
+
 class ForwardOutput(NamedTuple):
     next_tokens_gpu: torch.Tensor
     next_tokens_cpu: torch.Tensor
     copy_done_event: torch.cuda.Event
+    # --spec-mtp: the committed tokens of this step and the drafts for the next window
+    spec: Any = None
+
+
+# the stacked bf16 experts of the draft head, as the reader yields them
+_MTP_EXPERT_RE = re.compile(r"^mtp\.layers\.0\.mlp\.experts\.(gate_up_proj|down_proj)$")
+
+# FT_SPEC_TRACE=n: log the first n verify windows (ids, samples, drafts, top logits)
+_SPEC_TRACE_LEFT = [int(os.environ.get("FT_SPEC_TRACE", "0") or 0)]
+# FT_SPEC_PROFILE=1: synchronize between the phases of a verify step and log their mean wall
+# time every 20 steps (the syncs themselves add a little, so read it as a breakdown, not a total)
+_SPEC_PROFILE = os.environ.get("FT_SPEC_PROFILE") == "1"
+
+
+class _SpecProfiler:
+    """Phase timer for the verify step: ``mark(name)`` synchronizes the device and charges
+    the time since the previous mark to ``name``; ``step()`` closes a step and logs the
+    per-phase means every ``every`` steps."""
+
+    def __init__(self, every: int = 20) -> None:
+        self.every = every
+        self.totals: dict[str, float] = {}
+        self.order: list[str] = []
+        self.steps = 0
+        self._t = None
+
+    def start(self) -> None:
+        torch.cuda.synchronize()
+        self._t = time.perf_counter()
+
+    def mark(self, name: str) -> None:
+        if self._t is None:
+            return
+        torch.cuda.synchronize()
+        now = time.perf_counter()
+        if name not in self.totals:
+            self.totals[name] = 0.0
+            self.order.append(name)
+        self.totals[name] += now - self._t
+        self._t = now
+
+    def step(self) -> None:
+        self._t = None
+        self.steps += 1
+        if self.steps % self.every:
+            return
+        n = self.steps
+        total = sum(self.totals.values())
+        parts = " ".join(f"{k}={1000 * v / n:.1f}" for k, v in ((k, self.totals[k]) for k in self.order))
+        logger.warning(f"spec profile (ms/step over {n} steps, total {1000 * total / n:.1f}): {parts}")
+        self.totals = {k: 0.0 for k in self.order}
+        self.steps = 0
+
+
+def _expand_sampling_args(args: BatchSamplingArgs, rows: int) -> BatchSamplingArgs:
+    """Per-row sampling params for a verify window (one request, ``rows`` logits rows)."""
+    if args.temperatures is None or args.temperatures.numel() == rows:
+        return args
+
+    def ex(t):
+        return None if t is None else t.expand(rows).contiguous()
+
+    return BatchSamplingArgs(ex(args.temperatures), top_k=ex(args.top_k), top_p=ex(args.top_p))
+
+
+def _pinned_empty(shape, dtype: torch.dtype) -> torch.Tensor:
+    """An uninitialized pinned host tensor (allocated as bytes: the pinned allocator knows
+    uint8 for sure)."""
+    from freetoken.kernel.pinned import alloc_pinned_tensor
+
+    numel = 1
+    for d in shape:
+        numel *= int(d)
+    raw = alloc_pinned_tensor(numel * torch.empty((), dtype=dtype).element_size(), dtype=torch.uint8)
+    return raw.view(dtype).view(*shape)
 
 
 class Engine:
     def __init__(self, config: EngineConfig):
         assert not torch.cuda.is_initialized()
         set_tp_info(rank=config.tp_info.rank, size=config.tp_info.size)
+        # --spec-mtp: draft depth; the head's bf16 experts captured at load and quantized into
+        # the offload cache's extra bank layer (see _quantize_mtp_experts / _append_mtp_bank)
+        self.spec_k = int(getattr(config, "spec_mtp", 0) or 0)
+        self._spec_profiler = None
+        self._mtp_raw: Dict[str, torch.Tensor] = {}
+        self._mtp_bank_host: Dict[str, torch.Tensor] | None = None
+        self._mtp_bank_bytes = 0
+        self._mtp_bank_layers = 0
+        if self.spec_k > 0:
+            from freetoken.kvcache import qsa_pool as _qsa_pool
+
+            _qsa_pool.SPECULATIVE_TOKENS = self.spec_k  # before the pool exists
         _ensure_expandable_segments()  # before the first CUDA allocation below
 
         from freetoken.gpu_select import bind_assigned_gpu
@@ -333,6 +437,11 @@ class Engine:
         set_rope_device(self.device)
         with torch.device("meta"), torch_dtype(config.dtype):
             self.model = create_model(config.model_config)
+        if self.spec_k > 0 and getattr(self.model, "mtp", None) is None:
+            raise ValueError(
+                f"--spec-mtp: {type(self.model).__name__} builds no MTP draft head "
+                "(supported: the Qwen3.5-MoE family with mtp.* tensors in the checkpoint)"
+            )
         self.model.load_state_dict(self._load_weight_state_dict(config))
         post_weights_free = self._sync_get_memory()[0]
         self._weights_bytes = self._baseline_free - post_weights_free
@@ -350,6 +459,7 @@ class Engine:
         self._host_tables_bytes = 0
         if hasattr(self.model, "load_host_tables"):
             self._host_tables_bytes = int(self.model.load_host_tables(config) or 0)
+        self._host_tables_bytes += self._mtp_bank_bytes  # the draft head's pinned bank layer
         if is_offload_moe_backend(config.moe_backend):
             self._init_offload_moe_cache(config)
         if hasattr(self.model, "prepare_for_runtime"):
@@ -476,15 +586,86 @@ class Engine:
         # _materialize casts each loaded tensor to its model-param dtype (model_state), so
         # models declaring per-tensor dtypes (e.g. DSV4's mixed fp8/fp32/bf16) are preserved;
         # offload models exclude experts (served from the offload cache, not dense weights).
-        return _materialize_loaded_weight_state_dict(
-            model_state,
-            load_weight(
-                config.model_path,
-                self.device,
-                include_moe_experts=not is_offload_moe_backend(config.moe_backend),
-            ),
-            device=self.device,
+        has_mtp = getattr(self.model, "mtp", None) is not None
+        weights = load_weight(
+            config.model_path,
+            self.device,
+            include_moe_experts=not is_offload_moe_backend(config.moe_backend),
+            include_mtp=has_mtp,
         )
+        if has_mtp:
+            weights = self._capture_mtp_experts(weights)
+        weights = _drop_unknown_mtp(weights, model_state)
+        state = _materialize_loaded_weight_state_dict(model_state, weights, device=self.device)
+        if has_mtp:
+            self._quantize_mtp_experts()
+        return state
+
+    # ------------------------------------------------------------------ MTP expert bank layer
+    def _capture_mtp_experts(self, weights):
+        """Pull the head's stacked bf16 experts (``mtp.layers.0.mlp.experts.{gate_up,down}_proj``)
+        out of the weight stream: they become a bank layer, not model buffers."""
+        for key, weight in weights:
+            m = _MTP_EXPERT_RE.match(key)
+            if m is None:
+                yield key, weight
+                continue
+            self._mtp_raw[m.group(1)] = weight.to("cpu")
+            del weight
+
+    def _quantize_mtp_experts(self) -> None:
+        """Quantize the captured bf16 experts to the native NVFP4 bank layout, into pinned host
+        tensors -- right after the dense weights, so the bf16 copy (1.6 GB for 256 x 512) is gone
+        before the expert banks load. ``_append_mtp_bank`` hands the result to the cache."""
+        from freetoken.kernel.triton.nvfp4_quant import nvfp4_expert_bank_specs, quantize_nvfp4_experts
+
+        raw = self._mtp_raw
+        assert set(raw) == {"gate_up_proj", "down_proj"}, (
+            f"--spec-mtp: MTP experts missing from the checkpoint: got {sorted(raw)}"
+        )
+        gate_up, down = raw["gate_up_proj"], raw["down_proj"]
+        if gate_up.shape[-1] != down.shape[-2]:  # [E, H, 2I] / [E, I, H] storage -> [E, 2I, H] / [E, H, I]
+            gate_up, down = gate_up.transpose(1, 2).contiguous(), down.transpose(1, 2).contiguous()
+        e, two_i, h = gate_up.shape
+        host = {
+            n: _pinned_empty(shape, dt)
+            for n, (shape, dt) in nvfp4_expert_bank_specs(e, h, two_i // 2).items()
+        }
+        quantize_nvfp4_experts(gate_up, down, chunk=8, device=self.device, out=host)
+        del gate_up, down
+        self._mtp_raw = {}
+        self._mtp_bank_host = host
+        self._mtp_bank_bytes = sum(t.numel() * t.element_size() for t in host.values())
+        torch.cuda.synchronize(self.device)
+        torch.cuda.empty_cache()
+        logger.info(
+            f"MTP draft head: {e}-expert layer quantized to NVFP4 "
+            f"({self._mtp_bank_bytes / 2**20:.0f} MB pinned)"
+        )
+
+    def _append_mtp_bank(self, banks) -> int:
+        """Append the head's quantized experts as the offload cache's last layer (the head's
+        OffloadMoELayer indexes it by ``mtp_layer_id``). Returns the layers appended (0 or 1)."""
+        host = self._mtp_bank_host
+        if host is None:
+            return 0
+        from freetoken.moe.host_banks import HostResidency
+
+        assert banks.quant_format == "nvfp4", (
+            f"the MTP expert bank is written in the native nvfp4 layout; this run uses "
+            f"{banks.quant_format!r} (use --moe-backend hybrid/cpu, or --nvfp4-backend triton)"
+        )
+        for name, per_layer in banks.sources.items():
+            t = host[name]
+            assert t.shape[1:] == per_layer[0].shape[1:] and t.dtype == per_layer[0].dtype, (
+                name, t.shape, per_layer[0].shape, t.dtype, per_layer[0].dtype
+            )
+            per_layer.append(t)
+        if banks.layer_residency is not None:
+            banks.layer_residency.append(HostResidency.PINNED.value)
+        self._mtp_bank_host = None
+        logger.info("MTP draft head: its expert layer appended to the offload cache")
+        return 1
 
     def _resolve_auto_moe_cache_size(self, config: EngineConfig, banks) -> tuple[int, int, bool]:
         """Resolve --moe-cache-auto into (moe_cache_size, num_pages, prefill_overlap).
@@ -602,6 +783,7 @@ class Engine:
                 decode_target=("cpu" if decode_target in ("cpu", "hybrid") else "gpu"),
                 layer_residency=requested_residency,
             )
+            self._mtp_bank_layers = self._append_mtp_bank(banks)
             if config.moe_cache_auto:
                 size, pages, overlap = self._resolve_auto_moe_cache_size(config, banks)
                 object.__setattr__(config, "moe_cache_size", size)
@@ -623,7 +805,8 @@ class Engine:
             cache = OffloadMoeCache(
                 # Models with leading dense layers (GLM-4) only have experts on the MoE
                 # layers; num_moe_layers == num_layers when first_k_dense_replace == 0.
-                num_layers=config.model_config.num_moe_layers,
+                # --spec-mtp appends the draft head's expert layer.
+                num_layers=config.model_config.num_moe_layers + self._mtp_bank_layers,
                 num_experts=config.model_config.num_experts,
                 cache_size=config.moe_cache_size,
                 device=self.device,
@@ -651,7 +834,7 @@ class Engine:
         # attach_offload_moe_cache walks for OffloadMoELayers, or defers to a model's
         # _iter_offload_moe_layers() hook when its MoE blocks are bespoke nn.Modules (DSV4).
         layers = attach_offload_moe_cache(self.model, cache)
-        assert len(layers) == config.model_config.num_moe_layers
+        assert len(layers) == config.model_config.num_moe_layers + self._mtp_bank_layers
         if cache.decode_target in ("cpu", "hybrid"):
             self._init_cpu_moe_executor(config, cache, layers)
         self.ctx.moe_offload_cache = cache
@@ -708,7 +891,8 @@ class Engine:
             )
         # Decode batches never exceed max_running_req, but CUDA-graph padding can
         # round a batch up to the largest captured size; cover both.
-        max_tokens = max(config.max_running_req, config.cuda_graph_max_bs or 0, 1)
+        # An MTP verify window ships spec_k + 1 rows through the CPU executor at once.
+        max_tokens = max(config.max_running_req, config.cuda_graph_max_bs or 0, 1, self.spec_k + 1)
         # gpt-oss mxfp4 carries clamped-swiglu scalars; other formats use the defaults.
         executor = CpuMoeExecutor(
             cache,
@@ -935,22 +1119,147 @@ class Engine:
     def forward_batch(self, batch: Batch, args: BatchSamplingArgs) -> ForwardOutput:
         assert torch.cuda.current_stream() == self.stream
         use_graph = self.graph_runner.can_use_cuda_graph(batch)
+        spec = self.spec_k > 0
+        mtp = getattr(self.model, "mtp", None) if spec else None
+        if spec:
+            batch.spec_all_rows = batch.spec_verify  # the verify window needs every row's logits
+            self.ctx.spec_stash = []
+            if use_graph and batch.size == 1 and mtp is not None:
+                # the draft head reads the target's final hidden state, which a graph replay
+                # leaves in a buffer the model no longer points at: the (rare) plain
+                # single-request decode step runs eagerly instead
+                use_graph = False
+        rows = batch.input_ids.numel() if batch.is_prefill else batch.size
+        prof = None
+        if _SPEC_PROFILE and batch.spec_verify:
+            prof = self._spec_profiler
+            if prof is None:
+                prof = self._spec_profiler = _SpecProfiler()
+            prof.start()
         with self.ctx.forward_batch(batch), self.model.forward_host_ctx(batch, use_graph):
             logits = self.graph_runner.replay(batch) if use_graph else self.model.forward()
+        if prof is not None:
+            prof.mark("target_forward")
         if self.cpu_moe_executor is not None:
             # One pinned read: surfaces a fired flag-handshake watchdog (dead coordinator
             # -> stale expert outputs) as a loud error instead of silent corruption.
             self.cpu_moe_executor.raise_if_unhealthy()
 
-        for req in batch.reqs:
-            req.complete_one()
+        if not batch.spec_verify:
+            for req in batch.reqs:
+                req.complete_one()
 
-        batch_logits = logits[: batch.size]
-        next_tokens_gpu = self.sampler.sample(batch_logits, args).to(torch.int32)
-        next_tokens_cpu = next_tokens_gpu.to("cpu", non_blocking=True)
+        spec_res = None
+        if batch.spec_verify:
+            # the target's own sample at every window row decides how many drafts survive
+            req = batch.reqs[0]
+            sampled = self.sampler.sample(logits[:rows], _expand_sampling_args(args, rows)).to(torch.int32)
+            accepted = accept_drafts(sampled.tolist(), req.spec_drafts)
+            if prof is not None:
+                prof.mark("sample_accept")
+            self.model.spec_rollback(batch, len(accepted), self.ctx)
+            if prof is not None:
+                prof.mark("rollback")
+            drafts = self._mtp_draft(
+                batch, rows, row=len(accepted) - 1, next_token=accepted[-1], prof=prof,
+            )
+            spec_res = SpecResult(accepted, drafts)
+            if _SPEC_TRACE_LEFT[0] > 0:
+                _SPEC_TRACE_LEFT[0] -= 1
+                top = logits[:rows].float().topk(3, dim=-1)
+                logger.info(
+                    f"spec trace: window={batch.input_ids[:rows].tolist()} drafts={req.spec_drafts} "
+                    f"sampled={sampled.tolist()} accepted={accepted} next_drafts={drafts} "
+                    f"top3={top.indices.tolist()} top3_logits={[[round(x, 2) for x in r] for r in top.values.tolist()]}"
+                )
+            next_tokens_cpu = torch.tensor(accepted[:1], dtype=torch.int32)
+            next_tokens_gpu = next_tokens_cpu.to(self.device)
+        else:
+            batch_logits = logits[: batch.size]
+            next_tokens_gpu = self.sampler.sample(batch_logits, args).to(torch.int32)
+            if spec:
+                next_tokens_cpu = next_tokens_gpu.cpu()  # synchronous: read on the host below
+                token = int(next_tokens_cpu[0])
+                drafts = []
+                if batch.size == 1 and mtp is not None:
+                    tail = batch.spec_next_tail
+                    # a non-final prefill chunk only extends the head's KV (no drafting)
+                    drafts = self._mtp_draft(
+                        batch, rows, row=rows - 1,
+                        next_token=tail if tail is not None else token,
+                        draft=tail is None,
+                    )
+                spec_res = SpecResult([token], drafts)
+            else:
+                next_tokens_cpu = next_tokens_gpu.to("cpu", non_blocking=True)
+        if prof is not None and batch.spec_verify:
+            prof.step()
         copy_done_event = torch.cuda.Event()
         copy_done_event.record(self.stream)
-        return ForwardOutput(next_tokens_gpu, next_tokens_cpu, copy_done_event)
+        return ForwardOutput(next_tokens_gpu, next_tokens_cpu, copy_done_event, spec_res)
+
+    # ------------------------------------------------------------------ MTP draft head
+    def _mtp_draft(
+        self, batch: Batch, rows: int, *, row: int, next_token: int, draft: bool = True, prof=None,
+    ) -> list:
+        """Run the draft head over this forward's rows (fills its KV for them) and, when
+        ``draft``, chain ``spec_k`` greedy draft tokens from ``row`` (the last accepted row) on."""
+        mtp = self.model.mtp
+        if mtp is None:
+            return []
+        req = batch.reqs[0]
+        hidden = self.model.last_hidden[:rows]
+        ids = batch.input_ids[:rows]
+        tail = torch.tensor([next_token], dtype=ids.dtype, device=ids.device)
+        next_ids = torch.cat([ids[1:], tail]) if rows > 1 else tail
+        if row < rows - 1:
+            # partial accept: the drafting row's successor is the target's own sample, not the
+            # rejected draft that followed it in the window (rows past it are dead weight)
+            next_ids = next_ids.clone()
+            next_ids[row] = next_token
+        with self.ctx.forward_batch(batch):
+            h_all = mtp.forward(hidden, next_ids)  # [rows, hidden]
+        if not draft:
+            return []
+        h = h_all[row : row + 1]
+        d = int(self.model.lm_head.logits(h).argmax(dim=-1).item())
+        drafts = [d]
+        if prof is not None:
+            prof.mark("mtp_window")
+        pos_row = int(batch.positions[row].item())
+        rope = getattr(req, "mm_rope", None)
+        delta = int(rope.delta) if rope is not None else 0
+        for j in range(1, self.spec_k):
+            p = pos_row + j
+            if p + 1 > (req.spec_alloc_len or 0):
+                break  # no reserved KV page for this draft position
+            mini = self._mtp_step_batch(req, p, d, rope_delta=delta)
+            with self.ctx.forward_batch(mini):
+                h = mtp.forward(h, mini.input_ids)
+            d = int(self.model.lm_head.logits(h).argmax(dim=-1).item())
+            drafts.append(d)
+        if prof is not None:
+            prof.mark("mtp_chain")
+        return drafts
+
+    def _mtp_step_batch(self, req: Req, position: int, token: int, *, rope_delta: int = 0) -> Batch:
+        """A one-token decode batch at ``position`` for a draft step: the same page-table row
+        as the request (its KV pages past device_len are reserved by the scheduler)."""
+        from types import SimpleNamespace
+
+        proxy = SimpleNamespace(
+            table_idx=req.table_idx, extend_len=1, device_len=position + 1, cached_len=position,
+            linear_slot_idx=req.linear_slot_idx, uid=req.uid, mm_embeds=None, mamba_restore_src=None,
+        )
+        mini = Batch(reqs=[proxy], phase="decode")
+        mini.padded_reqs = [proxy]
+        mini.positions = torch.tensor([position], dtype=torch.int32, device=self.device)
+        if rope_delta:  # after an image prompt the rope position runs ahead of the logical one
+            mini.rope_positions = torch.tensor([position + rope_delta], dtype=torch.int32, device=self.device)
+        mini.input_ids = torch.tensor([token], dtype=torch.int32, device=self.device)
+        mini.out_loc = self.page_table[req.table_idx, position : position + 1]
+        self.attn_backend.prepare_metadata(mini)
+        return mini
 
     @torch.inference_mode()
     def _warmup_prefill(self) -> None:

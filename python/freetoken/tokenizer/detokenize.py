@@ -91,6 +91,29 @@ class DetokenizeManager:
         self.decode_map.pop(uid, None)
 
     def detokenize(self, msgs: List[DetokenizeMsg]) -> List[str]:
+        """Incremental text for each message, in order. The per-uid decode state is advanced
+        by one token per message; when a batch carries several messages for one uid (MTP
+        speculative decoding commits a whole window per step) they are decoded in successive
+        rounds so every message sees the state its predecessor left, instead of all of them
+        reading the same stale read/surrogate offsets and re-emitting each other's text."""
+        rounds: List[List[int]] = []
+        seen: Dict[int, int] = {}
+        for i, msg in enumerate(msgs):
+            r = seen.get(msg.uid, 0)
+            seen[msg.uid] = r + 1
+            if len(rounds) <= r:
+                rounds.append([])
+            rounds[r].append(i)
+        if len(rounds) <= 1:
+            return self._detokenize_round(msgs)
+        out: List[str] = [""] * len(msgs)
+        for idx in rounds:
+            for i, text in zip(idx, self._detokenize_round([msgs[i] for i in idx]), strict=True):
+                out[i] = text
+        return out
+
+    def _detokenize_round(self, msgs: List[DetokenizeMsg]) -> List[str]:
+        """One message per uid (the original single-token-step algorithm)."""
         read_ids: List[List[int]] = []
         surr_ids: List[List[int]] = []
         for msg in msgs:

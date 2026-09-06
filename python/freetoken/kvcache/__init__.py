@@ -129,12 +129,18 @@ def create_kvcache_pool(
     num_swa_tokens: int | None = None,
     num_req_slots: int | None = None,
 ) -> BaseKVCachePool:
+    # the pools validate global layer ids against the model depth; the MTP draft head (spec
+    # decoding) is one more full-attention layer numbered num_layers
+    num_layers = model_config.num_layers
+    mtp_layer = getattr(model_config, "mtp_layer_id", None)
+    if mtp_layer is not None and mtp_layer >= num_layers:
+        num_layers = mtp_layer + 1
     if model_config.has_swa_attention:
         from .hybrid_swa_pool import HybridSWAKVCache
 
         return HybridSWAKVCache(
             groups=model_config.kv_cache_group_specs(),
-            num_layers=model_config.num_layers,
+            num_layers=num_layers,
             num_full_pages=num_pages,
             page_size=page_size,
             num_swa_tokens=num_swa_tokens,
@@ -171,7 +177,7 @@ def create_kvcache_pool(
         assert layer_ids is None, "hybrid-linear x BSA has no pool support yet"
         return BSAKVCache(
             num_kv_heads=spec.num_kv_heads,
-            num_layers=model_config.num_layers,
+            num_layers=num_layers,
             head_dim=spec.head_dim,
             num_pages=num_pages,
             page_size=page_size,
@@ -193,7 +199,7 @@ def create_kvcache_pool(
             raise ValueError("QSA pools need num_req_slots (max_running_req + 1)")
         return QSAKVCache(
             num_kv_heads=spec.num_kv_heads,
-            num_layers=model_config.num_layers,
+            num_layers=num_layers,
             head_dim=spec.head_dim,
             num_pages=num_pages,
             page_size=page_size,
@@ -250,7 +256,7 @@ def create_kvcache_pool(
         num_kv_heads=spec.num_kv_heads if spec is not None else model_config.num_kv_heads,
         num_pages=num_pages,
         page_size=page_size,
-        num_layers=model_config.num_layers,
+        num_layers=num_layers,
         head_dim=spec.head_dim if spec is not None else model_config.head_dim,
         device=device,
         dtype=dtype,

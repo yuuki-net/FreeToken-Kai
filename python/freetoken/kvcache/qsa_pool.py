@@ -33,6 +33,11 @@ from .mha_pool import MHAKVCache
 _INDEX_DTYPE_BYTES = 2
 
 
+# --spec-mtp draft depth; the engine sets it before building the pool (module-level on purpose:
+# the pool factory signature is shared by every pool family)
+SPECULATIVE_TOKENS = 0
+
+
 class QSAKVCache(MHAKVCache):
     """MHA paged pool + the compressed index-key slab + the per-request pending ring.
 
@@ -70,7 +75,9 @@ class QSAKVCache(MHAKVCache):
                 f"QSA needs page_size ({page_size}) divisible by index_ratio ({index_ratio})"
             )
         if ring_capacity is None:
-            ring_capacity = self.ring_capacity_for(index_ratio)
+            # SPECULATIVE_TOKENS: set by the engine before the pool exists (--spec-mtp); a verify
+            # window keeps index_ratio + K raw keys pending at once
+            ring_capacity = self.ring_capacity_for(index_ratio, SPECULATIVE_TOKENS)
         if ring_capacity < index_ratio:
             # A closing group reads up to index_ratio - 1 past members plus this forward's.
             raise ValueError(

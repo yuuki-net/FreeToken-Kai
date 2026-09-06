@@ -922,9 +922,14 @@ class Nvfp4LMHead(BaseOP):
         from freetoken.core import get_global_ctx
 
         batch = get_global_ctx().batch
-        if batch.is_prefill:
+        if batch.is_prefill and not getattr(batch, "spec_all_rows", False):
             indices = batch.attn_metadata.get_last_indices(batch.size)
             x = x[indices].contiguous()
+        return self.logits(x)
+
+    def logits(self, x: torch.Tensor) -> torch.Tensor:
+        """Raw head GEMM over the rows given (no batch bookkeeping). The MTP draft head scores
+        its own hidden states through the shared head with this."""
         if self._transposed:
             return nvfp4_dense_linear_t(x, self.weight, self.weight_scale, self.weight_global)
         return nvfp4_dense_linear(x, self.weight, self.weight_scale, self.weight_global)

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from typing import TYPE_CHECKING, List, NamedTuple, NoReturn, Set, Tuple, TypeAlias
 
 import torch
@@ -133,6 +134,8 @@ class Scheduler(SchedulerIOMixin):
             min(config.max_extend_tokens, _chunk_cap) if _chunk_cap else config.max_extend_tokens
         )
         self.config = config
+        # MTP speculative decoding: draft-window depth (0 = off). Single-request decode only.
+        self.spec_k = int(getattr(config, "spec_mtp", 0) or 0)  # (unit-test stubs lack it: read via _spec_k)
         self.status_reporter = SchedulerStatusReporter(
             log=logger.info_rank0,
             decode_log_interval=config.decode_log_interval,
@@ -283,7 +286,9 @@ class Scheduler(SchedulerIOMixin):
         # backend's per-batch SNAPSHOT (staged in prepare_for_replay right before the replay, on
         # the same stream, like the generic out_loc copy_from), not the live slot maps -- so the
         # next batch's allocate_paged cannot corrupt the in-flight graph replay. DSV4 overlaps.
-        if ENV.DISABLE_OVERLAP_SCHEDULING:
+        # A verify step's successor depends on its result (accepted length, new drafts), so
+        # speculative decoding runs the non-overlapped loop.
+        if ENV.DISABLE_OVERLAP_SCHEDULING or _spec_k(self) > 0:
             with self.engine_stream_ctx:
                 self.engine.stream.wait_stream(self.stream)
                 while True:
@@ -303,10 +308,14 @@ class Scheduler(SchedulerIOMixin):
         if last_data is None:
             return
 
-        batch, (_, next_tokens_cpu, copy_done) = last_data[0].batch, last_data[1]
+        batch, out = last_data[0].batch, last_data[1]
+        # ForwardOutput (or the bare (gpu, cpu, event) tuple the unit tests hand in)
+        next_tokens_cpu, copy_done = out[1], out[2]
+        spec_res = getattr(out, "spec", None) if _spec_k(self) > 0 else None
         copy_done.synchronize()
         reply: List[DetokenizeMsg] = []
         new_finished_reqs: Set[Req] = set()
+        spec_accepted = len(spec_res.accepted) if (spec_res is not None and batch.spec_verify) else None
         with self.cache_manager.lazy_free_region():
             for i, req in enumerate(batch.reqs):
                 if isinstance(req, ChunkedReq):
@@ -333,6 +342,12 @@ class Scheduler(SchedulerIOMixin):
                     # and the next batch is scheduled before this drain runs). Its resources
                     # are freed below/already; shipping this token would append past the
                     # client's terminal reply.
+                    continue
+                if batch.spec_verify:
+                    if self._commit_spec_window(req, spec_res, reply):
+                        self.decode_manager.remove_req(req)
+                        self._free_req_resources(req)
+                        new_finished_reqs.add(req)
                     continue
                 next_token = next_tokens_cpu[i]
                 req.append_host(next_token.unsqueeze(0))
@@ -371,6 +386,8 @@ class Scheduler(SchedulerIOMixin):
                     )
                 )
 
+                if _spec_k(self) > 0:
+                    self._spec_post_step(req, spec_res, finished)
                 # NOTE: overlap scheduling may make the request freed twice, skip second free
                 if finished and req not in self.finished_reqs:
                     self.decode_manager.remove_req(req)
@@ -414,6 +431,7 @@ class Scheduler(SchedulerIOMixin):
             page_size=self.config.page_size,
             mamba_slots=mamba_slots,
             swa_tokens=swa_tokens,
+            spec_accepted=spec_accepted,
         )
         self.send_result(reply)
 
@@ -783,6 +801,8 @@ class Scheduler(SchedulerIOMixin):
         # Polymorphic page allocation: DSV4 allocates window pages + cmp/idx blocks into its
         # slot maps; the generic manager allocates KV pages into the page table.
         self.cache_manager.allocate_paged(batch.reqs)
+        if _spec_k(self) > 0:
+            self._prepare_spec(batch)
         if batch.is_prefill:
             self._gather_multimodal(batch)
         batch.positions = _make_positions(batch, self.device)
@@ -906,15 +926,109 @@ class Scheduler(SchedulerIOMixin):
 
     def _schedule_next_batch(self) -> ForwardInput | None:
         # TODO: support other policies: e.g. DECODE first
-        batch = (
-            self.prefill_manager.schedule_next_batch(self.prefill_budget)
-            or self.decode_manager.schedule_next_batch()
-        )
+        batch = self.prefill_manager.schedule_next_batch(self.prefill_budget)
+        if batch is None and _spec_k(self) > 0:
+            batch = self._schedule_spec_batch()
+        if batch is None:
+            batch = self.decode_manager.schedule_next_batch()
         if batch is None:
             return None
         forward_input = self._prepare_batch(batch)
         self._report_prompt_admissions(batch)
         return forward_input
+
+    # ------------------------------------------------------------------ MTP speculative
+    def _schedule_spec_batch(self) -> Batch | None:
+        """One running request with drafts from its last step -> a verify batch: an extend over
+        ``[t_last, *drafts]`` (phase 'prefill' for the kernels, spec_verify for the scheduler)."""
+        running = self.decode_manager.running_reqs
+        if len(running) != 1:
+            return None
+        req = next(iter(running))
+        if not req.spec_drafts or not req.can_decode or req.spec_base_len is not None:
+            return None
+        if _SPEC_PLAIN:
+            return None  # diagnostics: drafts are produced but never verified (plain decode)
+        # never draft past the output budget or the page table
+        room = min(req.remain_len - 1, self.engine.max_seq_len - req.device_len - _spec_k(self))
+        if room <= 0:
+            req.spec_drafts = []
+            return None
+        k = min(len(req.spec_drafts), room)
+        if _SPEC_MAX_DRAFTS is not None:
+            k = min(k, _SPEC_MAX_DRAFTS)  # diagnostics: 0 -> one-row verify windows
+        req.spec_extend(req.spec_drafts[:k])
+        batch = Batch(reqs=[req], phase="prefill")
+        batch.spec_verify = True
+        return batch
+
+    def _prepare_spec(self, batch: Batch) -> None:
+        """Spec-mode batch prep: reserve the draft head's KV positions past device_len, stage the
+        window's draft ids into the token pool, and tell the engine the next prompt token of a
+        non-final prefill chunk (the draft head extends over it too)."""
+        from .prefill import ChunkedReq
+
+        for req in batch.reqs:
+            if isinstance(req, ChunkedReq):
+                continue
+            upto = min(req.device_len + _spec_k(self), self.engine.max_seq_len)
+            self.cache_manager.reserve_pages(req, upto)
+            req.spec_alloc_len = upto
+        if batch.spec_verify:
+            req = batch.reqs[0]
+            base = req.spec_base_len
+            self.token_pool[req.table_idx, base : base + len(req.spec_drafts)] = torch.tensor(
+                req.spec_drafts, dtype=self.token_pool.dtype, device=self.device
+            )
+        batch.spec_next_tail = None
+        if batch.is_prefill and not batch.spec_verify and len(batch.reqs) == 1:
+            r = batch.reqs[0]
+            if isinstance(r, ChunkedReq) and r.input_ids.numel() > r.device_len:
+                batch.spec_next_tail = int(r.input_ids[r.device_len])
+
+    def _commit_spec_window(self, req: Req, spec_res, reply: List[DetokenizeMsg]) -> bool:
+        """Settle a verified window: commit the accepted tokens, give back the reserved pages,
+        emit one DetokenizeMsg per token (stopping at the first terminal one), and keep the
+        next drafts. Returns whether the request finished."""
+        tokens = list(spec_res.accepted)
+        req.spec_commit(tokens)
+        if req.spec_alloc_len is not None:
+            self.cache_manager.truncate_pages(req, req.cached_len, req.spec_alloc_len)
+            req.spec_alloc_len = None
+        finished = False
+        for j, tok in enumerate(tokens):
+            last = j == len(tokens) - 1
+            hit_length = last and not req.can_decode
+            hit_eos = not req.sampling_params.ignore_eos and tok in self.eos_token_ids
+            matched_stop = (
+                self._match_stop_str(req)
+                if (last and not hit_eos and req.sampling_params.stop_strs)
+                else None
+            )
+            finished = hit_length or hit_eos or matched_stop is not None
+            reason = ("stop" if (hit_eos or matched_stop is not None) else "length") if finished else None
+            reply.append(
+                DetokenizeMsg(
+                    uid=req.uid,
+                    next_token=tok,
+                    finished=finished,
+                    finish_reason=reason,
+                    matched_stop=matched_stop,
+                    stop_strs=req.sampling_params.stop_strs or None,
+                )
+            )
+            if finished:
+                break
+        req.spec_drafts = [] if finished else list(spec_res.drafts)
+        return finished
+
+    def _spec_post_step(self, req: Req, spec_res, finished: bool) -> None:
+        """After a plain decode / final prefill step in spec mode: return the reserved draft
+        pages and keep the drafts the last rank produced for the next window."""
+        if req.spec_alloc_len is not None:
+            self.cache_manager.truncate_pages(req, req.cached_len, req.spec_alloc_len)
+            req.spec_alloc_len = None
+        req.spec_drafts = [] if (finished or spec_res is None) else list(spec_res.drafts)
 
     def _report_prompt_admissions(self, batch: Batch) -> None:
         """Publish first-prefill accounting only after batch preparation succeeded.
@@ -945,7 +1059,16 @@ class Scheduler(SchedulerIOMixin):
         if self.toolcall_anchor_id is not None and not batch.is_prefill:
             self.cache_manager.snapshot_toolcall_anchor(batch.reqs)
         forward_output = self.engine.forward_batch(batch, sample_args)
-        self.token_pool[output_mapping] = forward_output.next_tokens_gpu
+        if batch.spec_verify:
+            # the window's accepted tokens land at their own positions (variable count)
+            req = batch.reqs[0]
+            toks = forward_output.spec.accepted
+            base = req.spec_base_len
+            self.token_pool[req.table_idx, base : base + len(toks)] = torch.tensor(
+                toks, dtype=self.token_pool.dtype, device=self.device
+            )
+        else:
+            self.token_pool[output_mapping] = forward_output.next_tokens_gpu
         self.decode_manager.filter_reqs(forward_input.batch.reqs)
         return forward_output
 
@@ -954,7 +1077,8 @@ def _prefill_rope_table(batch: Batch) -> torch.Tensor | None:
     """The image prompt's own cos/sin table for its prefill chunks: rope lookups index it by
     logical position, which is why the prompt runs alone (its chunks may be several; the
     table covers the whole prompt)."""
-    if not batch.is_prefill or len(batch.padded_reqs) != 1:
+    # (an MTP verify window is an extend past the prompt: it ropes at positions + delta)
+    if not batch.is_prefill or batch.spec_verify or len(batch.padded_reqs) != 1:
         return None
     req = batch.padded_reqs[0]
     rope = getattr(req, "mm_rope", None)
@@ -984,6 +1108,17 @@ def _make_rope_positions(batch: Batch, device: torch.device) -> torch.Tensor | N
         )
         offset += length
     return host.to(device, non_blocking=True)
+# --spec-mtp diagnostics (env): FT_SPEC_PLAIN=1 never verifies (plain decode steps, the draft
+# head still runs); FT_SPEC_MAX_DRAFTS=n caps the drafts per verify window (0 = one-row windows)
+_SPEC_PLAIN = os.environ.get("FT_SPEC_PLAIN") == "1"
+_SPEC_MAX_DRAFTS = (
+    int(os.environ["FT_SPEC_MAX_DRAFTS"]) if os.environ.get("FT_SPEC_MAX_DRAFTS") else None
+)
+
+
+def _spec_k(scheduler) -> int:
+    """--spec-mtp depth of a scheduler (0 when off; unit-test stubs may lack the attribute)."""
+    return int(getattr(scheduler, "spec_k", 0) or 0)
 
 
 def _make_positions(batch: Batch, device: torch.device) -> torch.Tensor:

@@ -225,7 +225,10 @@ def load_weight(
     device: torch.device,
     *,
     include_moe_experts: bool = True,
+    include_mtp: bool = False,
 ) -> Iterator[Tuple[str, torch.Tensor]]:
+    """``include_mtp``: also yield the checkpoint's MTP draft head (``mtp.*``) -- only readers
+    that know how to (qwen3_5_moe) accept the flag, so it is passed through only when set."""
     # FTW checkpoint: dense weights are stored post-iter_weights, so we replay them
     # model-agnostically instead of re-running the per-model reader. Which tensors exist is
     # decided at conversion (offload -> experts live in banks, not here); a backend mismatch
@@ -248,11 +251,13 @@ def load_weight(
 
     _config, spec = _spec_for_model_path(model_path)
     iter_weights = _load_attr(spec.module, spec.iter_weights)
+    extra = {"include_mtp": True} if include_mtp else {}
     yield from iter_weights(
         model_path,
         device,
         include_moe_experts=include_moe_experts,
         include_non_moe=True,
+        **extra,
     )
 
 

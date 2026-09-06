@@ -16,11 +16,15 @@ class SchedulerStatusReporter:
     _last_decode_time: float = field(init=False)
     _decode_forward_count: int = field(default=0, init=False)
     _decode_generated_tokens: int = field(default=0, init=False)
+    _spec_step_count: int = field(default=0, init=False)
+    _spec_accepted_tokens: int = field(default=0, init=False)
+    _last_spec_time: float = field(init=False)
 
     def __post_init__(self) -> None:
         now = self.clock()
         self._last_prefill_time = now
         self._last_decode_time = now
+        self._last_spec_time = now
         self.decode_log_interval = max(1, self.decode_log_interval)
 
     def report_batch(
@@ -34,8 +38,19 @@ class SchedulerStatusReporter:
         page_size: int,
         mamba_slots: tuple[int, int] | None = None,
         swa_tokens: tuple[int, int] | None = None,
+        spec_accepted: int | None = None,
     ) -> None:
-        if batch.is_prefill:
+        if spec_accepted is not None:
+            self._report_spec(
+                spec_accepted,
+                running_reqs=running_reqs,
+                queue_reqs=queue_reqs,
+                kv_used_pages=kv_used_pages,
+                kv_total_pages=kv_total_pages,
+                mamba_slots=mamba_slots,
+                swa_tokens=swa_tokens,
+            )
+        elif batch.is_prefill:
             self._report_prefill(
                 batch,
                 running_reqs=running_reqs,
@@ -120,6 +135,42 @@ class SchedulerStatusReporter:
             f"{_swa_msg(swa_tokens)}"
             f"{_mamba_msg(mamba_slots)}"
             f"gen throughput (token/s): {gen_throughput:.2f}, "
+            f"#queue-req: {queue_reqs}"
+        )
+
+    def _report_spec(
+        self,
+        accepted: int,
+        *,
+        running_reqs: int,
+        queue_reqs: int,
+        kv_used_pages: int,
+        kv_total_pages: int,
+        mamba_slots: tuple[int, int] | None = None,
+        swa_tokens: tuple[int, int] | None = None,
+    ) -> None:
+        """One MTP verify step committed ``accepted`` tokens (the drafts that survived plus
+        the target's own sample). Logged every ``decode_log_interval`` steps with the mean
+        accepted length, which is the whole point of the draft head."""
+        self._spec_step_count += 1
+        self._spec_accepted_tokens += accepted
+        if self._spec_step_count % self.decode_log_interval != 0:
+            return
+        now = self.clock()
+        gap = now - self._last_spec_time
+        self._last_spec_time = now
+        steps = self.decode_log_interval
+        tokens = self._spec_accepted_tokens
+        self._spec_accepted_tokens = 0
+        self.log(
+            f"Spec decode, "
+            f"#running-req: {running_reqs}, "
+            f"accepted/step: {tokens / steps:.2f}, "
+            f"step time (ms): {1000.0 * gap / steps:.1f}, "
+            f"token usage: {_usage_ratio(kv_used_pages, kv_total_pages):.2f}, "
+            f"{_swa_msg(swa_tokens)}"
+            f"{_mamba_msg(mamba_slots)}"
+            f"gen throughput (token/s): {tokens / gap if gap > 0 else 0.0:.2f}, "
             f"#queue-req: {queue_reqs}"
         )
 

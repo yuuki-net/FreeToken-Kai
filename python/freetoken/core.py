@@ -77,6 +77,10 @@ class Req:
     # handler must not free resources under an in-flight forward; it sets this flag and
     # _process_last_data frees the request when the batch drains (after copy_done.synchronize).
     aborted: bool = False
+    # --- MTP speculative decoding: the draft window under verification ---
+    spec_base_len: int | None = None       # device_len before the drafts were appended
+    spec_drafts: List[int] = field(default_factory=list)  # drafts awaiting verification
+    spec_alloc_len: int | None = None      # pages reserved up to here (draft positions)
 
     def __post_init__(self) -> None:
         assert self.input_ids.is_cpu
@@ -92,7 +96,9 @@ class Req:
 
     @property
     def remain_len(self) -> int:
-        return self.max_device_len - self.device_len
+        # under a draft window the budget is judged from the committed length
+        base = self.spec_base_len if self.spec_base_len is not None else self.device_len
+        return self.max_device_len - base
 
     @property
     def extend_len(self) -> int:
@@ -108,6 +114,28 @@ class Req:
         assert m <= self.max_device_len
         self._ids_buf[n:m] = next_token
         self.input_ids = self._ids_buf[:m]
+
+    def spec_extend(self, drafts: List[int]) -> None:
+        """Append a draft window: the next forward extends over ``[t_last, *drafts]`` (device_len
+        grows by len(drafts), cached_len stays); ``spec_commit`` settles it."""
+        assert self.spec_base_len is None, "draft window already open"
+        self.spec_base_len = self.device_len
+        self.spec_drafts = list(drafts)
+        self.device_len += len(drafts)
+
+    def spec_commit(self, tokens: List[int]) -> None:
+        """Keep ``tokens`` (the accepted drafts + the target's own sample) of the open window:
+        the same invariant a decode step leaves (cached_len == device_len - 1, the last id is
+        the pending input), but advanced by len(tokens)."""
+        base = self.spec_base_len
+        assert base is not None, "no draft window open"
+        a = len(tokens)
+        assert 1 <= a <= len(self.spec_drafts) + 1, (a, len(self.spec_drafts))
+        self.append_host(torch.tensor(tokens, dtype=self.input_ids.dtype))
+        self.cached_len = base - 1 + a
+        self.device_len = base + a
+        self.spec_base_len = None
+        self.spec_drafts = []
 
     @property
     def can_decode(self) -> bool:
@@ -164,6 +192,13 @@ class Batch:
     # _prepare_batch succeeds. Continuation chunks leave this empty, so accounting is
     # exactly-once.
     prompt_admissions: List[Tuple[int, int, int]] = field(default_factory=list, init=False)
+    # MTP speculative decoding. spec_verify: this extend batch verifies a draft window (the
+    # kernels run the prefill/extend path, the scheduler treats it as a decode step);
+    # spec_all_rows: the lm_head returns every row's logits, not the last per request;
+    # spec_next_tail: prefill chunk whose last row's next token is a known prompt token (host).
+    spec_verify: bool = field(default=False, init=False)
+    spec_all_rows: bool = field(default=False, init=False)
+    spec_next_tail: int | None = field(default=None, init=False)
 
     @property
     def is_prefill(self) -> bool:
@@ -194,6 +229,9 @@ class Context:
     # Per-request recurrent state for GatedDeltaNet layers; set by the engine for
     # hybrid linear-attention models, otherwise None.
     linear_state_pool: LinearStatePool | None = None
+    # MTP verify forward: per-GDN-layer state stashes (see the model's GDN op) consumed by
+    # the model's spec_rollback once the accepted length is known.
+    spec_stash: list = field(default_factory=list)
     _batch: Batch | None = field(default=None, init=False)
 
     @property

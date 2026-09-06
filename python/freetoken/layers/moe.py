@@ -225,7 +225,9 @@ class OffloadMoELayer(MoELayer):
         router_logits: torch.Tensor | None = None,
     ):
         ctx = get_global_ctx()
-        if ctx.batch.is_prefill:
+        # an MTP verify window is an extend for the kernels but must NOT stream whole layers:
+        # its few tokens go through the decode (LRU cache / hybrid) path
+        if ctx.batch.is_prefill and not getattr(ctx.batch, "spec_verify", False):
             final_hidden_states = self.prefill_forward(hidden_states, router_logits)
         else:
             final_hidden_states = self.decode_forward(hidden_states, router_logits)
@@ -245,7 +247,7 @@ class OffloadMoELayer(MoELayer):
         rewrites expert ids into cache slot ids); pass a fresh tensor or a clone.
         """
         ctx = get_global_ctx()
-        if ctx.batch.is_prefill:
+        if ctx.batch.is_prefill and not getattr(ctx.batch, "spec_verify", False):
             out = self._prefill_routed(hidden_states, topk_weights, topk_ids)
         else:
             out = self._decode_routed(hidden_states, topk_weights, topk_ids)

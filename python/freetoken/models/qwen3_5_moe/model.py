@@ -7,6 +7,7 @@ from freetoken.core import get_global_ctx
 from freetoken.layers import (
     BaseOP,
     GemmaRMSNorm,
+    LinearReplicated,
     OPList,
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -19,6 +20,7 @@ from .gdn import Qwen3_5GatedDeltaNet
 from .moe import Qwen3_5DenseMLP, Qwen3_5MoE
 
 if TYPE_CHECKING:
+    from freetoken.core import Batch
     from freetoken.models.config import ModelConfig
 
 
@@ -68,6 +70,46 @@ class Qwen3_5DecoderLayer(BaseOP):
         return hidden, residual
 
 
+class Qwen3_5MTP(BaseOP):
+    """The checkpoint's MTP draft head (``mtp.*``): one more full-attention decoder layer that
+    predicts the token after the next one. Per row, with ``H`` the target's final hidden state
+    (after the final norm, the lm_head input) and ``t_next`` the token that follows::
+
+        x  = fc(cat(norm_e(embed(t_next)), norm_h(H)))      # [T, 2*hidden] -> [T, hidden]
+        x' = layer(x)                                       # full attention + MoE, own KV slab
+        h  = norm(x')                                       # -> shared lm_head -> logits of t_next+1
+
+    (the vLLM/sglang ``Qwen3NextMTP`` graph). Multi-step drafting feeds ``h`` back as the next
+    step's ``H``. The head's dense weights are bf16 in the modelopt checkpoints (``mtp*`` is
+    excluded from quantization), so its layer is built unquantized; its routed experts become
+    one more NVFP4 bank layer (engine._append_mtp_bank), indexed by ``layer_id``."""
+
+    def __init__(self, config: ModelConfig, layer_id: int) -> None:
+        from dataclasses import replace
+
+        hidden = config.hidden_size
+        self.layer_id = layer_id
+        self.pre_fc_norm_embedding = GemmaRMSNorm(hidden, eps=config.rms_norm_eps)
+        self.pre_fc_norm_hidden = GemmaRMSNorm(hidden, eps=config.rms_norm_eps)
+        self.fc = LinearReplicated(2 * hidden, hidden, has_bias=False)
+        head_config = replace(config, attn_quant="none", dense_quant="none")
+        self.layers = OPList([Qwen3_5DecoderLayer(head_config, layer_id)])
+        self.norm = GemmaRMSNorm(hidden, eps=config.rms_norm_eps)
+        self._embed_ref = None  # the target's embedding (shared; not a state-dict child)
+
+    def forward(self, hidden: torch.Tensor, next_ids: torch.Tensor) -> torch.Tensor:
+        """``hidden [T, hidden]`` (the target's final hidden state, or the head's own output
+        for a chained draft step) + ``next_ids [T]`` -> the head's normed hidden state
+        ``[T, hidden]`` (its KV / expert routing use the active batch's metadata)."""
+        assert self._embed_ref is not None, "MTP head has no embedding table"
+        e = self.pre_fc_norm_embedding.forward(self._embed_ref.forward(next_ids).to(hidden.dtype))
+        h = self.pre_fc_norm_hidden.forward(hidden)
+        x = self.fc.forward(torch.cat([e, h], dim=-1))
+        x, residual = self.layers.op_list[0].forward(x, None)
+        x, _ = self.norm.forward_add_residual(x, residual)
+        return x
+
+
 class Qwen3_5Model(BaseOP):
     def __init__(self, config: ModelConfig):
         self._image_token_id = config.image_token_id
@@ -92,12 +134,19 @@ class Qwen3_5Model(BaseOP):
         for layer in self.layers.op_list:
             x, residual = layer.forward(x, residual)
         x, _ = self.norm.forward_add_residual(x, residual)
+        self._last_hidden = x  # the MTP draft head reads the final hidden state (lm_head input)
         return x
 
 
 class Qwen3_5MoEForCausalLM(BaseLLMModel):
     def __init__(self, config: ModelConfig):
         self.model = Qwen3_5Model(config)
+        # --spec-mtp: the draft head as layer mtp_layer_id (== num_layers), sharing the embedding
+        self.mtp = None
+        mtp_id = getattr(config, "mtp_layer_id", None)
+        if mtp_id is not None:
+            self.mtp = Qwen3_5MTP(config, mtp_id)
+            self.mtp._embed_ref = self.model.embed_tokens
         if getattr(config, "lm_head_quant", "none") == "nvfp4":
             # checkpoint stores the (untied) lm_head as NVFP4: keep it native (W4A16) -- the
             # bf16 dequant of this ~1 GB matrix was the single largest decode kernel.
@@ -116,9 +165,21 @@ class Qwen3_5MoEForCausalLM(BaseLLMModel):
             )
         super().__init__()
 
+    @property
+    def last_hidden(self) -> torch.Tensor:
+        """The final hidden state ``[T, hidden]`` of the last (eager) forward."""
+        return self.model._last_hidden
+
+    def spec_rollback(self, batch: Batch, accepted: int, ctx) -> None:
+        """Roll the per-request state back to the first ``accepted`` rows of the verify window:
+        the GDN recurrent + conv states, from the stashes the GDN ops recorded."""
+        for stash in ctx.spec_stash:
+            stash.restore(accepted)
+        ctx.spec_stash = []
+
     def forward(self) -> torch.Tensor:
         output = self.model.forward(get_global_ctx().batch.input_ids)
         return self.lm_head.forward(output)
 
 
-__all__ = ["Qwen3_5MoEForCausalLM"]
+__all__ = ["Qwen3_5MoEForCausalLM", "Qwen3_5MTP"]

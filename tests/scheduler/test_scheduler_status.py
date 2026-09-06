@@ -159,3 +159,18 @@ def test_usage_ratio_guard():
     assert _usage_ratio(0, 0) == 0.0
     assert _usage_ratio(5, 0) == 0.0
     assert _usage_ratio(5, 10) == 0.5
+
+
+def test_spec_line_reports_mean_accept_and_step_time():
+    rep, logs, clock = _reporter(interval=4)
+    batch = SimpleNamespace(is_prefill=True, is_decode=False, reqs=[_req(4, 0)],
+                            log_new_tokens=0, log_cached_tokens=0)
+    for i, a in enumerate((1, 3, 2, 4)):
+        clock["t"] = 0.1 * (i + 1)  # 100 ms per verify step
+        rep.report_batch(batch, running_reqs=1, queue_reqs=0, kv_used_pages=1,
+                         kv_total_pages=100, page_size=64, spec_accepted=a)
+    # a verify batch is never logged as a prefill; one spec line per interval
+    assert len(logs) == 1 and logs[0].startswith("Spec decode")
+    assert "accepted/step: 2.50" in logs[0]
+    assert "step time (ms): 100.0" in logs[0]
+    assert "gen throughput (token/s): 25.00" in logs[0]

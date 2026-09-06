@@ -235,6 +235,18 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--spec-mtp",
+        type=int,
+        default=0,
+        help=(
+            "MTP speculative decoding: verify K drafts from the checkpoint's own MTP head per "
+            "step (0 = off). Single-request decode (use --max-running-req 1); the draft head "
+            "adds one full-attention layer and one expert-bank layer (its bf16 experts are "
+            "quantized to NVFP4 at load). Qwen3.5-MoE family NVFP4 checkpoints."
+        ),
+    )
+
+    parser.add_argument(
         "--gpu",
         type=_lazy_gpu_arg,
         default=ServerArgs.gpu,

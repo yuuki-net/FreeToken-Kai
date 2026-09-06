@@ -281,6 +281,29 @@ class CacheManager:
                 self.swa_pool.alloc_swa(allocated)
             _write_page_table(self.page_table, allocated, allocation_info, self.page_size)
 
+    def reserve_pages(self, req: Req, upto_len: int) -> None:
+        """MTP: make pages exist for positions ``[device_len, upto_len)`` (the draft head writes
+        its own KV there) without moving ``device_len``; ``truncate_pages`` gives them back."""
+        assert not self.swa_paged, "MTP page reservation is not wired for SWA pools"
+        first_page = div_ceil(req.device_len, self.page_size)
+        last_page = div_ceil(upto_len, self.page_size)
+        if last_page > first_page:
+            allocated = self._page_to_token(self._allocate(last_page - first_page))
+            _write_page_table(
+                self.page_table, allocated, [(req.table_idx, first_page, last_page)], self.page_size
+            )
+
+    def truncate_pages(self, req: Req, keep_len: int, alloc_len: int) -> None:
+        """Free the pages that only hold positions ``>= keep_len`` after a request whose pages
+        reach ``alloc_len`` rolled back (the invariant every step restores: pages exist exactly
+        for positions ``< cached_len``)."""
+        from freetoken.engine.spec import pages_to_free
+
+        first_page, last_page = pages_to_free(keep_len, alloc_len, self.page_size)
+        if last_page > first_page:
+            lo, hi = first_page * self.page_size, last_page * self.page_size
+            self._free(self.page_table[req.table_idx, lo:hi].clone())
+
     def cache_req(self, req: Req, *, finished: bool) -> None:
         if self.is_swa:
             return self._cache_req_swa(req, finished=finished)
