@@ -34,7 +34,9 @@ Qwen3-VL processor config, so the same request shape works there too, with two d
   has no room for it, and one image is a few seconds of CPU time. The worker hands the
   scheduler the already-projected soft tokens; nothing image-related touches the GPU beyond
   the scatter. `FT_IMAGE_MAX_PIXELS` (default `1048576`, about 1k soft tokens per image)
-  bounds the resolution the processor keeps.
+  bounds the resolution the processor keeps. The tower's output is cached per image
+  (`FT_IMAGE_EMBED_CACHE`, default 32 entries), so an image a chat client resends every
+  turn -- or for its title generation -- is encoded once.
 * **M-RoPE.** Image tokens rope at 3-D `(t, h, w)` positions and every token after them at
   `logical + delta` (`delta <= 0`), exactly as the HF model does. FreeToken keeps its logical
   positions for the QSA ring / slab / causal bookkeeping and swaps only the rope lookups: the
