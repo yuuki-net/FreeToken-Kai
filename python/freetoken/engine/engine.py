@@ -1038,8 +1038,13 @@ class Engine:
             )
         # Decode batches never exceed max_running_req, but CUDA-graph padding can
         # round a batch up to the largest captured size; cover both.
-        # An MTP verify window ships spec_k + 1 rows through the CPU executor at once.
+        # An MTP verify window ships spec_k + 1 rows through the CPU executor at once, and a
+        # short prefill extend goes through it in CPU_PREFILL_PIECE-row pieces.
+        from freetoken.layers.moe import CPU_PREFILL_PIECE, cpu_prefill_max_tokens
+
         max_tokens = max(config.max_running_req, config.cuda_graph_max_bs or 0, 1, self.spec_k + 1)
+        if cpu_prefill_max_tokens() > 0:
+            max_tokens = max(max_tokens, CPU_PREFILL_PIECE)
         # gpt-oss mxfp4 carries clamped-swiglu scalars; other formats use the defaults.
         executor = CpuMoeExecutor(
             cache,

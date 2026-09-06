@@ -385,6 +385,12 @@ class OffloadMoELayer(MoELayer):
         pass through unmapped."""
         cache = self.offload_cache
         assert cache is not None
+        if (
+            not cache.prefill_overlap
+            and getattr(cache, "cpu_executor", None) is not None
+            and 0 < hidden_states.shape[0] <= cpu_prefill_max_tokens()
+        ):
+            return self._prefill_on_cpu(cache, hidden_states, topk_weights, topk_ids)
         if cache.prefill_overlap:
             views = self._wait_prefill_overlap(cache)
             out = self._expert_gemm(
@@ -411,6 +417,40 @@ class OffloadMoELayer(MoELayer):
             alphas=cache.alphas_for_layer(self.layer_id),
             is_prefill=True,
         )
+
+    def _prefill_on_cpu(
+        self,
+        cache: OffloadMoeCache,
+        hidden_states: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        """A short extend (a chat turn behind a cached prefix, a few hundred tokens at most)
+        skips streaming this layer's whole expert bank to the GPU: the CPU executor computes
+        the routed experts instead, in pieces of ``CPU_PREFILL_PIECE`` rows (one buffer shape,
+        the tail padded with skipped routes). Streaming a 256-expert NVFP4 layer costs ~0.13 s
+        per layer at the ~3.4 GB/s an RTX 2060 sees under WSL2 -- ~5 s per chunk over 40 layers
+        whatever the chunk holds -- while the CPU reads each distinct expert once for all the
+        rows routed to it. ``FREETOKEN_CPU_PREFILL_MAX_TOKENS`` (default 256; 0 disables) is the
+        longest extend that takes this path; longer chunks stream as before."""
+        executor = cache.cpu_executor
+        assert executor is not None
+        total = hidden_states.shape[0]
+        piece = max(1, min(CPU_PREFILL_PIECE, int(executor.max_tokens)))
+        outs = []
+        for start in range(0, total, piece):
+            end = min(start + piece, total)
+            n = end - start
+            x = hidden_states[start:end]
+            w = topk_weights[start:end]
+            ids = topk_ids[start:end]
+            if n < piece:
+                pad = piece - n
+                x = torch.cat([x, x.new_zeros(pad, x.shape[1])])
+                w = torch.cat([w, w.new_zeros(pad, w.shape[1])])
+                ids = torch.cat([ids, ids.new_full((pad, ids.shape[1]), -1)])  # -1: skipped
+            outs.append(executor.decode(self.layer_id, x, w, ids)[:n])
+        return outs[0] if len(outs) == 1 else torch.cat(outs)
 
     def _wait_prefill_overlap(self, cache: OffloadMoeCache) -> tuple[torch.Tensor, ...]:
         """Double-buffer choreography for this layer's overlap prefill: kick off the
@@ -584,6 +624,17 @@ class OffloadMoELayer(MoELayer):
             self.activation,
             self.apply_router_weight_on_input,
         )
+
+
+# Short-extend prefill on the CPU executor (see OffloadMoELayer._prefill_on_cpu): the piece
+# size is the one batch shape the executor sees for it (the engine sizes max_tokens to it).
+CPU_PREFILL_PIECE = 64
+
+
+def cpu_prefill_max_tokens() -> int:
+    """Longest prefill extend the CPU executor computes instead of streaming the layer banks
+    (``FREETOKEN_CPU_PREFILL_MAX_TOKENS``, default 256; 0 disables)."""
+    return int(os.environ.get("FREETOKEN_CPU_PREFILL_MAX_TOKENS", "256") or 0)
 
 
 def make_moe_layer(
