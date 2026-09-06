@@ -4,7 +4,7 @@ An unofficial fork of [FlashML-org/FreeToken](https://github.com/FlashML-org/Fre
 based on upstream `main` at commit `af71ba4` (2026-09-03). It is not affiliated with, endorsed
 by, or supported by FlashML. The license is unchanged (Apache-2.0).
 
-The fork adds four things upstream does not have:
+The fork adds five things upstream does not have:
 
 1. **Image input over the OpenAI API** for checkpoints that ship a vision tower but were served
    text-only: Qwen3.8-Flash-Next and the Qwen3.5-MoE family (Qwen3.6-35B-A3B, Ornith-1.5-35B-A3B).
@@ -17,10 +17,15 @@ The fork adds four things upstream does not have:
 4. **The input embedding table in host memory** (`--host-embedding`), which turns 12k of
    context into 64k on a 6 GB card, plus a CPU path for short prefill extends that removes the
    per-turn expert streaming behind a cached prefix.
+5. **Layer-split serving over two consumer GPUs** (`--pp-size 2`): one process per card, the
+   residual stream handed over gloo, no NCCL and no peer access needed, uneven splits for
+   cards of different sizes. It is what runs Qwen3.8-Flash-Next (10.4 GB of dense weights) on
+   two 12 GB cards with 128k of context; it does not make a model that already fits one card
+   faster. See [pipeline.md](pipeline.md).
 
 Everything else is upstream FreeToken. The feature sets are independent: image input, the MTP
-head and the host embedding also apply to a plain upstream checkout on Ampere+, and the Turing
-patch is useful on its own for text-only models such as gpt-oss-20b.
+head, the host embedding and the layer split also apply to a plain upstream checkout on
+Ampere+, and the Turing patch is useful on its own for text-only models such as gpt-oss-20b.
 
 Please keep questions and bug reports about this fork in this repository. The FreeToken
 maintainers have no part in it; do not contact them about anything you find here.
@@ -43,11 +48,14 @@ the same result. Take the patch, not the ordeal.
 |---|---|---|
 | RTX 2060 6 GB, 32 GB RAM, Windows 11 + WSL2 (`memory=24GB`) | `ornith-ai/Ornith-1.5-35B-A3B-NVFP4` (35B MoE, 3B active, vision) | Text and image input work. Decode 25-39 tok/s (`--moe-backend hybrid`, `--dtype float16`), 64k of context with `--host-embedding`. Prefill: a 2062-token prompt in ~7.8 s (68 s before the Turing GEMM changes); ~5 s of that is the per-chunk expert streaming, the rest ~1.3 ms/token; a follow-up turn behind a cached prefix answers in 2-3 s |
 | same | `openai/gpt-oss-20b` (MXFP4) | 13-14 tok/s with the Turing patch alone |
+| RTX 3060 12 GB x2 (GPU 1 in a chipset PCIe 4.0 x4 slot), 8-core CPU, 128 GB RAM, Linux | `RadixArk/Qwen3.8-Flash-Next-NVFP4` (125B MoE, vision), `--pp-size 2 --dense-quant fp8` | Does not fit one 12 GB card; runs with 128k of context. 18-20 tok/s plain, 13-27 tok/s with `--spec-mtp 5` (2.1-4.5 tokens accepted per step; the verify window and the draft head run as CUDA graphs on both ranks). Image input validated end to end (colour probe 6/6, chunked image prefill). A follow-up turn behind a cached prefix answers in 2.4-4.5 s (9 s before the CPU short-prefill path) |
+| same | `ornith-ai/Ornith-1.5-35B-A3B-NVFP4` | One card, `--moe-backend hybrid`: 41-46 tok/s, 2,947 expert slots. Two cards, `--pp-layers 25 --moe-backend offload`: 40-44 tok/s, 3,833 slots per card; the even split with hybrid is slower (25-30 tok/s). `--spec-mtp 5` on one card: 19-35 tok/s (a 6-row verify step costs 68-92 ms against 23 ms for one row: the window multiplies the expert traffic, as on the 2060) |
+| same | `openai/gpt-oss-120b` (MXFP4, 57 GB of expert banks) | One card: 9-12 tok/s (202 expert slots; the banks exceed the pin budget, so 9 layers decode on the CPU). Two cards, `--pp-layers 26 --moe-backend hybrid`: 12-17 tok/s (394 slots per card, every bank pinned) |
 
-The Qwen3.8-Flash-Next image path shares the same code and was validated with the colour probe
-(`tools/color_probe.py`, 6/6) and chunked image prefill; it is not in the table because it was
-not run on the 2060. Nothing else has been tested. Other Turing cards (RTX 2070/2080, T4, GTX 16
-series without tensor cores) should behave like the 2060 but are unverified.
+The two-card rows are the only measurements of the layer split; the hand-off between the ranks
+costs under 1 ms per step (`FT_STEP_PROFILE`), and the rest is the two forwards in sequence.
+Other Turing cards (RTX 2070/2080, T4, GTX 16 series without tensor cores) should behave like
+the 2060 but are unverified; so should other Ampere and newer cards.
 
 ## Ampere and newer
 
@@ -57,14 +65,16 @@ Nothing in this fork is limited to Turing, and nothing is taken away from newer 
   Triton attention default, the 64 KB extend tiles, the dequant + cuBLAS prefill paths and their
   startup scratches only engage below compute capability 8.0. On Ampere and newer the engine runs
   upstream's kernels and backends unchanged.
-- Image input, `--spec-mtp`, `--host-embedding` and the CPU short-prefill path are
-  architecture-independent. Two details to know: the verify-window CUDA graphs need an attention
-  backend that stages the window, which today is the Triton backend (`--attention-backend
-  triton`); with another backend the window runs eagerly and says so in the log. And the host
-  embedding needs pinned memory the GPU can dereference (Linux/UVA, or WDDM through the mapped
-  address), which is how FreeToken's own PLE table already works.
-- None of the four features has been run on an Ampere or newer card by the fork's maintainer.
-  Treat them as "expected to work, unverified" there and report what you see.
+- Image input, `--spec-mtp`, `--host-embedding`, the CPU short-prefill path and `--pp-size`
+  are architecture-independent. Two details to know: the verify-window CUDA graphs need an
+  attention backend that stages the window, which today means the Triton backend
+  (`--attention-backend triton`) or Flash-Next's qsa_sparse backend; with another backend the
+  window runs eagerly and says so in the log. And the host embedding needs pinned memory the
+  GPU can dereference (Linux/UVA, or WDDM through the mapped address), which is how FreeToken's
+  own PLE table already works.
+- Run on RTX 3060 (Ampere) by the fork's maintainer: image input, `--spec-mtp` with its
+  graphs, the CPU short-prefill path and the layer split (see the table above). Not run there:
+  `--host-embedding` (a 12 GB card does not need it). Newer generations are unverified.
 
 ## Install
 
@@ -160,6 +170,15 @@ off when a multi-row forward costs about as much as a single-row one -- experts 
 the GPU -- which a 6 GB card cannot offer for a 35B MoE. Treat `--spec-mtp` on Turing/offload
 setups as a correctness-verified feature, not a speed-up.
 
+The same holds on an RTX 3060 12 GB (Ornith, `--moe-backend hybrid`, `--attention-backend
+triton`, K=5, graphs captured): a 6-row verify step takes 68-92 ms against 23 ms for a plain
+step, 1.4-3.8 tokens are accepted, and the result is 19-35 tok/s against 41-46 tok/s plain.
+With 29% of the experts resident the window still multiplies the expert traffic. Flash-Next on
+two 3060s is the case where it helps a little (18-20 tok/s plain, 13-27 tok/s with K=5 depending
+on acceptance), because its per-step fixed costs are larger. The head is also supported for
+Qwen3.8-Flash-Next (its `mtp.*` block has four residual streams and a hyper-connection mixer;
+the 512 bf16 experts become one NVFP4 bank layer, 1.35 GB pinned).
+
 ## 64k of context on 6 GB: `--host-embedding`
 
 The input embedding table (250k x 2048 fp16 = 1 GB on Ornith) can live in pinned host
@@ -204,6 +223,9 @@ vocabularies only (Ornith's is untied); Qwen3.5-MoE family.
   checkpoints only; its CUDA graphs need the Triton attention backend (eager otherwise).
 - Image prompts bypass the shared prefix cache (by upstream design), so a conversation with images
   is prefilled in full every turn.
+- `--pp-size`: the ranks run in sequence, so two cards are never faster than one card that
+  holds everything; every rank needs one layer of each attention kind; the runtime cache
+  rebuild (`ft ctl`) is not available with more than one rank. See [pipeline.md](pipeline.md).
 - On Turing, use `--dtype float16`. A long prefill chunk costs ~5 s of expert streaming on the
   2060 under WSL (every layer's bank crosses PCIe at ~3.4 GB/s) plus ~1.3 ms per token; extends
   of up to `FREETOKEN_CPU_PREFILL_MAX_TOKENS` (256) rows -- a chat turn behind a cached prefix
