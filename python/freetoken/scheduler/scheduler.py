@@ -1024,7 +1024,7 @@ class Scheduler(SchedulerIOMixin):
 
     def _spec_post_step(self, req: Req, spec_res, finished: bool) -> None:
         """After a plain decode / final prefill step in spec mode: return the reserved draft
-        pages and keep the drafts the last rank produced for the next window."""
+        pages and keep the drafts the head produced for the next window."""
         if req.spec_alloc_len is not None:
             self.cache_manager.truncate_pages(req, req.cached_len, req.spec_alloc_len)
             req.spec_alloc_len = None
