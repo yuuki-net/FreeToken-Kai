@@ -256,6 +256,7 @@ def _prefill_nvfp4_moe_kernel(
     MUL_ROUTED_WEIGHT: tl.constexpr,
     top_k: tl.constexpr,
     compute_type: tl.constexpr,
+    ARITH_DEQUANT: tl.constexpr = False,
 ):
     pid = tl.program_id(axis=0)
     num_pid_m = tl.cdiv(EM, BLOCK_SIZE_M)
@@ -300,8 +301,22 @@ def _prefill_nvfp4_moe_kernel(
             scale = tl.load(s_ptrs, mask=byte_mask[:, None], other=0.0).to(tl.float32)
         else:
             scale = e4m3_u8_to_f32(tl.load(s_ptrs, mask=byte_mask[:, None], other=0))
-        b_lo = tl.load(lut_ptr + lo) * scale  # [BLOCK_KB, BLOCK_N]
-        b_hi = tl.load(lut_ptr + hi) * scale
+        if ARITH_DEQUANT:
+            # Arithmetic e2m1 dequant (same trick as nvfp4_linear._nvfp4_pair_f32, bit-identical
+            # to the LUT): place the code's magnitude bits at fp16 [11:9] and its sign at [15];
+            # the fp16 bit pattern reads back as value * 2^-14, so fold 2^14 into the scale.
+            # No gathers -- on GPUs where the LUT gathers serialise the LSU (Turing) this is
+            # what lets the dot run at all.
+            v = lo | (hi << 16)
+            r = ((v << 9) & 0x0E000E00) | ((v & 0x00080008) << 12)
+            d_lo = (r & 0xFFFF).to(tl.uint16).to(tl.float16, bitcast=True).to(tl.float32)
+            d_hi = (r >> 16).to(tl.uint16).to(tl.float16, bitcast=True).to(tl.float32)
+            s14 = scale * 16384.0
+            b_lo = d_lo * s14  # [BLOCK_KB, BLOCK_N]
+            b_hi = d_hi * s14
+        else:
+            b_lo = tl.load(lut_ptr + lo) * scale  # [BLOCK_KB, BLOCK_N]
+            b_hi = tl.load(lut_ptr + hi) * scale
 
         a_lo = tl.load(a_ptrs_lo, mask=token_mask[:, None] & byte_mask[None, :], other=0.0)
         a_hi = tl.load(a_ptrs_hi, mask=token_mask[:, None] & byte_mask[None, :], other=0.0)

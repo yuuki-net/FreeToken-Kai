@@ -7,6 +7,8 @@ so no BF16 copy of the experts is ever materialized.
 
 from __future__ import annotations
 
+import functools
+import os
 from typing import Any, Dict
 
 import torch
@@ -258,6 +260,20 @@ def fused_experts_decode_nvfp4_serial(
     )
 
 
+@functools.cache
+def _arith_dequant() -> bool:
+    """Prefill MoE kernel dequant: arithmetic (no LUT gathers) below Ampere by default --
+    measured 0.56 TFLOPS for the LUT path on an RTX 2060 against 16 TFLOPS for the dense
+    NVFP4 kernels that already use the arithmetic form. ``FREETOKEN_NVFP4_MOE_ARITH=0/1``
+    overrides anywhere (the two forms are bit-identical, so this is purely a speed knob)."""
+    env = os.environ.get("FREETOKEN_NVFP4_MOE_ARITH")
+    if env is not None:
+        return env == "1"
+    from freetoken.utils import is_pre_ampere
+
+    return is_pre_ampere()
+
+
 def _prefill_config(M: int) -> Dict[str, int]:
     # ``BLOCK_SIZE_M`` is coupled to host-side ``moe_align_block_size`` (token padding),
     # so it cannot be picked by triton.autotune; these were chosen by an offline sweep
@@ -305,6 +321,7 @@ def _prefill_gemm(
         MUL_ROUTED_WEIGHT=mul_routed_weight,
         top_k=kernel_top_k,
         compute_type=_tl_dtype(c.dtype),
+        ARITH_DEQUANT=_arith_dequant(),
         **cfg,
     )
 
