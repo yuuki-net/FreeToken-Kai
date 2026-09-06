@@ -16,7 +16,15 @@ from freetoken.models import create_model, load_weight
 from freetoken.moe import create_moe_backend, is_offload_moe_backend
 from freetoken.moe.expert_banks import load_expert_banks
 from freetoken.moe.offload_cache import OffloadMoeCache, attach_offload_moe_cache
-from freetoken.utils import align_ceil, init_logger, is_sm90_family, is_sm100_family, mem_GB, torch_dtype
+from freetoken.utils import (
+    align_ceil,
+    init_logger,
+    is_pre_ampere,
+    is_sm90_family,
+    is_sm100_family,
+    mem_GB,
+    torch_dtype,
+)
 
 from .config import EngineConfig
 from .graph import GraphRunner, get_free_memory
@@ -134,7 +142,10 @@ def _resolve_auto_attention_backend(required: frozenset[AttnType]) -> str:
         candidates += [
             ("trtllm", is_sm100_family()),
             ("fa,fi", is_sm90_family()),
-            ("fi", True),
+            # flashinfer's JIT attention fails on Turing (sm_75) at head_dim 256 ("unspecified
+            # launch failure" in BatchPrefillWithPagedKVCache); the Triton backend serves it.
+            # An explicit --attention-backend fi is still accepted.
+            ("fi", not is_pre_ampere()),
             ("triton", True),
         ]
     for name, arch_ok in candidates:

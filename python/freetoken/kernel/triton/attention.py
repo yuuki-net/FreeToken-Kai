@@ -18,7 +18,9 @@ def _optin_smem_bytes(device_index: int) -> int:
     return int(getattr(props, "shared_memory_per_block_optin", 0))
 
 
-def _select_extend_tile(head_dim: int, block_d: int, smem_optin: int) -> tuple[int, int]:
+def _select_extend_tile(
+    head_dim: int, block_d: int, smem_optin: int, split: bool = False
+) -> tuple[int, int]:
     """Pick ``(BLOCK_M, BLOCK_N)`` for the extend/prefill kernel, shared-memory aware.
 
     Larger tiles run materially faster (~2x for head_dim 512 on H100) but their bf16
@@ -27,6 +29,12 @@ def _select_extend_tile(head_dim: int, block_d: int, smem_optin: int) -> tuple[i
     Keep the fast tiles where the device's opt-in shared memory fits them (datacenter
     A100/H100); shrink only where it does not. ``smem_optin == 0`` (unknown) conservatively
     selects the small tiles, i.e. the prior consumer-safe behavior.
+
+    ``split``: the extend kernel that also reads the cached prefix stages K/V tiles for
+    both sources, i.e. ``(BLOCK_M + 4 * BLOCK_N)`` rows instead of ``(BLOCK_M + 2 * BLOCK_N)``.
+    Whatever the preference above picked is finally halved until it fits the device's hard
+    opt-in limit (Turing: 64 KB), since Triton refuses to launch a kernel whose static shared
+    memory exceeds it.
     """
     budget = smem_optin * 0.8  # headroom for scores/acc/alignment/triton scratch
 
@@ -34,12 +42,20 @@ def _select_extend_tile(head_dim: int, block_d: int, smem_optin: int) -> tuple[i
         return (block_m + 2 * block_n) * block_d * 2 <= budget
 
     if head_dim <= 128:
-        return 128, 64
-    if head_dim <= 256:
-        return (128, 64) if fits(128, 64) else (64, 32)
-    if head_dim <= 384:
-        return (32, 64) if fits(32, 64) else (32, 32)
-    return (32, 64) if fits(32, 64) else (16, 16)
+        block_m, block_n = 128, 64
+    elif head_dim <= 256:
+        block_m, block_n = (128, 64) if fits(128, 64) else (64, 32)
+    elif head_dim <= 384:
+        block_m, block_n = (32, 64) if fits(32, 64) else (32, 32)
+    else:
+        block_m, block_n = (32, 64) if fits(32, 64) else (16, 16)
+    if smem_optin > 0:
+        kv_tiles = 4 if split else 2
+        while (block_m + kv_tiles * block_n) * block_d * 2 > smem_optin and (
+            block_m > 16 or block_n > 16
+        ):
+            block_m, block_n = max(16, block_m // 2), max(16, block_n // 2)
+    return block_m, block_n
 
 
 @triton.jit
@@ -799,7 +815,7 @@ def extend_paged_attention(
     # shared memory fits them, shrink on consumer GPUs (sm_89 ~99KB) where the default
     # 128x64 overflows once head_dim >= 256 (e.g. gemma4: SWA 256, full-attention 512).
     block_m, block_n = _select_extend_tile(
-        head_dim, block_d, _optin_smem_bytes(q.device.index)
+        head_dim, block_d, _optin_smem_bytes(q.device.index), split=k_extend is not None
     )
     grid = (qo_indptr.numel() - 1, num_q_heads, triton.cdiv(max_q_len, block_m))
     if k_extend is not None or v_extend is not None:

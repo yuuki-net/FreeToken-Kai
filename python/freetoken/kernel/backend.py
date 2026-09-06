@@ -28,6 +28,18 @@ def is_flashinfer_installed() -> bool:
 
 @functools.cache
 def is_sgl_kernel_installed() -> bool:
+    # The sgl_kernel wheel ships no sm_75 (Turing) binaries: every launch fails with
+    # cudaErrorNoKernelImageForDevice, and moe_align_block_size hands its uninitialised
+    # outputs downstream, which then shows up as an illegal memory access in the MoE
+    # GEMM. Every caller has a Triton / native fallback, so report the package as absent
+    # on anything below compute capability 8.0.
+    try:
+        import torch
+
+        if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] < 8:
+            return False
+    except Exception:
+        pass
     return _importable("sgl_kernel")
 
 

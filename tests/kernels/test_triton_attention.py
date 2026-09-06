@@ -603,6 +603,9 @@ def test_extend_triton_attention_with_sinks_matches_reference(use_split_inputs: 
         # unknown budget -> conservative small tiles (prior consumer-safe behavior)
         (256, 0, (64, 32)),
         (512, 0, (16, 16)),
+        # Turing (64KB opt-in): the plain kernel's (64+64) rows x 512B is exactly the limit
+        (256, 65536, (64, 32)),
+        (128, 65536, (128, 64)),
     ],
 )
 def test_select_extend_tile_is_shared_memory_aware(head_dim, smem_optin, expected):
@@ -612,6 +615,31 @@ def test_select_extend_tile_is_shared_memory_aware(head_dim, smem_optin, expecte
 
     block_d = triton.next_power_of_2(head_dim)
     assert _select_extend_tile(head_dim, block_d, smem_optin) == expected
+
+
+@pytest.mark.parametrize(
+    ("head_dim", "smem_optin", "expected"),
+    [
+        # the split kernel stages K/V for the prefix AND the extend part: (M + 4N) rows.
+        # Turing: (64 + 128) x 512 B = 96 KB > 64 KB -> halve to (32, 16) = 48 KB
+        (256, 65536, (32, 16)),
+        (128, 65536, (64, 32)),    # (128 + 256) x 256 B = 96 KB > 64 KB -> halve to 48 KB
+        # sm_89 (~99 KB): (64, 32) needs 96 KB, fits -> unchanged from today
+        (256, 101376, (64, 32)),
+        # H100 (~227 KB): (128, 64) needs 192 KB, fits -> unchanged
+        (256, 232448, (128, 64)),
+    ],
+)
+def test_select_extend_tile_split_kernel_respects_hard_limit(head_dim, smem_optin, expected):
+    import triton
+
+    from freetoken.kernel.triton.attention import _select_extend_tile
+
+    block_d = triton.next_power_of_2(head_dim)
+    got = _select_extend_tile(head_dim, block_d, smem_optin, split=True)
+    assert (got[0] + 4 * got[1]) * block_d * 2 <= smem_optin
+    if expected is not None:
+        assert got == expected
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton attention needs CUDA")

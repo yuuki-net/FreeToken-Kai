@@ -40,6 +40,14 @@ def is_sm100_family() -> bool:
     return _is_arch_family(10)
 
 
+def is_pre_ampere() -> bool:
+    """Compute capability below 8.0 (Turing and older). Such a device has no bf16 tensor
+    cores, 64 KB of opt-in shared memory and no prebuilt sgl_kernel / flashinfer attention
+    kernels that fit it, so a few auto choices pick their self-contained Triton fallbacks."""
+    arch = _get_torch_cuda_version()
+    return arch is not None and arch[0] < 8
+
+
 def is_sm90_supported() -> bool:
     return is_arch_supported(9, 0)
 

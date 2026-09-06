@@ -66,8 +66,15 @@ def _patch_env(monkeypatch, *, major, flashinfer=True, sgl=True):
 
     monkeypatch.setattr(engine, "is_sm100_family", lambda: major == 10)
     monkeypatch.setattr(engine, "is_sm90_family", lambda: major == 9)
+    monkeypatch.setattr(engine, "is_pre_ampere", lambda: major < 8)
     monkeypatch.setattr(engine, "_flashinfer_available", lambda: flashinfer)
     monkeypatch.setattr(engine, "_sgl_flash_attn_available", lambda: sgl)
+
+
+@pytest.mark.parametrize("cc, expected", [((7, 5), True), ((8, 6), False), ((9, 0), False), (None, False)])
+def test_is_pre_ampere(monkeypatch, cc, expected):
+    monkeypatch.setattr(arch, "_get_torch_cuda_version", lambda: cc)
+    assert arch.is_pre_ampere() is expected
 
 
 @pytest.mark.parametrize(
@@ -79,6 +86,7 @@ def _patch_env(monkeypatch, *, major, flashinfer=True, sgl=True):
         (12, True, True, "fi"),  # consumer Blackwell: no FA3/FA4/trtllm-gen kernels
         (11, True, True, "fi"),  # Thor
         (8, True, True, "fi"),  # Ampere
+        (7, True, True, "triton"),  # Turing: flashinfer's JIT attention fails at head_dim 256
         (12, False, True, "triton"),  # no flashinfer -> only self-contained option
     ],
 )
