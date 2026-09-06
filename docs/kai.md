@@ -104,10 +104,20 @@ checkpoint) are quantized to NVFP4 at load and appended to the offload cache (~0
 pinned host memory). Loading reads 1.6 GB of bf16 experts through host RAM once.
 
 Scope: single running request (`--max-running-req 1`); the verify window and the draft chain
-run eagerly (no CUDA graph yet), so on a launch-bound GPU the average tok/s may not improve
-while the per-step maximum does; modelopt MIXED_PRECISION checkpoints only (fp8 attention +
-NVFP4 experts, the Ornith / Qwen3.6-35B-A3B-NVFP4 format). The `Spec decode` line in the
-decode status shows the mean accepted length.
+run eagerly (no CUDA graph); modelopt MIXED_PRECISION checkpoints only (fp8 attention + NVFP4
+experts, the Ornith / Qwen3.6-35B-A3B-NVFP4 format). The `Spec decode` line in the decode
+status shows the mean accepted length.
+
+Measured on the RTX 2060 (Ornith, fp16, `--moe-backend hybrid`, K=3): the head is good
+(2.5 tokens accepted per step on average, up to 4), and the verify path matches plain decode
+within fp16 rounding (`FT_SPEC_CHECK_STEP`: per-layer residual divergence 1e-4 at layer 0 to
+1e-2 at layer 39, identical top-3 logits, GDN state after rollback within 1e-3). But it does
+**not** make decoding faster there: a 4-row verify forward costs ~145 ms against ~45 ms for one
+row, because with the experts on the CPU every row pays its own expert traffic (~27 ms per
+token), which is the dominant cost. Result 8-22 tok/s versus 25-37 tok/s plain. Speculative
+decoding pays off when a multi-row forward costs about as much as a single-row one -- experts
+resident on the GPU -- which a 6 GB card cannot offer for a 35B MoE. Treat `--spec-mtp` on
+Turing/offload setups as a correctness-verified feature, not a speed-up.
 
 ## Environment variables added by this fork
 
