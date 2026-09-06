@@ -105,7 +105,7 @@ class HybridSWAKVCache(BaseKVCachePool):
     @staticmethod
     def _build_layers_mapping(
         num_layers: int, specs: dict[str, KVCacheGroupSpec]
-    ) -> tuple[_LayerRef, ...]:
+    ) -> tuple[_LayerRef | None, ...]:
         mapping: list[_LayerRef | None] = [None] * num_layers
         for group_name in ("full", "swa"):
             for local_index, layer_id in enumerate(specs[group_name].layer_ids):
@@ -117,8 +117,15 @@ class HybridSWAKVCache(BaseKVCachePool):
 
         missing = [layer_id for layer_id, ref in enumerate(mapping) if ref is None]
         if missing:
-            raise ValueError(f"KV layer ids missing from full/swa groups: {missing}")
-        return tuple(ref for ref in mapping if ref is not None)
+            # the pipeline (layer-split) engine gives a rank only its own layers' groups; the
+            # other ranks' layers stay unmapped (never indexed here) and keep the ids global
+            from freetoken.distributed import try_get_pp_info
+
+            pp = try_get_pp_info()
+            local = missing if pp is None else [l for l in missing if pp.owns_layer(l)]
+            if local:
+                raise ValueError(f"KV layer ids missing from full/swa groups: {local}")
+        return tuple(mapping)
 
     def is_full_layer(self, layer_id: int) -> bool:
         return self.layers_mapping[layer_id].group == "full"

@@ -188,3 +188,27 @@ def test_gpt_oss_bank_window_allocates_local_layers(monkeypatch):
     assert _bank_window(cfg) == (0, 4)
     banks, _ = _empty_mxfp4_triton_banks(cfg, dtype=torch.bfloat16, tp_info=tp)
     assert all(len(per_layer) == 4 for per_layer in banks.values())
+
+
+def test_gpt_oss_swa_pool_maps_only_local_layers(monkeypatch):
+    """The hybrid SWA pool of a pipeline rank backs its own layers (global ids) and leaves the
+    other ranks' layers unmapped; a single process still rejects a missing layer."""
+    from freetoken.kvcache.hybrid_swa_pool import HybridSWAKVCache
+    from freetoken.models.config import window_model_config
+
+    full = _gpt_oss()
+    _pp(monkeypatch, 1, 2, 2, 4, 4)
+    cfg = window_model_config(full, 2, 4)
+    pool = HybridSWAKVCache(
+        groups=cfg.kv_cache_group_specs(), num_layers=4, num_full_pages=8, page_size=1,
+        dtype=torch.bfloat16, device=torch.device("cpu"),
+    )
+    assert pool.layers_mapping[0] is None and pool.layers_mapping[1] is None
+    assert pool.group_of(2) == "swa" and pool.group_of(3) == "full"
+    assert pool.k_cache(3).shape[0] == 8
+    _pp(monkeypatch, 0, 1, 0, 4, 4)
+    with pytest.raises(ValueError):
+        HybridSWAKVCache(
+            groups=cfg.kv_cache_group_specs(), num_layers=4, num_full_pages=8, page_size=1,
+            dtype=torch.bfloat16, device=torch.device("cpu"),
+        )
