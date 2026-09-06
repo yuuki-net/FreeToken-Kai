@@ -562,12 +562,23 @@ class Engine:
             dummy_req=self.dummy_req,
             moe_offload_cache=self.moe_offload_cache,
         )
+        # pre-map before the prefill warmup so its persistent buffers come from the cache
+        self._premap_vram()
         if config.attention_backend.split(",")[0] == "triton":
             # Prefill runs on the first comma part; warm its autotune cache.
             self._warmup_prefill()
         if self.spec_k > 0:
+            if self._premap_enabled():
+                # the verify-window graphs carve their own pools: hand the pre-mapped memory
+                # back for the capture, then take the remainder again below
+                torch.cuda.synchronize(self.device)
+                torch.cuda.empty_cache()
             self._capture_spec_graph()
-        self._premap_vram()
+            self._premap_vram()
+
+    @staticmethod
+    def _premap_enabled() -> bool:
+        return os.environ.get("FREETOKEN_PREMAP_VRAM") == "1"
 
     def _premap_vram(self) -> None:
         """Opt-in (``FREETOKEN_PREMAP_VRAM=1``): once every pool and graph exists, take all but
@@ -576,7 +587,7 @@ class Engine:
         segments and never grow or shrink them through the driver. On WSL2 with a full card
         (RTX 2060 6 GB) segment growth under load intermittently failed with ``CUDA driver
         error: device not ready``; pre-mapping removes those driver calls from the hot path."""
-        if os.environ.get("FREETOKEN_PREMAP_VRAM") != "1":
+        if not self._premap_enabled():
             return
         headroom = int(os.environ.get("FREETOKEN_VRAM_HEADROOM_MB", "96") or 0) * 2**20
         torch.cuda.synchronize(self.device)
