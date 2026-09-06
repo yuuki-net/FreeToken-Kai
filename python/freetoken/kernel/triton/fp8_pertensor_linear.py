@@ -218,6 +218,31 @@ def _gemm_kernel(
     tl.store(c_ptrs, acc.to(compute_type), mask=m_mask[:, None] & n_mask[None, :])
 
 
+@functools.cache
+def _scratch_gemm_preferred() -> bool:
+    """Whether M>1 W8A16 GEMMs go through ``_gemm_scratch`` instead of the inline-dequant
+    Triton kernel. Default: below Ampere. Measured on an RTX 2060 (M=2785, N=12288, K=2048):
+    the Triton kernel runs at 0.15 TFLOPS in fp16 and bf16 alike -- the software e4m3 unpack
+    per tile dominates and the dot never gets near the tensor cores -- while cuBLAS fp16 does
+    19 TFLOPS on the same GPU. ``FREETOKEN_FP8_SCRATCH_GEMM=0/1`` overrides anywhere."""
+    env = os.environ.get("FREETOKEN_FP8_SCRATCH_GEMM")
+    if env is not None:
+        return env == "1"
+    from freetoken.utils import is_pre_ampere
+
+    return is_pre_ampere()
+
+
+def _gemm_scratch(a: torch.Tensor, weight: torch.Tensor, weight_scale: torch.Tensor,
+                  out_dtype: torch.dtype) -> torch.Tensor:
+    """M>1 W8A16 GEMM as dequant + cuBLAS: ``weight`` [N, K] fp8 (the fp8 tensor, not the
+    uint8 view) is expanded to a per-call ``[N, K]`` scratch in the activation dtype with the
+    per-row scale folded in (so the product stays in fp16 range), then ``a @ w.t()``. The
+    scratch is ~50 MB for a 12288 x 2048 projection and is freed on return."""
+    w = weight.to(a.dtype) * weight_scale.to(a.dtype)[:, None]
+    return (a @ w.t()).to(out_dtype)
+
+
 def _gemm(a: torch.Tensor, weight: torch.Tensor, weight_scale: torch.Tensor,
           out_dtype: torch.dtype) -> torch.Tensor:
     """M>1 W8A16 GEMM. ``a`` [M, K] bf16; ``weight`` [N, K] fp8; ``weight_scale`` [N] fp32."""
@@ -357,6 +382,9 @@ def fp8_pertensor_linear(
         ).reshape(*lead, N)
     elif x.numel() // K == 1:
         out = _gemv(x.reshape(K), e4m3_kernel_view(weight), weight_scale, x.dtype).reshape(*lead, N)
+    elif _scratch_gemm_preferred():
+        # pre-Ampere: dequant to a scratch and let cuBLAS run the GEMM (see the helper)
+        out = _gemm_scratch(x.reshape(-1, K), weight, weight_scale, x.dtype).reshape(*lead, N)
     else:
         out = _gemm(
             x.reshape(-1, K), e4m3_kernel_view(weight), weight_scale, x.dtype,
