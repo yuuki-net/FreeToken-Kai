@@ -567,6 +567,34 @@ class Engine:
             self._warmup_prefill()
         if self.spec_k > 0:
             self._capture_spec_graph()
+        self._premap_vram()
+
+    def _premap_vram(self) -> None:
+        """Opt-in (``FREETOKEN_PREMAP_VRAM=1``): once every pool and graph exists, take all but
+        ``FREETOKEN_VRAM_HEADROOM_MB`` (default 96) of the remaining free VRAM into the caching
+        allocator and release it there, so serving-time allocations are served from cached
+        segments and never grow or shrink them through the driver. On WSL2 with a full card
+        (RTX 2060 6 GB) segment growth under load intermittently failed with ``CUDA driver
+        error: device not ready``; pre-mapping removes those driver calls from the hot path."""
+        if os.environ.get("FREETOKEN_PREMAP_VRAM") != "1":
+            return
+        headroom = int(os.environ.get("FREETOKEN_VRAM_HEADROOM_MB", "96") or 0) * 2**20
+        torch.cuda.synchronize(self.device)
+        free = torch.cuda.mem_get_info(self.device)[0]
+        size = free - headroom
+        if size <= 0:
+            logger.info(f"FREETOKEN_PREMAP_VRAM: nothing to pre-map ({mem_GB(free)} free)")
+            return
+        try:
+            block = torch.empty(size, dtype=torch.uint8, device=self.device)
+            del block  # stays cached in the allocator
+        except RuntimeError as exc:  # noqa: BLE001
+            logger.warning(f"FREETOKEN_PREMAP_VRAM: could not pre-map {mem_GB(size)}: {exc!r}")
+            return
+        logger.info(
+            f"FREETOKEN_PREMAP_VRAM: pre-mapped {mem_GB(size)} into the allocator cache "
+            f"({mem_GB(headroom)} of headroom left to the driver)"
+        )
 
     def _capture_spec_graph(self) -> None:
         """Capture the K+1-row verify window as a CUDA graph (see engine/spec_graph), then the
