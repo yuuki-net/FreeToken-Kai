@@ -415,6 +415,7 @@ def iter_ftw_weights(path: str, *, kinds=("weight",), workers: int = 8,
 def load_ftw_banks(
     path: str, *, num_layers: int, workers: int = 8, chunk: int = _DEFAULT_CHUNK,
     layer_residency: list[str] | None = None,
+    layer_window: tuple[int, int, int] | None = None,
 ):
     """Reconstruct the offload :class:`ExpertBanks` from the FTW's ``experts_bank``
     entries, on the per-layer host bank contract (one ``[num_experts, ...]``
@@ -444,6 +445,10 @@ def load_ftw_banks(
     Alphas (``gate_up_alpha``/``down_alpha``) stay flat ``[num_layers*num_experts]``
     vectors, unaffected by the row split (fixed GPU residency; see
     ``cache_budget.expert_bytes_per_slot``).
+
+    ``layer_window = (start, end, total)``: the pipeline engine reads only bank layers
+    ``[start, end)`` of the file's ``total`` (``num_layers == end - start``), re-based to
+    local indices 0..; the alphas are sliced to the same window.
     """
     from freetoken.moe.host_banks import (
         HostBank, HostResidency, PinPipeline, alloc_banks, born_pinned_default,
@@ -452,6 +457,13 @@ def load_ftw_banks(
 
     residency = layer_residency or [HostResidency.PINNED.value] * num_layers
     assert len(residency) == num_layers, (len(residency), num_layers)
+    if layer_window is None:
+        layer_ids = list(range(num_layers))
+        total_layers = num_layers
+    else:
+        w_start, w_end, total_layers = layer_window
+        assert w_end - w_start == num_layers, (layer_window, num_layers)
+        layer_ids = list(range(w_start, w_end))
 
     # PINNED layers are born-pinned (cudaHostAlloc) where that wins (see born_pinned_default); LOCKED/PAGEABLE layers stay lazy mmaps
     born = born_pinned_default()
@@ -471,11 +483,11 @@ def load_ftw_banks(
     row_entries = [e for e in bank_entries if e["name"] not in _ALPHA_NAMES]
 
     meta_layers = reader.meta("expert_bank_num_layers")
-    if meta_layers is not None and meta_layers != num_layers:
+    if meta_layers is not None and meta_layers != total_layers:
         reader.close()
         raise RuntimeError(
             f"{path!r} was converted with {meta_layers} expert-bank layers but the "
-            f"model config says num_moe_layers={num_layers}; the checkpoint does not "
+            f"model config says num_moe_layers={total_layers}; the checkpoint does not "
             "match its config"
         )
 
@@ -504,43 +516,46 @@ def load_ftw_banks(
     row_jobs = []  # (name, HostBank, window_off, window_len, layer_bytes) -- flat layout
     layer_jobs = []  # (name, HostBank, entry) -- per-layer layout, direct aligned read
 
+    # job layer ids below are LOCAL (index into residency / the returned per-layer lists);
+    # ``layer_ids[local]`` is the layer's position in the file
     for e in flat_entries:
         name = e["name"]
         total, *row_shape = e["shape"]
-        assert total % num_layers == 0, (name, total, num_layers)
-        num_experts = total // num_layers
+        assert total % total_layers == 0, (name, total, total_layers)
+        num_experts = total // total_layers
         dtype = _dtype_of(e["dtype"])
         row_bytes = (math.prod(row_shape) if row_shape else 1) * _elsize(dtype)
         layer_bytes = num_experts * row_bytes
-        assert layer_bytes * num_layers == e["nbytes"], (name, layer_bytes, num_layers, e["nbytes"])
+        assert layer_bytes * total_layers == e["nbytes"], (name, layer_bytes, total_layers, e["nbytes"])
         row_hb[name] = []
         row_view_args[name] = []
-        for layer_id in range(num_layers):
+        for local_id, layer_id in enumerate(layer_ids):
             off = e["global_off"] + layer_id * layer_bytes
             win_off = (off // ALIGN) * ALIGN
             win_end = _align_up(off + layer_bytes)
             head_pad = off - win_off
-            bank = HostBank((win_end - win_off,), torch.uint8, backing=_backing(layer_id))
+            bank = HostBank((win_end - win_off,), torch.uint8, backing=_backing(local_id))
             row_hb[name].append(bank)
             row_view_args[name].append((head_pad, layer_bytes, num_experts, tuple(row_shape), dtype))
-            row_jobs.append((name, bank, win_off, win_end - win_off, layer_bytes, layer_id))
+            row_jobs.append((name, bank, win_off, win_end - win_off, layer_bytes, local_id))
 
     for base, by_layer in per_layer_groups.items():
-        assert sorted(by_layer) == list(range(num_layers)), (
+        assert sorted(by_layer) == list(range(total_layers)), (
             f"FTW bank {base!r} has per-layer entries for layers {sorted(by_layer)}, "
-            f"expected exactly range({num_layers})"
+            f"expected exactly range({total_layers})"
         )
         row_hb[base] = []
         row_view_args[base] = []
-        for layer_id in range(num_layers):
+        for local_id, layer_id in enumerate(layer_ids):
             e = by_layer[layer_id]
             assert e["global_off"] % ALIGN == 0, (base, layer_id, e["global_off"])  # writer invariant
-            bank = HostBank(tuple(e["shape"]), _dtype_of(e["dtype"]), backing=_backing(layer_id))
+            bank = HostBank(tuple(e["shape"]), _dtype_of(e["dtype"]), backing=_backing(local_id))
             row_hb[base].append(bank)
             row_view_args[base].append(None)
-            layer_jobs.append((base, bank, e, layer_id))
+            layer_jobs.append((base, bank, e, local_id))
 
-    total_bytes = sum(e["nbytes"] for e in bank_entries)
+    total_bytes = sum(e["nbytes"] for e in alpha_entries)
+    total_bytes += sum(job[4] for job in row_jobs) + sum(job[2]["nbytes"] for job in layer_jobs)
     bar = byte_bar(total_bytes, "Loading expert banks (FTW)")
 
     # Jobs are per (bank, layer) -- many small reads, so a wider pool; each bank pins
@@ -627,6 +642,13 @@ def load_ftw_banks(
     # alphas are the small per-expert scale vectors, distinguished by their reserved names
     # (not a separate kind); everything else under experts_bank is a weight source.
     alpha_kw = {n: alpha_hb[n].tensor for n in alpha_hb}
+    if layer_window is not None:
+        # [total_layers * E] in the file -> this rank's [num_layers * E] slice (the cache
+        # indexes alphas by its LOCAL layer id, see OffloadMoeCache.alphas_for_layer)
+        for n, t in alpha_kw.items():
+            assert t.numel() % total_layers == 0, (n, t.numel(), total_layers)
+            per_layer = t.numel() // total_layers
+            alpha_kw[n] = t[layer_ids[0] * per_layer : (layer_ids[-1] + 1) * per_layer]
     return ExpertBanks(
         reader.meta("quant_format"), sources, **alpha_kw,
         layer_residency=applied,

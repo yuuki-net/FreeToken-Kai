@@ -1,26 +1,29 @@
 """CUDA graphs for the MTP verify window and the draft head (``--spec-mtp``).
 
 A verify step runs the target over ``[t_last, d_1..d_K]`` -- an extend of exactly K+1 rows of
-ONE request. Eagerly that costs tens of milliseconds of launch / host overhead on top of the
-real work, so the window is captured once as a CUDA graph, the way the decode step is: every
-per-step input the captured kernels read lives in a static buffer (token ids, positions, rope
-positions, KV slots, the GDN slot / cu_seqlens / continuation flag, the attention addressing
-the backend stages), and a step copies its values in, replays, and reads the static output.
+ONE request. Eagerly that costs tens of milliseconds of launch / host overhead (per pipeline
+rank) on top of the real work, so the window is captured once as a CUDA graph, the way the
+decode step is: every per-step input the captured kernels read lives in a static buffer (token
+ids, positions, rope positions, KV slots, the GDN slot / cu_seqlens / continuation flag, the
+attention addressing the backend stages, the residual stream a non-first pipeline rank
+receives), and a step copies its values in, replays, and reads the static output.
 
-What the window graph contains: the decoder layers (prefill-phase kernels: varlen conv, the
-per-token GDN kernel that leaves the rollback stashes, paged attention over a cached prefix,
-the MoE decode path) and the lm_head over every row. The GDN stashes the captured layers
-append are graph-pool tensors rewritten by every replay, so the rollback reads the stashes
-recorded at capture. What stays eager: sampling and the rollback.
+What the window graph contains: this process's decoder layers (prefill-phase kernels: varlen
+conv, the per-token GDN kernel that leaves the rollback stashes, paged attention over a cached
+prefix, the MoE decode path) and, on the rank that owns the head, the lm_head over every row.
+The GDN stashes the captured layers append are graph-pool tensors rewritten by every replay,
+so the rollback reads the stashes recorded at capture. What stays eager: sampling and the
+rollback.
 
-The draft head gets two more graphs: the window pass (the head over the K+1 rows on the
-target's static final hidden state, the drafting row scored through the shared lm_head into a
-static token buffer) and one chain step (a one-token head decode at a staged position on the
-head's own previous output). Each drafted token is read back once, as eagerly.
+The draft head (head-owning rank) gets two more graphs: the window pass (the head over the K+1
+rows on the target's static final hidden state, the drafting row scored through the shared
+lm_head into a static token buffer) and one chain step (a one-token head decode at a staged
+position on the head's own previous output). Each drafted token is read back once, as eagerly.
 
 Windows shorter than K+1 rows (the output budget's tail) fall back to the eager path. An
 attention backend takes part by implementing ``init_spec_capture(rows)`` / ``stage_spec(md,
-table_idx=, kv_len=)`` (the Triton backend does); without them the window stays eager.
+table_idx=, kv_len=)`` (the Triton and qsa_sparse backends do); without them the window stays
+eager.
 """
 
 from __future__ import annotations
@@ -61,12 +64,18 @@ class SpecVerifyGraph:
         self.fla_cu = torch.tensor([0, rows], dtype=torch.int64, device=dev)
         self.fla_slot = torch.zeros(1, dtype=i32, device=dev)
         self.fla_init = torch.ones(1, dtype=torch.bool, device=dev)
-        self.out: torch.Tensor | None = None      # [rows, vocab] logits
-        self.hidden: torch.Tensor | None = None   # the final hidden state (draft head input)
+        pp = engine.pp_comm
+        self.pp_in = (
+            torch.zeros(rows, pp.hidden_width, dtype=engine.dtype, device=dev)
+            if pp is not None and not pp.is_first
+            else None
+        )
+        self.out: torch.Tensor | None = None      # [rows, vocab] logits, or the residual stream to hand on
+        self.hidden: torch.Tensor | None = None   # head-owning rank: the final hidden state (draft head input)
         self.stash: list = []                     # the GDN layers' SpecGdnStash objects (graph-pool tensors)
         self.graph: torch.cuda.CUDAGraph | None = None
         self._capture_batch: Batch | None = None
-        # draft head: window graph + one-step chain graph, see capture_mtp
+        # draft head (head-owning rank): window graph + one-step chain graph, see capture_mtp
         self.g_window: torch.cuda.CUDAGraph | None = None
         self.g_chain: torch.cuda.CUDAGraph | None = None
         self.chain_batch: Batch | None = None
@@ -124,6 +133,8 @@ class SpecVerifyGraph:
         graph = torch.cuda.CUDAGraph()
         ctx.spec_stash = []
         try:
+            if self.pp_in is not None:
+                ctx.pp_hidden_in = self.pp_in
             with ctx.forward_batch(batch):
                 warm = model.forward()  # eager warm run (autotune, lazy buffers); shapes the output
                 self.out = torch.empty_like(warm)
@@ -133,8 +144,10 @@ class SpecVerifyGraph:
                     self.out.copy_(model.forward())
                 self.stash = list(ctx.spec_stash)
                 ctx.spec_stash = []
-                self.hidden = model.last_hidden
+                pp = eng.pp_comm
+                self.hidden = model.last_hidden if pp is None or pp.is_last else None
         finally:
+            ctx.pp_hidden_in = None
             if eng.moe_offload_cache is not None:
                 eng.moe_offload_cache.reset()
         self.graph = graph
@@ -166,10 +179,10 @@ class SpecVerifyGraph:
         mtp = model.mtp
         assert mtp is not None and self._capture_batch is not None and self.hidden is not None
         dev, rows = eng.device, self.rows
-        hidden = self.hidden.shape[-1]
+        width = self.hidden.shape[-1]  # the head's input width (hidden, or hc * hidden)
         self.next_ids = torch.zeros(rows, dtype=torch.int32, device=dev)
         self.row_idx = torch.zeros(1, dtype=torch.int64, device=dev)
-        self.h_in = torch.zeros(1, hidden, dtype=self.hidden.dtype, device=dev)
+        self.h_in = torch.zeros(1, width, dtype=self.hidden.dtype, device=dev)
         self.d_buf = torch.zeros(1, dtype=torch.int64, device=dev)
         torch.cuda.synchronize(dev)
         free_before = torch.cuda.mem_get_info(dev)[0]
@@ -178,9 +191,9 @@ class SpecVerifyGraph:
         batch = self._capture_batch
 
         def window():
-            r = mtp.forward(self.hidden, self.next_ids)
+            r = mtp.forward(self.hidden, self.next_ids, batch)
             self.h_in.copy_(r.index_select(0, self.row_idx))
-            self.d_buf.copy_(model.lm_head.logits(self.h_in).argmax(dim=-1))
+            self.d_buf.copy_(model.lm_head.logits(mtp.to_head(self.h_in)).argmax(dim=-1))
 
         g_window = torch.cuda.CUDAGraph()
         with ctx.forward_batch(batch):
@@ -213,9 +226,9 @@ class SpecVerifyGraph:
         attn.prepare_for_capture(mini)  # decode metadata on the backend's static buffers
 
         def chain():
-            r = mtp.forward(self.h_in, self.c_ids)
+            r = mtp.forward(self.h_in, self.c_ids, mini)
             self.h_in.copy_(r)
-            self.d_buf.copy_(model.lm_head.logits(self.h_in).argmax(dim=-1))
+            self.d_buf.copy_(model.lm_head.logits(mtp.to_head(self.h_in)).argmax(dim=-1))
 
         g_chain = torch.cuda.CUDAGraph()
         with ctx.forward_batch(mini):

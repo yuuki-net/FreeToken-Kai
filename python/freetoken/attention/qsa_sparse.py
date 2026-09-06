@@ -497,6 +497,43 @@ class QSASparseAttnBackend(BaseAttnBackend):
         if topk_scratch:
             self._graph["topk_scratch"] = empty(chunk, topk_scratch, dtype=torch.int32)
 
+    # ----- CUDA graph (MTP verify window) --------------------------------------------------
+    def init_spec_capture(self, rows: int) -> None:
+        """Static addressing of the K+1-row verify window of one request (engine/spec_graph):
+        one page-table row, one kv length, one ring slot, a constant token->request map and
+        query indptr. Restaged per replay by ``stage_spec``."""
+        width = get_global_ctx().page_table.shape[1]
+        pages = -(-width // self.page_size)
+        dev = self.device
+        self._spec = {
+            "block_table": torch.zeros((1, pages), dtype=torch.int32, device=dev),
+            "kvlen": torch.zeros(1, dtype=torch.int32, device=dev),
+            "table_idx": torch.zeros(1, dtype=torch.int32, device=dev),
+            "token_to_req": torch.zeros(rows, dtype=torch.int32, device=dev),
+            "cu_seqlens": torch.tensor([0, rows], dtype=torch.int32, device=dev),
+            "last": torch.tensor([rows - 1], dtype=torch.int32, device=dev),
+        }
+
+    def stage_spec(self, md, *, table_idx: int, kv_len: int) -> None:
+        """Copy this step's window addressing into the static spec buffers and point ``md``
+        at them (the captured kernels read the buffers; an eager forward on the same batch,
+        e.g. the draft head, reads them through ``md`` too)."""
+        s = getattr(self, "_spec", None)
+        assert s is not None, "init_spec_capture() first"
+        assert isinstance(md, QSASparseMetadata)
+        idx = torch.tensor([table_idx], dtype=torch.int64, device=self.device)
+        s["block_table"].copy_(self._block_base_view().index_select(0, idx) // self.page_size)
+        s["kvlen"].fill_(kv_len)
+        s["table_idx"].fill_(table_idx)
+        md.block_table = s["block_table"]
+        md.seq_lens = s["kvlen"]
+        md.ring_slots = s["table_idx"]
+        md.token_to_req = s["token_to_req"]
+        md.cu_seqlens = s["cu_seqlens"]
+        md.last_indices = s["last"]
+        md.cmp_rows = None  # replanned at the first QSA layer of the next eager forward
+        md.ring_rows = None
+
     def prepare_for_capture(self, batch: Batch) -> None:
         self.prepare_metadata(batch)
         md = batch.attn_metadata

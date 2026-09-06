@@ -272,7 +272,7 @@ def state_pool_bytes(config, num_slots: int | None = None) -> int:
         return 0
     slots = num_slots if num_slots is not None else _linear_pool_num_slots(config)
     per_req = linear_state_bytes_per_req(
-        linear_group, config.tp_info.size, config.dtype, slot_states
+        linear_group, int(getattr(config, "tp_size", None) or config.tp_info.size), config.dtype, slot_states
     )
     return per_req * slots
 

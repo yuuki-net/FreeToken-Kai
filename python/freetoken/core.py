@@ -199,6 +199,11 @@ class Batch:
     spec_verify: bool = field(default=False, init=False)
     spec_all_rows: bool = field(default=False, init=False)
     spec_next_tail: int | None = field(default=None, init=False)
+    # Pipeline engine: nobody reads this batch's sampled tokens (every request is a non-final
+    # prefill chunk, whose successor is the next prompt token), so the first rank hands the
+    # residual stream on without waiting for the last rank -- the ranks then work on
+    # consecutive chunks at the same time. Set by the scheduler.
+    pp_no_tokens: bool = field(default=False, init=False)
 
     @property
     def is_prefill(self) -> bool:
@@ -229,11 +234,14 @@ class Context:
     # Per-request recurrent state for GatedDeltaNet layers; set by the engine for
     # hybrid linear-attention models, otherwise None.
     linear_state_pool: LinearStatePool | None = None
+    # Pipeline engine, non-first ranks: the residual stream received from the previous rank
+    # for the active forward ([rows, width] on this device); None on rank 0 / single process.
+    pp_hidden_in: torch.Tensor | None = None
     # MTP verify forward: per-GDN-layer state stashes (see the model's GDN op) consumed by
     # the model's spec_rollback once the accepted length is known.
     spec_stash: list = field(default_factory=list)
     # diagnostics (FT_SPEC_CHECK_STEP): when a list, the model appends (layer_id, residual
-    # stream) after every decoder layer of the active forward
+    # stream) after every local decoder layer of the active forward
     debug_layer_outs: list | None = None
     _batch: Batch | None = field(default=None, init=False)
 

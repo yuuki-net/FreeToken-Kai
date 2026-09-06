@@ -48,6 +48,14 @@ _NVFP4_SOURCE_SPEC = Nvfp4ExpertSourceSpec(
 # Per-tensor modelopt quant scales; consumed with their ``.weight`` (experts) or unused.
 _SCALE_SUFFIXES = (".weight_scale", ".weight_scale_2", ".input_scale")
 
+
+def _is_primary() -> bool:
+    """Rank 0 of whatever parallel layout runs (TP or the pipeline engine): drives progress bars."""
+    from freetoken.distributed import try_get_world_info
+
+    world = try_get_world_info()
+    return world is None or world.is_primary()
+
 # The n-gram table itself: too big for the dense state dict, loaded by load_ple_table.
 _PLE_TABLE_INFIX = ".ple.ple_embedding.ngram_embedding."
 _PLE_SHARD_RE = re.compile(
@@ -100,8 +108,10 @@ _FUSIONS: dict[str, tuple[tuple[str, ...], int]] = {
 
 def _rename(raw_name: str) -> str | None:
     """Checkpoint key -> FreeToken state-dict key, or None to skip."""
-    if raw_name.startswith(("mtp.", "model.visual.", "visual.")):
+    if raw_name.startswith(("model.visual.", "visual.")):
         return None
+    # mtp.* (the MTP draft head) is kept under its own prefix: the engine drops it unless
+    # --spec-mtp built the head, and turns its stacked bf16 experts into a bank layer
     if _PLE_TABLE_INFIX in raw_name:
         return None  # n-gram table + its scale: load_ple_table
     if _EXPERT_RE.search(raw_name):
@@ -143,8 +153,11 @@ def iter_weights(
     *,
     include_moe_experts: bool,
     include_non_moe: bool,
+    include_mtp: bool = False,
 ) -> Iterator[tuple[str, torch.Tensor]]:
     """Yield the dense (non-expert) weights, prefix-stripped and fused to the model's buffers.
+    ``include_mtp`` also yields the checkpoint's MTP draft head (``mtp.*``, the engine asks for
+    it when --spec-mtp built the head on this process); off, like upstream, it is skipped.
 
     Keys keep the checkpoint's module names below the stripped prefix, so the emitted set is the
     model's state dict minus the routed experts. Nothing here is quantized: the modelopt
@@ -162,16 +175,19 @@ def iter_weights(
     if not include_non_moe:
         return
 
+    from freetoken.distributed import try_get_world_info
+
+    world = try_get_world_info()
     fuse_buf: dict[str, dict[int, torch.Tensor]] = {}
     for file in tqdm(
         iter_weight_files(model_path),
         desc="Loading weights",
-        disable=not get_tp_info().is_primary(),
+        disable=world is not None and not world.is_primary(),
     ):
         with safetensors.safe_open(file, framework="pt", device=str(device)) as f:
             for raw_name in f.keys():
                 name = _rename(raw_name)
-                if name is None:
+                if name is None or (not include_mtp and name.startswith("mtp.")):
                     continue
                 tensor = f.get_tensor(raw_name)
                 fused = _try_fuse(name, tensor, fuse_buf)
@@ -296,7 +312,7 @@ def load_nvfp4_expert_sources(model_path: str, config, *, layer_sink=None) -> di
         config,
         _NVFP4_SOURCE_SPEC,
         drop_page_cache=drop_page_cache,
-        primary=get_tp_info().is_primary(),
+        primary=_is_primary(),
         layer_sink=layer_sink,
     )
 
@@ -312,7 +328,7 @@ def load_nvfp4_expert_sources_parallel(
         config,
         _NVFP4_SOURCE_SPEC,
         drop_page_cache=drop_page_cache,
-        primary=get_tp_info().is_primary(),
+        primary=_is_primary(),
         workers=workers,
         chunk=chunk,
         layer_sink=layer_sink,

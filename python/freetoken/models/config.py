@@ -293,6 +293,9 @@ class ModelConfig:
     # it bf16. Separate from dense_quant because only some NVFP4 checkpoints quantize lm_head
     # (modelopt MIXED_PRECISION does; pure NVFP4 leaves it bf16).
     lm_head_quant: str = "none"
+    # Embedding table quant: "none" (bf16 lookup) or "fp8_pertensor" (rows quantized at load,
+    # --dense-quant fp8; halves the ~1.3 GB table of a 248k vocab).
+    embed_quant: str = "none"
     shared_expert_intermediate_size: int = 0
     use_qk_norm: bool = False
     # ----- DeepSeek/GLM-style MoE extensions (default keeps other models intact) -----
@@ -352,8 +355,12 @@ class ModelConfig:
     # Extra per-request tensors riding the LinearStatePool slots (see SlotStateSpec);
     # () for models without any. Requires a linear-attention group to ride on.
     slot_states: Tuple[SlotStateSpec, ...] = ()
-    # MTP draft head served as decoder layer ``mtp_layer_id`` (== num_layers): it joins the
-    # full-attention group for KV allocation and the model builds the head. None = no head.
+    # Pipeline (layer-split) engine: the MoE layers THIS rank serves. None = every MoE layer
+    # of the model (the single-process case). Set by window_model_config.
+    num_moe_layers_override: int | None = None
+    # MTP draft head served by this process as decoder layer ``mtp_layer_id`` (== num_layers):
+    # it joins the full-attention group for KV / index-slab allocation and the model builds
+    # the head. None = no draft head.
     mtp_layer_id: int | None = None
     # --host-embedding: the input embedding table stays in pinned host memory (rows gathered by
     # the GPU in place over PCIe); models that support it build ``HostEmbedding``.
@@ -369,7 +376,10 @@ class ModelConfig:
 
         Models with leading dense layers (``first_k_dense_replace`` > 0, e.g. GLM-4)
         only store experts for the trailing layers; everything else has all layers MoE.
+        Under the pipeline engine this is the rank-local count (see window_model_config).
         """
+        if self.num_moe_layers_override is not None:
+            return self.num_moe_layers_override
         return self.num_layers - self.first_k_dense_replace
 
     @property
@@ -538,3 +548,45 @@ def with_mtp_layer(config: ModelConfig, layer_id: int) -> ModelConfig:
             group = replace(group, **fields)
         groups.append(group)
     return replace(config, attention_groups=tuple(groups), mtp_layer_id=layer_id)
+def window_model_config(
+    config: ModelConfig, start: int, end: int, extra_full_layer: int | None = None
+) -> ModelConfig:
+    """The view of ``config`` one pipeline rank serves: decoder layers ``[start, end)``.
+
+    Attention groups and slot states keep their GLOBAL layer ids but drop the layers other
+    ranks run, so the KV/GDN pools, the attention backends' per-layer slots and the linear
+    state pool size themselves for this rank alone; ``num_moe_layers`` becomes the local
+    MoE layer count (the offload cache and the expert banks are indexed rank-locally).
+    Every attention group must keep at least one layer: the pool family is picked from the
+    group set, and an empty group would silently change it -- pick another --pp-layers.
+    """
+    from dataclasses import replace
+
+    if not (0 <= start < end <= config.num_layers):
+        raise ValueError(f"layer window [{start}, {end}) outside [0, {config.num_layers})")
+    groups = []
+    for group in config.attention_groups:
+        ids = tuple(l for l in group.layer_ids if start <= l < end)
+        if not ids:
+            raise ValueError(
+                f"pipeline layers [{start}, {end}) hold no {group.name!r} attention layer; "
+                "choose --pp-layers so every rank has one layer of each attention kind"
+            )
+        if extra_full_layer is not None and isinstance(group, FullAttentionGroupConfig):
+            ids = ids + (extra_full_layer,)  # the MTP draft head's own KV / index slab
+        fields = {"layer_ids": ids}
+        if getattr(group, "num_index_layers", 0):
+            fields["num_index_layers"] = len(ids)
+        groups.append(replace(group, **fields))
+    slot_states = tuple(
+        replace(spec, layer_ids=tuple(l for l in spec.layer_ids if start <= l < end))
+        for spec in config.slot_states
+    )
+    num_moe = sum(1 for l in range(start, end) if l >= config.first_k_dense_replace)
+    return replace(
+        config,
+        attention_groups=tuple(groups),
+        slot_states=slot_states,
+        num_moe_layers_override=num_moe,
+        mtp_layer_id=extra_full_layer,
+    )

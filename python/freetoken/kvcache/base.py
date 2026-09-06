@@ -10,6 +10,12 @@ from freetoken.utils import div_even, init_logger, mem_GB
 logger = init_logger(__name__)
 
 
+def _tp_size(config) -> int:
+    """Shard count for the KV math: EngineConfig.tp_size (1 under the pipeline engine);
+    duck-typed configs (tests) fall back to tp_info.size."""
+    return int(getattr(config, "tp_size", None) or config.tp_info.size)
+
+
 class CacheRebuildRejected(Exception):
     """A runtime cache rebuild was rejected BEFORE any destructive free (e.g. the
     requested geometry does not fit). The old caches are intact and serving continues --
@@ -28,7 +34,7 @@ def spec_kv_bytes_per_token(spec, config) -> int:
     per_token = (
         (1 if spec.mla else 2)  # MLA latent groups store one slab (V aliases K)
         * spec.head_dim
-        * div_even(spec.num_kv_heads, config.tp_info.size, allow_replicate=True)
+        * div_even(spec.num_kv_heads, _tp_size(config), allow_replicate=True)
         * config.dtype.itemsize
         * spec.num_layers
     )

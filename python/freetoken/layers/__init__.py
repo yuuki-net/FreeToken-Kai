@@ -6,7 +6,13 @@ from .activation import (
     swigluoai_and_mul,
 )
 from .base import BaseOP, OPList, StateLessOP
-from .embedding import HostEmbedding, ParallelLMHead, VocabParallelEmbedding
+from .embedding import (
+    Fp8ParallelLMHead,
+    Fp8VocabParallelEmbedding,
+    HostEmbedding,
+    ParallelLMHead,
+    VocabParallelEmbedding,
+)
 from .linear import (
     LinearColParallelMerged,
     LinearOProj,
@@ -36,6 +42,8 @@ __all__ = [
     "VocabParallelEmbedding",
     "HostEmbedding",
     "ParallelLMHead",
+    "Fp8ParallelLMHead",
+    "Fp8VocabParallelEmbedding",
     "LinearColParallelMerged",
     "LinearRowParallel",
     "LinearOProj",

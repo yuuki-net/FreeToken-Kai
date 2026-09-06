@@ -803,6 +803,7 @@ class Scheduler(SchedulerIOMixin):
         self.cache_manager.allocate_paged(batch.reqs)
         if _spec_k(self) > 0:
             self._prepare_spec(batch)
+        batch.pp_no_tokens = _no_tokens_needed(batch)
         if batch.is_prefill:
             self._gather_multimodal(batch)
         batch.positions = _make_positions(batch, self.device)
@@ -1071,6 +1072,19 @@ class Scheduler(SchedulerIOMixin):
             self.token_pool[output_mapping] = forward_output.next_tokens_gpu
         self.decode_manager.filter_reqs(forward_input.batch.reqs)
         return forward_output
+
+
+def _no_tokens_needed(batch: Batch) -> bool:
+    """A prefill batch made only of non-final chunks: nobody reads its sampled tokens (each
+    chunk's successor is the next prompt token), so under the pipeline engine the first rank
+    need not wait for the last rank -- see Batch.pp_no_tokens. Every rank computes this from
+    the same batch, so the ranks agree on which steps carry tokens."""
+    return (
+        batch.is_prefill
+        and not batch.spec_verify
+        and len(batch.reqs) > 0
+        and all(isinstance(r, ChunkedReq) for r in batch.reqs)
+    )
 
 
 def _prefill_rope_table(batch: Batch) -> torch.Tensor | None:

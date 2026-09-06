@@ -38,6 +38,28 @@ def accept_drafts(sampled: Sequence[int], drafts: Sequence[int]) -> list[int]:
     return [int(t) for t in sampled[: m + 1]]
 
 
+def pack_spec_message(result: SpecResult, k: int) -> torch.Tensor:
+    """Fixed-length int32 vector ``[a, tok_0..tok_k (pad -1), d_1..d_k (pad -1)]`` for the
+    pipeline ranks (same size every step, so the receiver needs no header)."""
+    a = len(result.accepted)
+    assert 1 <= a <= k + 1, (a, k)
+    toks = list(result.accepted) + [-1] * (k + 1 - a)
+    drafts = list(result.drafts)[:k] + [-1] * (k - min(len(result.drafts), k))
+    return torch.tensor([a, *toks, *drafts], dtype=torch.int32)
+
+
+def unpack_spec_message(vec: torch.Tensor, k: int) -> SpecResult:
+    v = vec.tolist()
+    a = int(v[0])
+    toks = [int(t) for t in v[1 : 1 + a]]
+    drafts = [int(d) for d in v[2 + k : 2 + 2 * k] if d >= 0]
+    return SpecResult(accepted=toks, drafts=drafts)
+
+
+def spec_message_len(k: int) -> int:
+    return 2 * k + 2
+
+
 def pages_to_free(keep_len: int, alloc_len: int, page_size: int) -> tuple[int, int]:
     """Pages ``[first, last)`` that only hold positions ``>= keep_len`` once a request whose
     pages were allocated up to ``alloc_len`` rolls back; the page holding position
@@ -56,4 +78,23 @@ def rebuild_conv_state(prev_state: torch.Tensor, conv_in: torch.Tensor, accepted
     return cat[..., -width:].contiguous()
 
 
-__all__ = ["SpecResult", "accept_drafts", "pages_to_free", "rebuild_conv_state"]
+def ngram_context_after(host_ids: Sequence[int], drafts: Sequence[int], accepted: int, ctx_len: int, boundary: int) -> list[int]:
+    """PLE n-gram context (the last ``ctx_len`` processed ids) after ``accepted`` rows of the
+    window ``[host_ids[-1], drafts...]`` were kept. ``host_ids`` is the request's committed
+    id list before the window (its last id is the window's first input)."""
+    seq = list(host_ids) + list(drafts)
+    end = len(host_ids) - 1 + accepted  # rows 0..accepted-1 = seq[len-1 : len-1+accepted]
+    window = seq[max(0, end - ctx_len) : end]
+    return [boundary] * (ctx_len - len(window)) + [int(t) for t in window]
+
+
+__all__ = [
+    "SpecResult",
+    "accept_drafts",
+    "pack_spec_message",
+    "unpack_spec_message",
+    "spec_message_len",
+    "pages_to_free",
+    "rebuild_conv_state",
+    "ngram_context_after",
+]

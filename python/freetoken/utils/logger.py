@@ -64,12 +64,12 @@ def init_logger(
         BOLD = "\033[1m"
 
         def format(self, record):
-            from freetoken.distributed import try_get_tp_info
+            from freetoken.distributed import try_get_world_info
 
             # Format timestamp like SGLang: [YYYY-MM-DD|HH:MM:SS|pid=1234]
             timestamp = self.formatTime(record, "[%Y-%m-%d|%H:%M:%S{suffix}]")
             nonlocal tp_info
-            tp_info = tp_info or try_get_tp_info()
+            tp_info = tp_info or try_get_world_info()
             if tp_info is not None and use_tp_rank is not False:
                 real_suffix = f"{suffix}|core|rank={tp_info.rank}"
             else:
@@ -101,10 +101,10 @@ def init_logger(
     logger.propagate = False
 
     def _call_rank0(msg, *args, _which, **kwargs):
-        from freetoken.distributed import try_get_tp_info
+        from freetoken.distributed import try_get_world_info
 
         nonlocal tp_info
-        tp_info = tp_info or try_get_tp_info()
+        tp_info = tp_info or try_get_world_info()
         # No TP set yet (e.g. a unit test or a tool that loads weights without distributed
         # init) -> treat as a single rank (primary) and log, rather than crashing.
         if tp_info is None or tp_info.is_primary():

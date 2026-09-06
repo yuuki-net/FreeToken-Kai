@@ -38,6 +38,23 @@ from freetoken.kernel.triton.e4m3_compat import (
 
 FP8 = torch.float8_e4m3fn
 _TL_DTYPE = {torch.bfloat16: tl.bfloat16, torch.float16: tl.float16, torch.float32: tl.float32}
+_FP8_MAX = 448.0  # e4m3 dynamic range
+
+
+def quantize_fp8_per_row(w: torch.Tensor, chunk_rows: int = 8192) -> tuple[torch.Tensor, torch.Tensor]:
+    """Per-output-row fp8-e4m3 weight quantization for the W8A16 path: ``w ~= q * scale[:, None]``.
+
+    Row-chunked so a full-vocab head (lm_head / embedding, ~1.3 GB bf16) never needs a whole
+    fp32 copy at once. Same recipe glm_moe_dsa applies to its MLA projections at load."""
+    assert w.dim() == 2, w.shape
+    q = torch.empty(w.shape, dtype=FP8, device=w.device)
+    scale = torch.empty(w.shape[0], dtype=torch.float32, device=w.device)
+    for r0 in range(0, w.shape[0], chunk_rows):
+        wf = w[r0:r0 + chunk_rows].float()
+        s = (wf.abs().amax(dim=1) / _FP8_MAX).clamp(min=1e-12)
+        q[r0:r0 + chunk_rows] = (wf / s[:, None]).clamp(-_FP8_MAX, _FP8_MAX).to(FP8)
+        scale[r0:r0 + chunk_rows] = s
+    return q, scale
 
 # Escape hatch: FREETOKEN_DEBUG_FP8_REF=1 swaps the triton kernels for a pure-torch dequant matmul
 # (numeric reference / A-B debugging). Evaluated once; the kernels are the default.
@@ -488,6 +505,7 @@ __all__ = [
     "Fp8PerTensorLinear",
     "Fp8PerTensorColMerged",
     "fp8_pertensor_linear",
+    "quantize_fp8_per_row",
     "rowwise_scaled_mm_ok",
     "weight_scale_segments",
 ]

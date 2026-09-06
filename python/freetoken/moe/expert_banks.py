@@ -442,9 +442,17 @@ def load_expert_banks(
     from freetoken.checkpoint.ftw import is_ftw_checkpoint, load_ftw_banks
 
     if model_path and is_ftw_checkpoint(model_path) and not dummy:
+        from freetoken.distributed import try_get_pp_info
+
+        pp = try_get_pp_info()
+        layer_window = None
+        if pp is not None:
+            # this rank's MoE layers within the FTW's full bank set
+            fkd = int(getattr(model_config, "first_k_dense_replace", 0))
+            layer_window = (*pp.bank_window(fkd), pp.num_layers - fkd)
         banks = load_ftw_banks(
             model_path, num_layers=model_config.num_moe_layers, workers=workers, chunk=chunk,
-            layer_residency=layer_residency,
+            layer_residency=layer_residency, layer_window=layer_window,
         )
         if banks is not None:
             logger.info_rank0(f"expert banks: FTW fast path (FTW checkpoint {model_path})")

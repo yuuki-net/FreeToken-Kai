@@ -6,12 +6,17 @@ import os
 import re
 import time
 from datetime import timedelta
-from typing import Any, Dict, Iterable, NamedTuple, Tuple
+from typing import Any, Dict, Iterable, Iterator, NamedTuple, Tuple
 
 import torch
 from freetoken.attention import AttnType, attention_backend_info, create_attention_backend
 from freetoken.core import Batch, Context, Req, set_global_ctx
-from freetoken.distributed import destroy_distributed, enable_pynccl_distributed, set_tp_info
+from freetoken.distributed import (
+    destroy_distributed,
+    enable_pynccl_distributed,
+    set_pp_info,
+    set_tp_info,
+)
 from freetoken.gpu_select import gpu_identity
 from freetoken.layers import set_rope_device
 from freetoken.models import create_model, load_weight
@@ -31,7 +36,13 @@ from freetoken.utils import (
 from .config import EngineConfig
 from .graph import GraphRunner, get_free_memory
 from .sample import BatchSamplingArgs, Sampler
-from .spec import SpecResult, accept_drafts
+from .spec import (
+    SpecResult,
+    accept_drafts,
+    pack_spec_message,
+    spec_message_len,
+    unpack_spec_message,
+)
 from .spec_graph import spec_graph_applicable
 from freetoken.kvcache import create_kv_pool, resolve_pool_class
 from freetoken.kvcache.base import CacheRebuildRejected
@@ -299,6 +310,68 @@ def _make_dummy_weight_state_dict(
     return state_dict
 
 
+def _keep_local_weights(
+    weights: Iterable[Tuple[str, torch.Tensor]], model_state: Dict[str, torch.Tensor]
+) -> Iterator[Tuple[str, torch.Tensor]]:
+    """Pipeline ranks: drop the tensors of layers another rank serves before they are moved
+    to this GPU. An unknown key that IS a local layer's still surfaces in load_state_dict."""
+    dropped = 0
+    for key, weight in weights:
+        if key in model_state:
+            yield key, weight
+        else:
+            dropped += 1
+            del weight
+    logger.info(f"pipeline: skipped {dropped} tensors served by other ranks")
+
+
+def _remap_weights(weights, remap, model_state: Dict[str, torch.Tensor]):
+    for key, weight in weights:
+        yield from remap(key, weight, model_state)
+
+
+def _drop_unknown_mtp(weights, model_state: Dict[str, torch.Tensor]):
+    """The reader keeps the checkpoint's mtp.* head; a process that did not build the draft
+    head (spec off, or not the last pipeline rank) drops those tensors here."""
+    dropped = 0
+    for key, weight in weights:
+        if key.startswith("mtp.") and key not in model_state:
+            dropped += 1
+            del weight
+            continue
+        yield key, weight
+    if dropped:
+        logger.info_rank0(f"skipped {dropped} MTP head tensors (draft head not built on this rank)")
+
+
+def _quantize_at_load(
+    weights: Iterable[Tuple[str, torch.Tensor]], model_state: Dict[str, torch.Tensor]
+) -> Iterator[Tuple[str, torch.Tensor]]:
+    """--dense-quant: a bf16 ``X.weight`` whose model buffer is fp8 and that has a sibling
+    ``X.weight_scale`` buffer is quantized per output row on the fly (the checkpoint ships
+    it unquantized). Anything else, including tensors already fp8, passes through."""
+    from freetoken.kernel.triton.fp8_pertensor_linear import FP8, quantize_fp8_per_row
+
+    quantized = 0
+    for key, weight in weights:
+        expected = model_state.get(key)
+        scale_key = key[: -len(".weight")] + ".weight_scale" if key.endswith(".weight") else None
+        if (
+            expected is not None
+            and expected.dtype == FP8
+            and weight.dtype != FP8
+            and weight.is_floating_point()
+            and scale_key in model_state
+        ):
+            q, s = quantize_fp8_per_row(weight)
+            quantized += 1
+            yield key, q
+            yield scale_key, s
+        else:
+            yield key, weight
+    logger.info_rank0(f"--dense-quant: quantized {quantized} dense projections to per-row fp8 at load")
+
+
 def _materialize_loaded_weight_state_dict(
     model_state: Dict[str, torch.Tensor],
     weights: Iterable[Tuple[str, torch.Tensor]],
@@ -307,8 +380,9 @@ def _materialize_loaded_weight_state_dict(
     host_prefixes: Tuple[str, ...] = (),
 ) -> Dict[str, torch.Tensor]:
     """Cast each loaded tensor to its model-buffer dtype on ``device``; keys under
-    ``host_prefixes`` (a model's ``host_resident_prefixes``, e.g. the embedding table under
-    --host-embedding) land in pinned host memory instead."""
+    ``host_prefixes`` (a model's ``host_resident_prefixes``: the embedding table under
+    --host-embedding, or the draft head's own embedding copy) land in pinned host memory
+    instead."""
     state_dict: Dict[str, torch.Tensor] = {}
     for key, weight in weights:
         expected = model_state.get(key)
@@ -321,20 +395,6 @@ def _materialize_loaded_weight_state_dict(
         else:
             state_dict[key] = weight.to(device=device, dtype=dtype)
     return state_dict
-
-
-def _drop_unknown_mtp(weights, model_state: Dict[str, torch.Tensor]):
-    """A checkpoint's mtp.* tensors the built model has no buffer for are dropped here (the
-    draft head is only built under --spec-mtp; readers that keep mtp.* only do so then)."""
-    dropped = 0
-    for key, weight in weights:
-        if key.startswith("mtp.") and key not in model_state:
-            dropped += 1
-            del weight
-            continue
-        yield key, weight
-    if dropped:
-        logger.info_rank0(f"skipped {dropped} MTP head tensors the model does not declare")
 
 
 class ForwardOutput(NamedTuple):
@@ -433,9 +493,20 @@ def _pinned_empty(shape, dtype: torch.dtype) -> torch.Tensor:
 class Engine:
     def __init__(self, config: EngineConfig):
         assert not torch.cuda.is_initialized()
-        set_tp_info(rank=config.tp_info.rank, size=config.tp_info.size)
-        # --spec-mtp: draft depth; the head's bf16 experts captured at load and quantized into
-        # the offload cache's extra bank layer (see _quantize_mtp_experts / _append_mtp_bank)
+        if config.is_pp:
+            # Pipeline: the ranks split the LAYERS, so every layer sees TP=1; the PP info is
+            # what the model, the bank loaders and rank-0 logging consult.
+            start, end = config.pp_layer_range
+            set_pp_info(
+                rank=config.tp_info.rank, size=config.tp_info.size,
+                start=start, end=end, num_layers=config.full_model_config.num_layers,
+            )
+            set_tp_info(rank=0, size=1)
+        else:
+            set_tp_info(rank=config.tp_info.rank, size=config.tp_info.size)
+        self.pp_comm = None  # set by _init_communication under --parallel pp
+        # --spec-mtp: draft depth; the stacked bf16 MTP experts captured at load, quantized into
+        # the offload cache's extra bank layer (see _append_mtp_bank)
         self.spec_k = int(getattr(config, "spec_mtp", 0) or 0)
         self._spec_profiler = None
         self._spec_graph = None  # SpecVerifyGraph once captured (end of __init__)
@@ -475,10 +546,22 @@ class Engine:
         set_rope_device(self.device)
         with torch.device("meta"), torch_dtype(config.dtype):
             self.model = create_model(config.model_config)
-        if self.spec_k > 0 and getattr(self.model, "mtp", None) is None:
+        if self.spec_k > 0 and config.pp_is_last and getattr(self.model, "mtp", None) is None:
             raise ValueError(
-                f"--spec-mtp: {type(self.model).__name__} builds no MTP draft head "
-                "(supported: the Qwen3.5-MoE family with mtp.* tensors in the checkpoint)"
+                f"--spec-mtp: {type(self.model).__name__} builds no MTP draft head (supported: "
+                "the Qwen3.5-MoE family and Qwen3.8-Flash-Next, with mtp.* tensors in the checkpoint)"
+            )
+        if self.pp_comm is not None:
+            width = getattr(self.model, "pp_hidden_width", None)
+            if width is None:
+                raise NotImplementedError(
+                    f"--pp-size is not supported for {type(self.model).__name__}: the "
+                    "model does not declare pp_hidden_width / a layer-split forward"
+                )
+            self.pp_comm.configure(int(width), self.dtype)
+            logger.info(
+                f"pipeline rank {config.tp_info.rank}/{config.tp_info.size}: layers "
+                f"[{config.pp_layer_range[0]}, {config.pp_layer_range[1]}) on {self.device}"
             )
         self.model.load_state_dict(self._load_weight_state_dict(config))
         post_weights_free = self._sync_get_memory()[0]
@@ -526,7 +609,7 @@ class Engine:
                 num_slots=_linear_pool_num_slots(config),
                 dtype=self.dtype,
                 device=self.device,
-                tp_size=config.tp_info.size,
+                tp_size=config.tp_size,
                 slot_states=config.model_config.slot_states,
             )
             self.ctx.linear_state_pool = self.linear_state_pool
@@ -587,6 +670,11 @@ class Engine:
             vocab_size=config.model_config.vocab_size,
             dummy_req=self.dummy_req,
             moe_offload_cache=self.moe_offload_cache,
+            pp_hidden=(
+                (self.pp_comm.hidden_width, self.dtype)
+                if self.pp_comm is not None and not self.pp_comm.is_first
+                else None
+            ),
         )
         # pre-map before the prefill warmup so its persistent buffers come from the cache
         self._premap_vram()
@@ -725,6 +813,23 @@ class Engine:
             torch.cuda.empty_cache()
 
     def _init_communication(self, config: EngineConfig) -> torch.distributed.ProcessGroup:
+        if config.is_pp:
+            # Layer split: the ranks never all-reduce; the residual stream and the sampled
+            # tokens go point-to-point over gloo (no NCCL / P2P needed, see distributed/pipeline).
+            from freetoken.distributed import get_pp_info
+            from freetoken.distributed.pipeline import PipelineComm
+
+            torch.distributed.init_process_group(
+                backend="gloo",
+                rank=config.tp_info.rank,
+                world_size=config.tp_info.size,
+                timeout=timedelta(seconds=config.distributed_timeout),
+                init_method=config.distributed_addr,
+            )
+            tp_cpu_group = torch.distributed.group.WORLD
+            assert tp_cpu_group is not None
+            self.pp_comm = PipelineComm(get_pp_info(), tp_cpu_group, self.device)
+            return tp_cpu_group
         if config.tp_info.size == 1 or config.use_pynccl:
             torch.distributed.init_process_group(
                 backend="gloo",
@@ -768,9 +873,20 @@ class Engine:
             include_moe_experts=not is_offload_moe_backend(config.moe_backend),
             include_mtp=has_mtp,
         )
+        remap = getattr(self.model, "remap_loaded_weight", None)
+        if remap is not None:
+            # model-declared renames/splits (e.g. the fp8 GDN's in_proj -> qkvz | ba) come
+            # first so the pipeline filter and the quantizer see the model's own keys
+            weights = _remap_weights(weights, remap, model_state)
         if has_mtp:
             weights = self._capture_mtp_experts(weights)
         weights = _drop_unknown_mtp(weights, model_state)
+        if config.is_pp:
+            # The reader yields the whole model; keep only the tensors this rank's layer
+            # window declares (other ranks' layers, and the embedding / head it does not own).
+            weights = _keep_local_weights(weights, model_state)
+        if config.dense_quant != "none":
+            weights = _quantize_at_load(weights, model_state)
         state = _materialize_loaded_weight_state_dict(
             model_state, weights, device=self.device, host_prefixes=host_prefixes
         )
@@ -1100,6 +1216,10 @@ class Engine:
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats(self.device)
         free_memory = get_free_memory(self.device)
+        if self.config.is_pp:
+            # each pipeline rank budgets its own GPU: the halves hold different weights, so a
+            # cross-rank min/max (and the TP imbalance check) would be meaningless here
+            return free_memory, free_memory
         free_mem_tensor = torch.tensor([free_memory, -free_memory], device="cpu", dtype=torch.int64)
         torch.distributed.all_reduce(
             free_mem_tensor, op=torch.distributed.ReduceOp.MIN, group=self.tp_cpu_group
@@ -1308,6 +1428,7 @@ class Engine:
     def forward_batch(self, batch: Batch, args: BatchSamplingArgs) -> ForwardOutput:
         assert torch.cuda.current_stream() == self.stream
         use_graph = self.graph_runner.can_use_cuda_graph(batch)
+        pp = self.pp_comm
         spec = self.spec_k > 0
         mtp = getattr(self.model, "mtp", None) if spec else None
         if spec:
@@ -1316,8 +1437,10 @@ class Engine:
             if use_graph and batch.size == 1 and mtp is not None:
                 # the draft head reads the target's final hidden state, which a graph replay
                 # leaves in a buffer the model no longer points at: the (rare) plain
-                # single-request decode step runs eagerly instead
+                # single-request decode step runs eagerly on the drafting rank instead
                 use_graph = False
+        # rows of the residual stream crossing the pipeline: every token of a prefill chunk,
+        # one per real request in decode (padding rows never leave the GPU)
         rows = batch.input_ids.numel() if batch.is_prefill else batch.size
         # the captured K+1-row verify window (engine/spec_graph); shorter windows stay eager
         sg = self._spec_graph
@@ -1340,26 +1463,75 @@ class Engine:
         if sg is not None:
             sg.stage(batch)
         with self.ctx.forward_batch(batch), self.model.forward_host_ctx(batch, use_graph or sg is not None):
-            if sg is not None:
-                logits = sg.replay()
-            else:
-                logits = self.graph_runner.replay(batch) if use_graph else self.model.forward()
+            if pp is not None and not pp.is_first:
+                hidden_in = pp.recv_hidden(rows)
+                if prof is not None:
+                    prof.mark("recv_hidden")
+                if use_graph:
+                    buf = self.graph_runner.buffer.pp_in
+                    assert buf is not None
+                    buf[:rows].copy_(hidden_in)
+                    hidden_in = buf[: batch.padded_size]
+                elif sg is not None:
+                    sg.pp_in.copy_(hidden_in)
+                    hidden_in = sg.pp_in
+                self.ctx.pp_hidden_in = hidden_in
+            try:
+                if sg is not None:
+                    logits = sg.replay()
+                else:
+                    logits = self.graph_runner.replay(batch) if use_graph else self.model.forward()
+            finally:
+                self.ctx.pp_hidden_in = None
         if sg is not None:
             # the rollback reads the GDN stashes recorded at capture (rewritten by the replay)
             self.ctx.spec_stash = sg.stash
         if prof is not None:
             prof.mark("target_forward")
-        if check:
-            v_outs, self.ctx.debug_layer_outs = self.ctx.debug_layer_outs, None
-            v_final = logits[:rows].detach().clone()
         if self.cpu_moe_executor is not None:
             # One pinned read: surfaces a fired flag-handshake watchdog (dead coordinator
             # -> stale expert outputs) as a loud error instead of silent corruption.
             self.cpu_moe_executor.raise_if_unhealthy()
+        if check:
+            v_outs, self.ctx.debug_layer_outs = self.ctx.debug_layer_outs, None
+            v_final = logits[:rows].detach().clone()
 
         if not batch.spec_verify:
             for req in batch.reqs:
                 req.complete_one()
+
+        copy_done_event = torch.cuda.Event()
+        if pp is not None and not pp.is_last:
+            # not the head: hand the residual stream on, then take the tokens the last rank
+            # sampled (the scheduler on every rank feeds them into the next step)
+            pp.send_hidden(logits[:rows])
+            if prof is not None:
+                prof.mark("send_hidden")
+            spec_res = None
+            if batch.pp_no_tokens:
+                # a non-final prefill chunk: its sampled token has no reader (the successor is
+                # the next prompt token), so do not wait for the last rank -- it is still on
+                # the previous chunk, and this rank moves on to the next one meanwhile. The
+                # scheduler ignores the tokens of a chunk-only batch.
+                next_tokens_cpu = torch.zeros(batch.size, dtype=torch.int32)
+            elif spec:
+                spec_res = unpack_spec_message(pp.recv_tokens(spec_message_len(self.spec_k)), self.spec_k)
+                if prof is not None:
+                    prof.mark("wait_tokens")
+                if batch.spec_verify:
+                    self.model.spec_rollback(batch, len(spec_res.accepted), self.ctx)
+                    if prof is not None:
+                        prof.mark("rollback")
+                        prof.step()
+                next_tokens_cpu = torch.tensor(spec_res.accepted[:1], dtype=torch.int32)
+            else:
+                next_tokens_cpu = pp.recv_tokens(batch.size)
+            next_tokens_gpu = next_tokens_cpu.to(self.device)
+            if check:
+                _SPEC_CHECK_STEP_LEFT[0] -= 1
+                self._spec_check_step(batch, snap, v_outs, v_final)
+            copy_done_event.record(self.stream)
+            return ForwardOutput(next_tokens_gpu, next_tokens_cpu, copy_done_event, spec_res)
 
         spec_res = None
         if batch.spec_verify:
@@ -1389,8 +1561,11 @@ class Engine:
         else:
             batch_logits = logits[: batch.size]
             next_tokens_gpu = self.sampler.sample(batch_logits, args).to(torch.int32)
-            if spec:
+            if pp is not None or spec:
                 next_tokens_cpu = next_tokens_gpu.cpu()  # synchronous: read on the host below
+            else:
+                next_tokens_cpu = next_tokens_gpu.to("cpu", non_blocking=True)
+            if spec:
                 token = int(next_tokens_cpu[0])
                 drafts = []
                 if batch.size == 1 and mtp is not None:
@@ -1402,14 +1577,15 @@ class Engine:
                         draft=tail is None,
                     )
                 spec_res = SpecResult([token], drafts)
-            else:
-                next_tokens_cpu = next_tokens_gpu.to("cpu", non_blocking=True)
+        if pp is not None and not batch.pp_no_tokens:
+            # (the first rank did not wait for a chunk-only batch's tokens: nothing to send)
+            pp.send_tokens(pack_spec_message(spec_res, self.spec_k) if spec else next_tokens_cpu)
         if prof is not None and batch.spec_verify:
+            prof.mark("send_tokens")
             prof.step()
         if check:
             _SPEC_CHECK_STEP_LEFT[0] -= 1
             self._spec_check_step(batch, snap, v_outs, v_final)
-        copy_done_event = torch.cuda.Event()
         copy_done_event.record(self.stream)
         return ForwardOutput(next_tokens_gpu, next_tokens_cpu, copy_done_event, spec_res)
 
@@ -1440,23 +1616,47 @@ class Engine:
         for name, t in pool.slot_states.items():
             t[:, slot] = snap["ss:" + name]
 
-    def _spec_state_digest(self, req: Req) -> dict:
-        """The GDN recurrent + conv state of every linear layer for this request (clones)."""
+    def _spec_state_digest(self, req: Req, pos: int) -> dict:
+        """Every piece of per-request state a one-token step at ``pos`` writes: GDN recurrent +
+        conv per GDN layer, the PLE context, and per sparse layer the K/V row at ``pos``, the
+        pending-ring row and the compressed-index rows (scratch, and the group row when the
+        token closes a group). Clones, keyed by name."""
         d: dict = {}
         pool = self.linear_state_pool
+        slot = req.linear_slot_idx if req.linear_slot_idx is not None else req.table_idx
         if pool is not None:
-            slot = self._spec_slot(req)
             for li in range(pool.recurrent_states.shape[0]):
                 d[f"rec{li}"] = pool.recurrent_states[li, slot].clone()
                 d[f"conv{li}"] = pool.conv_states[li, slot].clone()
+            for name, t in pool.slot_states.items():
+                d[f"ple:{name}"] = t[:, slot].clone()
+        kv = self.kv_cache
+        idx_slot = getattr(self.attn_backend, "_idx_slot", None)
+        if idx_slot:
+            loc = int(self.page_table[req.table_idx, pos].item())
+            mtp = getattr(self.model, "mtp", None)
+            mtp_id = getattr(mtp, "layer_id", None) if mtp is not None else None
+            for lid, s in idx_slot.items():
+                if lid == mtp_id:
+                    continue
+                try:
+                    d[f"k{lid}"] = kv.k_cache(lid)[loc].clone()
+                    d[f"v{lid}"] = kv.v_cache(lid)[loc].clone()
+                except Exception:  # noqa: BLE001
+                    pass
+                cap = kv.ring_capacity
+                d[f"ring{lid}"] = kv.pending_ring(s)[req.table_idx, pos % cap].clone()
+                cmp = kv.cmp_k_cache(s)
+                d[f"cmpS{lid}"] = cmp[kv.cmp_scratch_base + req.table_idx].clone()
+                if loc % kv.index_ratio == kv.index_ratio - 1:
+                    d[f"cmpG{lid}"] = cmp[loc // kv.index_ratio].clone()
         return d
 
     def _spec_check_step(self, batch: Batch, snap: dict, v_outs: list, v_final: torch.Tensor) -> None:
-        """FT_SPEC_CHECK_STEP: after a one-row verify window (verified + rolled back), rewind the
-        slot state and run the same token through the plain decode path (eager, phase 'decode');
-        log the per-layer divergence of the residual stream, of the final logits, and of the GDN
-        state the two paths leave behind. The plain path's state stays (both are the state after
-        this token)."""
+        """FT_SPEC_CHECK_STEP: after a one-row verify window, rewind the slot state and run the
+        same token through the plain decode path (eager, phase 'decode'); log the per-layer
+        divergence of the residual streams and of the final output. Both pipeline ranks run
+        it in lockstep (the residual crosses the ranks like any forward)."""
         from types import SimpleNamespace
 
         from freetoken.attention.linear import build_fla_metadata
@@ -1464,7 +1664,7 @@ class Engine:
         req = batch.reqs[0]
         pos = int(batch.positions[0].item())
         token = int(batch.input_ids[0].item())
-        state_v = self._spec_state_digest(req)  # what the verify path + rollback left behind
+        state_v = self._spec_state_digest(req, pos)  # what the verify path left behind
         self._spec_restore(snap)
         proxy = SimpleNamespace(
             table_idx=req.table_idx, extend_len=1, device_len=pos + 1, cached_len=pos,
@@ -1486,10 +1686,18 @@ class Engine:
             mini.fla_metadata = build_fla_metadata(mini, self.device)
         self.attn_backend.prepare_metadata(mini)
         self.ctx.debug_layer_outs = []
+        pp = self.pp_comm
         with self.ctx.forward_batch(mini), self.model.forward_host_ctx(mini, False):
-            out = self.model.forward()
+            if pp is not None and not pp.is_first:
+                self.ctx.pp_hidden_in = pp.recv_hidden(1)
+            try:
+                out = self.model.forward()
+            finally:
+                self.ctx.pp_hidden_in = None
+        if pp is not None and not pp.is_last:
+            pp.send_hidden(out[:1])
         d_outs, self.ctx.debug_layer_outs = self.ctx.debug_layer_outs, None
-        state_d = self._spec_state_digest(req)  # what the plain decode path leaves behind
+        state_d = self._spec_state_digest(req, pos)  # what the decode path leaves behind
         groups: dict[str, list[str]] = {}
         for name, dv in state_v.items():
             dd = state_d.get(name)
@@ -1509,11 +1717,12 @@ class Engine:
             a, b = a.float().reshape(-1), b.float().reshape(-1)
             parts.append(f"L{i}:{(a - b).abs().max().item():.1e}/{b.abs().max().item():.1e}")
         a, b = v_final.float().reshape(-1), out[:1].float().reshape(-1)
-        msg = (
-            f"final:{(a - b).abs().max().item():.1e}/{b.abs().max().item():.1e}"
-            f" top3 verify={a.topk(3).indices.tolist()} decode={b.topk(3).indices.tolist()}"
-            f" argmax_equal={bool(a.argmax() == b.argmax())}"
-        )
+        msg = f"final:{(a - b).abs().max().item():.1e}/{b.abs().max().item():.1e}"
+        if pp is None or pp.is_last:
+            msg += (
+                f" top3 verify={a.topk(3).indices.tolist()} decode={b.topk(3).indices.tolist()}"
+                f" argmax_equal={bool(a.argmax() == b.argmax())}"
+            )
         logger.warning(f"spec step check pos={pos} tok={token} {msg} | " + " ".join(parts))
 
     # ------------------------------------------------------------------ MTP draft head
@@ -1552,11 +1761,11 @@ class Engine:
             next_ids = next_ids.clone()
             next_ids[row] = next_token
         with self.ctx.forward_batch(batch):
-            h_all = mtp.forward(hidden, next_ids)  # [rows, hidden]
+            h_all = mtp.forward(hidden, next_ids, batch)  # [rows, width]
         if not draft:
             return []
         h = h_all[row : row + 1]
-        d = int(self.model.lm_head.logits(h).argmax(dim=-1).item())
+        d = int(self.model.lm_head.logits(mtp.to_head(h)).argmax(dim=-1).item())
         drafts = [d]
         if prof is not None:
             prof.mark("mtp_window")
@@ -1567,8 +1776,8 @@ class Engine:
                 break  # no reserved KV page for this draft position
             mini = self._mtp_step_batch(req, p, d, rope_delta=delta)
             with self.ctx.forward_batch(mini):
-                h = mtp.forward(h, mini.input_ids)
-            d = int(self.model.lm_head.logits(h).argmax(dim=-1).item())
+                h = mtp.forward(h, mini.input_ids, mini)
+            d = int(self.model.lm_head.logits(mtp.to_head(h)).argmax(dim=-1).item())
             drafts.append(d)
         if prof is not None:
             prof.mark("mtp_chain")

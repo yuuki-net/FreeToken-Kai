@@ -77,12 +77,24 @@ class EngineConfig:
     distributed_timeout: float = 60.0
     use_dummy_weight: bool = False
     use_pynccl: bool = True
+    # "tp": tp_info ranks shard every layer (tensor parallel). "pp": tp_info ranks each run a
+    # contiguous block of decoder layers on their own GPU (pipeline / layer split, see
+    # distributed/pipeline.py); layer math then sees TP=1.
+    parallel: str = "tp"
+    # --pp-layers: the size-1 layer boundaries of the pipeline split; None = even split.
+    pp_split: tuple[int, ...] | None = None
+    # --dense-quant: quantize the checkpoint's bf16 dense (non-expert) projections at load.
+    # "fp8": per-row fp8-e4m3 + fp32 scale, W8A16 (attention, GDN qkv|z / out, shared expert,
+    # lm_head, embedding); layers the checkpoint already quantizes keep their own format.
+    dense_quant: str = "none"
     # --spec-mtp K: MTP speculative decoding with K drafts per step (0 = off). The draft head
-    # (the checkpoint's mtp.* block) is built as one extra full-attention layer (id =
-    # num_layers) with its own KV slab and one extra expert-bank layer. Single request.
+    # (the checkpoint's mtp.* block) is built on the last pipeline rank (the only process when
+    # single-GPU) as one extra full-attention layer (id = num_layers) with its own KV slab and
+    # one extra expert-bank layer. Single request.
     spec_mtp: int = 0
     # --host-embedding: keep the input embedding table in pinned host memory (the GPU gathers
-    # rows in place); ~1 GB of VRAM back for KV pages on a 250k-vocabulary model.
+    # rows in place); ~1 GB of VRAM back for KV pages on a 250k-vocabulary model. Applies to
+    # the rank that owns the embedding (rank 0 under the pipeline engine).
     host_embedding: bool = False
     max_seq_len_override: int | None = None
     num_page_override: int | None = None  # if not None, will override the number of pages
@@ -94,19 +106,74 @@ class EngineConfig:
     def hf_config(self):
         return cached_load_hf_config(self.model_path)
 
+    @property
+    def is_pp(self) -> bool:
+        return self.parallel == "pp" and self.tp_info.size > 1
+
+    @property
+    def tp_size(self) -> int:
+        """Shard count for the layer / KV / GDN-state math: the pipeline ranks split layers,
+        not tensors, so every layer and pool sees 1 there. (tp_info.size stays the world size.)"""
+        return 1 if self.is_pp else self.tp_info.size
+
     @cached_property
-    def model_config(self) -> ModelConfig:
+    def full_model_config(self) -> ModelConfig:
+        """The whole model, before any pipeline windowing."""
         spec = get_model_spec(self.hf_config.architectures[0])
         parse_config = _load_attr(spec.module, spec.parse_config)
         config = parse_config(self.hf_config)
-        if self.spec_mtp > 0:
-            from freetoken.models.config import with_mtp_layer
-
-            # the draft head joins the full-attention group as layer num_layers
-            config = with_mtp_layer(config, config.num_layers)
-        if self.host_embedding:
+        if self.dense_quant == "fp8":
             from dataclasses import replace
 
+            # only the parts the checkpoint left bf16: a native fp8/nvfp4 layer keeps its format
+            fields = {
+                f: "fp8_pertensor"
+                for f in ("attn_quant", "dense_quant", "lm_head_quant", "embed_quant")
+                if getattr(config, f, "none") == "none"
+            }
+            config = replace(config, **fields)
+        elif self.dense_quant != "none":
+            raise ValueError(f"--dense-quant {self.dense_quant!r}: supported values are none, fp8")
+        return config
+
+    @cached_property
+    def pp_layer_range(self) -> tuple[int, int] | None:
+        """Decoder layers ``[start, end)`` this rank runs under ``--parallel pp``; None otherwise."""
+        if not self.is_pp:
+            return None
+        from freetoken.distributed import pp_layer_range
+
+        return pp_layer_range(
+            self.full_model_config.num_layers, self.pp_split, self.tp_info.rank, self.tp_info.size
+        )
+
+    @property
+    def pp_is_first(self) -> bool:
+        """This process owns the embedding (rank 0 of the pipeline, or the only process)."""
+        return (not self.is_pp) or self.tp_info.rank == 0
+
+    @property
+    def pp_is_last(self) -> bool:
+        """This process owns the head (the last pipeline rank, or the only process)."""
+        return (not self.is_pp) or self.tp_info.rank == self.tp_info.size - 1
+
+    @cached_property
+    def model_config(self) -> ModelConfig:
+        """The model as THIS process serves it: the full config, or its pipeline window (only
+        this rank's layers in the attention groups, slot states and MoE layer count, so the
+        KV/GDN pools, attention backends and the expert cache size themselves per rank). The
+        MTP draft head joins the full-attention group of the head-owning rank as layer
+        num_layers; --host-embedding marks the embedding-owning rank's table host-resident."""
+        from dataclasses import replace
+
+        config = self.full_model_config
+        mtp_layer = config.num_layers if (self.spec_mtp > 0 and self.pp_is_last) else None
+        if self.pp_layer_range is not None or mtp_layer is not None:
+            from freetoken.models.config import window_model_config
+
+            start, end = self.pp_layer_range or (0, config.num_layers)
+            config = window_model_config(config, start, end, extra_full_layer=mtp_layer)
+        if self.host_embedding and self.pp_is_first:
             config = replace(config, embed_host=True)
         return config
 

@@ -399,6 +399,15 @@ def commit_ngram_context(meta: PLEMetadata, fla, context_pool: torch.Tensor | No
         context_pool.index_copy_(0, fla.track_dst, win.to(context_pool.dtype))
 
 
+def rewrite_ngram_context(slot: int, ids: Sequence[int], context_pool: torch.Tensor | None = None) -> None:
+    """MTP rollback: set one request's ``ple_ngram_ctx`` to ``ids`` (the last ngram_size-1
+    committed token ids) after a verify window kept fewer tokens than it processed."""
+    if context_pool is None:
+        context_pool = _ngram_context_pool()
+    assert len(ids) == context_pool.shape[-1], (len(ids), context_pool.shape)
+    context_pool[slot] = torch.tensor(list(ids), dtype=context_pool.dtype, device=context_pool.device)
+
+
 class NGramEmbedding(BaseOP):
     """Hashed n-gram lookup: splitmix64 mix of the last n token ids -> per-head prime vocab -> table rows.
 

@@ -27,6 +27,17 @@ class _SharedExpert(BaseOP):
                 hidden_size, [intermediate_size, intermediate_size], has_bias=False
             )
             self.down_proj = Fp8BlockLinear(intermediate_size, hidden_size, has_bias=False)
+        elif getattr(config, "dense_quant", "none") == "fp8_pertensor":
+            # quantized at load (--dense-quant fp8): fp8 weight + per-row scale, W8A16
+            from freetoken.kernel.triton.fp8_pertensor_linear import (
+                Fp8PerTensorColMerged,
+                Fp8PerTensorLinear,
+            )
+
+            self.gate_up_proj = Fp8PerTensorColMerged(
+                hidden_size, [intermediate_size, intermediate_size], has_bias=False
+            )
+            self.down_proj = Fp8PerTensorLinear(intermediate_size, hidden_size, has_bias=False)
         elif getattr(config, "dense_quant", "none") == "nvfp4":
             # NVFP4 checkpoint: keep the shared expert's NVFP4 weights native (W4A16).
             from freetoken.kernel.triton.nvfp4_linear import Nvfp4DenseColMerged, Nvfp4DenseLinear

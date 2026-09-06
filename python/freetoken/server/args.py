@@ -246,14 +246,50 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--pp-size",
+        type=int,
+        default=1,
+        help=(
+            "Pipeline (layer-split) parallelism: run the decoder layers as N contiguous "
+            "blocks, one process per GPU (--gpu lists them in rank order). Rank 0 owns the "
+            "embedding, the last rank owns the head; the residual stream crosses ranks over "
+            "gloo, so no NCCL/P2P is needed. Mutually exclusive with --tp-size > 1."
+        ),
+    )
+
+    parser.add_argument(
+        "--dense-quant",
+        type=str,
+        default="none",
+        choices=["none", "fp8"],
+        help=(
+            "Quantize the checkpoint's bf16 dense (non-expert) weights at load: 'fp8' = per-row "
+            "fp8-e4m3 W8A16 for attention, GDN, shared expert, lm_head and the embedding "
+            "(roughly halves their VRAM and per-token read traffic; hyper-connection and PLE "
+            "projections stay bf16). Currently wired for qwen4_exp (Qwen3.8-Flash-Next)."
+        ),
+    )
+
+    parser.add_argument(
         "--spec-mtp",
         type=int,
         default=0,
         help=(
             "MTP speculative decoding: verify K drafts from the checkpoint's own MTP head per "
             "step (0 = off). Single-request decode (use --max-running-req 1); the draft head "
-            "adds one full-attention layer and one expert-bank layer (its bf16 experts are "
-            "quantized to NVFP4 at load). Qwen3.5-MoE family NVFP4 checkpoints."
+            "runs on the head-owning rank and adds one full-attention layer and one expert-bank "
+            "layer (its bf16 experts are quantized to NVFP4 at load). Qwen3.5-MoE family and "
+            "Qwen3.8-Flash-Next NVFP4 checkpoints."
+        ),
+    )
+
+    parser.add_argument(
+        "--pp-layers",
+        type=str,
+        default=None,
+        help=(
+            "Layer boundaries of the --pp-size split, comma-separated (N-1 values): '24' "
+            "gives rank 0 layers [0,24) and rank 1 [24,48). Default: even split."
         ),
     )
 
@@ -667,10 +703,37 @@ def parse_args(
     # Parse arguments
     kwargs = parser.parse_args(args).__dict__.copy()
 
+    # --pp-size N: the N ranks split the layers; tp_info carries the world (rank, size) as
+    # for TP, `parallel` tells the engine how to use it.
+    pp_size = kwargs.pop("pp_size")
+    pp_layers = kwargs.pop("pp_layers")
+    kwargs["pp_split"] = None
+    if pp_size > 1:
+        if kwargs["tensor_parallel_size"] > 1:
+            parser.error("--pp-size and --tp-size cannot both be > 1")
+        kwargs["parallel"] = "pp"
+        kwargs["tensor_parallel_size"] = pp_size
+        if pp_layers:
+            try:
+                split = tuple(int(x) for x in pp_layers.split(",") if x.strip())
+            except ValueError:
+                parser.error(f"--pp-layers must be comma-separated integers, got {pp_layers!r}")
+            if len(split) != pp_size - 1 or any(b <= a for a, b in zip(split, split[1:])):
+                parser.error(
+                    f"--pp-layers needs {pp_size - 1} strictly increasing boundaries for "
+                    f"--pp-size {pp_size}, got {pp_layers!r}"
+                )
+            kwargs["pp_split"] = split
+    elif pp_layers:
+        parser.error("--pp-layers needs --pp-size > 1")
+
     # reject a too-long list here with a clear reason, not as a dead rank later
     if len(kwargs["gpu"]) not in (0, kwargs["tensor_parallel_size"]):
         if kwargs["tensor_parallel_size"] == 1 and len(kwargs["gpu"]) > 1:
-            parser.error("tensor parallelism is not supported yet: --gpu takes one entry")
+            parser.error(
+                "tensor parallelism is not supported yet: --gpu takes one entry "
+                "(give --pp-size N to split the layers over N GPUs)"
+            )
         parser.error(
             f"--gpu has {len(kwargs['gpu'])} entries but --tensor-parallel-size is "
             f"{kwargs['tensor_parallel_size']}; give one entry per TP rank"

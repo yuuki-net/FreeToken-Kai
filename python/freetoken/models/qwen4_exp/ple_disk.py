@@ -37,6 +37,20 @@ def _context(ids: torch.Tensor, position: int, eos: int) -> list[int]:
             int(ids[position - 1]) if position >= 1 else eos]
 
 
+def _extend_ids(req) -> torch.Tensor:
+    """This forward's tokens of ``req`` (host): ``input_ids[cached_len:device_len]``, plus the
+    draft ids of an open MTP verify window (they sit in the device token pool, not in the host
+    id list, but the hash windows are computed here)."""
+    ids = req.input_ids[req.cached_len : req.device_len]
+    drafts = getattr(req, "spec_drafts", None)
+    if drafts and getattr(req, "spec_base_len", None) is not None:
+        ids = torch.cat((ids, torch.tensor(list(drafts), dtype=ids.dtype)))
+    assert ids.numel() == req.device_len - req.cached_len, (
+        f"PLE staging: {ids.numel()} ids for an extend of {req.device_len - req.cached_len}"
+    )
+    return ids
+
+
 @dataclass(frozen=True)
 class PleRowSource:
     """On-disk row layout: equal extents, row i of an extent at ``base + i * row_stride`` (a repacked flat file is one extent with its own stride)."""
@@ -225,11 +239,14 @@ class DiskRowTable:
         runs = [
             torch.cat((
                 torch.tensor(_context(req.input_ids, req.cached_len, eos), dtype=torch.int64),
-                req.input_ids[req.cached_len : req.device_len].to(torch.int64),
+                _extend_ids(req).to(torch.int64),
             ))
             for req in batch.padded_reqs
         ]
-        self.fill(runs, graph=False)
+        # an extend replayed as a graph (the MTP verify window) consumes the graph staging
+        # buffer under the same flag handshake as decode; its ids are host-known, so the fill
+        # (and its signal) go out before the replay is launched
+        self.fill(runs, graph=use_graph)
         return None
 
     @contextmanager

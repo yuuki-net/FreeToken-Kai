@@ -165,3 +165,49 @@ class ParallelLMHead(VocabParallelEmbedding):
         scores its own hidden states through the shared head with this."""
         module = self.tied_embedding or self
         return F.linear(x, module.weight, self.bias)
+
+
+class Fp8VocabParallelEmbedding(VocabParallelEmbedding):
+    """Embedding table held as fp8-e4m3 rows + a per-row fp32 scale (quantized at load, see
+    ``--dense-quant fp8``); rows are gathered and dequantized per lookup. TP=1 only."""
+
+    def __init__(self, num_embeddings: int, embedding_dim: int):
+        super().__init__(num_embeddings, embedding_dim)
+        assert self.tp_size == 1, "fp8 embedding is TP=1 only"
+        self.weight = torch.empty(self.num_embeddings_tp, embedding_dim, dtype=torch.float8_e4m3fn)
+        self.weight_scale = torch.empty(self.num_embeddings_tp, dtype=torch.float32)
+        # the model dtype: __init__ runs under the engine's torch_dtype(config.dtype)
+        self._out_dtype = torch.get_default_dtype()
+
+    @nvtx_annotate("Embedding")
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        idx = x.long()
+        # gather on the byte view (index kernels for fp8 dtypes are not universal), then dequant
+        rows = self.weight.view(torch.uint8)[idx].view(torch.float8_e4m3fn).to(self._out_dtype)
+        return rows * self.weight_scale[idx].to(self._out_dtype)[:, None]
+
+
+class Fp8ParallelLMHead(ParallelLMHead):
+    """W8A16 lm_head: fp8-e4m3 weight + per-row fp32 scale (quantized at load). The full-vocab
+    GEMV reads the whole head every decode step, so fp8 halves that traffic. TP=1, untied only."""
+
+    def __init__(self, num_embeddings: int, embedding_dim: int):
+        super().__init__(num_embeddings, embedding_dim, tie_word_embeddings=False)
+        assert self.tp_size == 1, "fp8 lm_head is TP=1 only"
+        self.weight = torch.empty(num_embeddings, embedding_dim, dtype=torch.float8_e4m3fn)
+        self.weight_scale = torch.empty(num_embeddings, dtype=torch.float32)
+
+    @nvtx_annotate("LMHead")
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        from freetoken.kernel.triton.fp8_pertensor_linear import fp8_pertensor_linear
+
+        batch = get_global_ctx().batch
+        if batch.is_prefill and not getattr(batch, "spec_all_rows", False):
+            indices = batch.attn_metadata.get_last_indices(batch.size)
+            x = x[indices].contiguous()
+        return fp8_pertensor_linear(x, self.weight, self.weight_scale)
+
+    def logits(self, x: torch.Tensor) -> torch.Tensor:
+        from freetoken.kernel.triton.fp8_pertensor_linear import fp8_pertensor_linear
+
+        return fp8_pertensor_linear(x, self.weight, self.weight_scale)

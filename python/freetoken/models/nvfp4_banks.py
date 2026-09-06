@@ -9,6 +9,7 @@ from typing import Callable
 
 import safetensors
 import torch
+from freetoken.distributed import try_get_pp_info
 from freetoken.utils import download_hf_weight
 from tqdm import tqdm
 
@@ -51,6 +52,13 @@ def _bank_layer(spec: Nvfp4ExpertSourceSpec, layer: int, config) -> int | None:
     bank_layer = spec.layer_to_bank(layer, config)
     if bank_layer is None:
         return None
+    # pipeline engine: only this rank's MoE layers are loaded, re-based to a local index
+    pp = try_get_pp_info()
+    if pp is not None:
+        lo, hi = pp.bank_window(int(getattr(config, "first_k_dense_replace", 0)))
+        if not (lo <= bank_layer < hi):
+            return None
+        bank_layer -= lo
     num_layers = _num_moe_layers(config)
     if bank_layer < 0 or bank_layer >= num_layers:
         raise ValueError(

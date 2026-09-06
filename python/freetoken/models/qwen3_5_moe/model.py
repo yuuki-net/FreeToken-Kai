@@ -98,10 +98,11 @@ class Qwen3_5MTP(BaseOP):
         self.norm = GemmaRMSNorm(hidden, eps=config.rms_norm_eps)
         self._embed_ref = None  # the target's embedding (shared; not a state-dict child)
 
-    def forward(self, hidden: torch.Tensor, next_ids: torch.Tensor) -> torch.Tensor:
+    def forward(self, hidden: torch.Tensor, next_ids: torch.Tensor, batch=None) -> torch.Tensor:
         """``hidden [T, hidden]`` (the target's final hidden state, or the head's own output
         for a chained draft step) + ``next_ids [T]`` -> the head's normed hidden state
-        ``[T, hidden]`` (its KV / expert routing use the active batch's metadata)."""
+        ``[T, hidden]`` (its KV / expert routing use the active batch's metadata; ``batch`` is
+        the engine's common draft-head signature, unused here)."""
         assert self._embed_ref is not None, "MTP head has no embedding table"
         e = self.pre_fc_norm_embedding.forward(self._embed_ref.forward(next_ids).to(hidden.dtype))
         h = self.pre_fc_norm_hidden.forward(hidden)
@@ -109,6 +110,11 @@ class Qwen3_5MTP(BaseOP):
         x, residual = self.layers.op_list[0].forward(x, None)
         x, _ = self.norm.forward_add_residual(x, residual)
         return x
+
+    @staticmethod
+    def to_head(h: torch.Tensor) -> torch.Tensor:
+        """The head's output is already the lm_head input."""
+        return h
 
 
 class Qwen3_5Model(BaseOP):

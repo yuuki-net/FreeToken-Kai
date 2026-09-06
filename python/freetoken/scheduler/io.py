@@ -11,6 +11,9 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+# gloo tag of the per-step "how many raw messages follow" note (pipeline hidden/tokens: 1/2)
+_MSG_COUNT_TAG = 7
+
 
 class SchedulerIOMixin:
     """
@@ -49,6 +52,7 @@ class SchedulerIOMixin:
         if tp_info.size > 1:
             if tp_info.is_primary():
                 recv = self._recv_msg_multi_rank0
+                self._pending_count_sends: list = []
                 self._send_into_ranks: Final = ZmqPubQueue(
                     config.zmq_scheduler_broadcast_addr, create=True, encoder=BaseBackendMsg.encoder
                 )
@@ -97,9 +101,8 @@ class SchedulerIOMixin:
         while not self._recv_from_tokenizer.empty():
             pending_raw_msgs.append(self._recv_from_tokenizer.get_raw())
 
-        # broadcast the number of raw messages to all ranks
-        src_tensor = torch.tensor(len(pending_raw_msgs))
-        self.tp_cpu_group.broadcast(src_tensor, root=0).wait()
+        # tell every other rank how many raw messages follow
+        self._publish_msg_count(len(pending_raw_msgs))
 
         for raw in pending_raw_msgs:
             self._send_into_ranks.put_raw(raw)
@@ -113,13 +116,32 @@ class SchedulerIOMixin:
             pending_msgs.append(self._recv_from_rank0.get())
 
         # ensure all ranks have the same number of raw messages
-        dst_tensor = torch.tensor(-1)
-        self.tp_cpu_group.broadcast(dst_tensor, root=0).wait()
-        dst_length = int(dst_tensor.item())
+        dst_length = self._await_msg_count()
 
         for _ in range(dst_length):
             pending_msgs.append(self._recv_from_rank0.get())
         return pending_msgs
+
+    def _publish_msg_count(self, count: int) -> None:
+        """Rank 0: how many raw messages the other ranks must take off the pub socket this
+        step. Point-to-point and asynchronous rather than a broadcast: a collective holds
+        rank 0 until every rank reaches the same step, and the pipeline engine wants rank 0
+        one prefill chunk ahead of the last rank (distributed/pipeline). Each rank consumes
+        exactly one count per step, in order, so the sends never pile up; the tensors stay
+        referenced until their send has completed."""
+        self._pending_count_sends = [
+            (t, w) for t, w in self._pending_count_sends if not w.is_completed()
+        ]
+        count_t = torch.tensor([count], dtype=torch.int64)
+        for dst in range(1, self.tp_cpu_group.size()):
+            work = self.tp_cpu_group.send([count_t], dst, _MSG_COUNT_TAG)
+            self._pending_count_sends.append((count_t, work))
+
+    def _await_msg_count(self) -> int:
+        """Other ranks: this step's message count from rank 0 (blocks until rank 0 got there)."""
+        buf = torch.tensor([-1], dtype=torch.int64)
+        self.tp_cpu_group.recv([buf], 0, _MSG_COUNT_TAG).wait()
+        return int(buf.item())
 
     def _reply_tokenizer_rank0(self, reply: List[BaseTokenizerMsg]) -> None:
         num_reply = len(reply)
