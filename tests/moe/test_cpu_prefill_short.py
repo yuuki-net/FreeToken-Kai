@@ -61,3 +61,7 @@ def test_dispatch_threshold_and_disable(monkeypatch):
     assert layer._prefill_routed(torch.zeros(300, 8), torch.zeros(300, 2), torch.zeros(300, 2, dtype=torch.int32)) == "gpu"
     monkeypatch.setenv("FREETOKEN_CPU_PREFILL_MAX_TOKENS", "0")
     assert layer._prefill_routed(x, torch.zeros(40, 2), torch.zeros(40, 2, dtype=torch.int32)) == "gpu"
+    # with the overlap double buffer on, a short extend still takes the CPU path
+    monkeypatch.setenv("FREETOKEN_CPU_PREFILL_MAX_TOKENS", "256")
+    layer.offload_cache.prefill_overlap = True
+    assert layer._prefill_routed(x, torch.zeros(40, 2), torch.zeros(40, 2, dtype=torch.int32)) == "cpu"

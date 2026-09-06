@@ -385,9 +385,11 @@ class OffloadMoELayer(MoELayer):
         pass through unmapped."""
         cache = self.offload_cache
         assert cache is not None
+        # short extends take the CPU executor whether or not the overlap double buffer is on:
+        # the decision is per forward (every layer sees the same row count), so a forward that
+        # goes this way never touches the overlap machinery
         if (
-            not cache.prefill_overlap
-            and getattr(cache, "cpu_executor", None) is not None
+            getattr(cache, "cpu_executor", None) is not None
             and 0 < hidden_states.shape[0] <= cpu_prefill_max_tokens()
         ):
             return self._prefill_on_cpu(cache, hidden_states, topk_weights, topk_ids)
