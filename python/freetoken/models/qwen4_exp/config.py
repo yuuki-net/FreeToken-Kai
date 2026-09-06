@@ -189,12 +189,15 @@ def parse_config(hf_config: Any) -> ModelConfig:
         if layer_types[lid] != "linear_attention":
             raise ValueError(f"PLE must sit on a linear_attention layer, got layer {lid}")
 
+    mrope_section = rope_params.get("mrope_section")
     full_rotary = RotaryConfig(
         head_dim=head_dim,
         rotary_dim=rotary_dim,
         max_position=text.max_position_embeddings,
         base=rope_theta,
         scaling=rope_scaling,
+        mrope_section=tuple(int(s) for s in mrope_section) if mrope_section else None,
+        mrope_interleaved=bool(rope_params.get("mrope_interleaved", True)),
     )
     full_group = FullAttentionGroupConfig(
         name="full",

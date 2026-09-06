@@ -147,8 +147,14 @@ class Qwen4ExpAttention(BaseOP):
         v = v.contiguous()
         self.q_norm.forward_inplace(q)
         self.k_norm.forward_inplace(k)
+        # M-RoPE: an image prompt's prefill ropes from its own table (indexed by logical
+        # position); tokens after the images rope at logical + delta. Text-only: unchanged.
+        table = getattr(batch, "rope_cos_sin", None)
+        rope_pos = getattr(batch, "rope_positions", None)
+        positions = batch.positions if table is not None or rope_pos is None else rope_pos
         q, k = self.rotary.forward(
-            batch.positions, q.view(-1, self.qo_attn_dim), k.view(-1, self.kv_attn_dim)
+            positions, q.view(-1, self.qo_attn_dim), k.view(-1, self.kv_attn_dim),
+            cos_sin_cache=table,
         )
         index = self.indexer.forward(x)
         o = get_global_ctx().attn_backend.qsa_forward(

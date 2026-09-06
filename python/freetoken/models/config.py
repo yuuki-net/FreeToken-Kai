@@ -98,6 +98,10 @@ class RotaryConfig:
     max_position: int
     base: float
     scaling: Dict[str, Any] | None
+    # Multimodal rope (Qwen-VL lineage): the (t, h, w) frequency sections and their layout.
+    # None for models without it; text-only prompts rope identically either way.
+    mrope_section: Tuple[int, ...] | None = None
+    mrope_interleaved: bool = True
 
 
 @dataclass(frozen=True)

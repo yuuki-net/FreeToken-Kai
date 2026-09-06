@@ -73,13 +73,17 @@ class RotaryEmbedding(StateLessOP):
         positions: torch.Tensor,
         query: torch.Tensor,
         key: torch.Tensor,
+        cos_sin_cache: torch.Tensor | None = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """``cos_sin_cache`` overrides the model table for this call (same ``[rows,
+        rotary_dim]`` = ``[cos | sin]`` float32 layout): a per-request M-RoPE table indexed by
+        the same ``positions``."""
         self.apply_rope_with_cos_sin_cache_inplace(
             positions=positions,
             query=query,
             key=key,
             head_size=self.head_size,
-            cos_sin_cache=self._cos_sin_cache,
+            cos_sin_cache=self._cos_sin_cache if cos_sin_cache is None else cos_sin_cache,
             is_neox=self.is_neox,
         )
         return query, key

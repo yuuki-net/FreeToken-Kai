@@ -88,6 +88,11 @@ class QSASparseMetadata(BaseAttnMetadata):
     cmp_rows:         torch.Tensor | None = None  # [T] int32, compressed slab destination
     ring_rows:        torch.Tensor | None = None  # [T] int32, flat ring row or -1
     positions:        torch.Tensor | None = None  # [T] int32, logical query positions
+    # Rope lookups for the indexer (M-RoPE): per-token rope positions (== positions unless a
+    # request ropes at logical + delta) and an optional per-forward cos/sin table that
+    # replaces the model table (an image prompt's prefill). Causal visibility keeps positions.
+    rope_positions:   torch.Tensor | None = None  # [T] int32
+    rope_cache:       torch.Tensor | None = None  # [rows, rotary_dim] float32 or None
     # fmt: on
 
     def get_last_indices(self, bs: int) -> torch.Tensor:
@@ -296,6 +301,9 @@ class QSASparseAttnBackend(BaseAttnBackend):
         """Per-token slab row and ring row for this forward; the other QSA layers reuse it
         (it is layer-invariant). Pure device arithmetic: no host sync, graph-capturable."""
         md.positions = batch.positions
+        rope_pos = getattr(batch, "rope_positions", None)
+        md.rope_positions = batch.positions if rope_pos is None else rope_pos
+        md.rope_cache = getattr(batch, "rope_cos_sin", None)
         out_loc = batch.out_loc.to(torch.int64)
         positions = batch.positions.to(torch.int64)
         rows = torch.arange(out_loc.numel(), device=self.device)
@@ -338,10 +346,16 @@ class QSASparseAttnBackend(BaseAttnBackend):
             pooled,
             first,
         )
+        # A compressed key ropes at its group's first token's *rope* position: the logical
+        # first position shifted by that row's delta (0 without M-RoPE; with the prompt table
+        # the logical position already indexes the table).
+        first_rope = first
+        if md.rope_positions is not None and md.rope_positions is not md.positions:
+            first_rope = (first + (md.rope_positions - md.positions)).clamp_(min=0)
         qsa_index_norm_rope(
             pooled,
-            first,
-            self._index_rope_cache(),
+            first_rope,
+            self._index_rope_cache() if md.rope_cache is None else md.rope_cache,
             index.k_norm_weight,
             index.eps,
             self.kvcache.cmp_k_cache(slot),
@@ -366,8 +380,8 @@ class QSASparseAttnBackend(BaseAttnBackend):
         )
         qsa_index_norm_rope(
             index.q.view(-1, self.index_head_dim),
-            positions,
-            self._index_rope_cache(),
+            positions if md.rope_positions is None else md.rope_positions,
+            self._index_rope_cache() if md.rope_cache is None else md.rope_cache,
             index.q_norm_weight,
             index.eps,
             q_index.view(-1, self.index_head_dim),

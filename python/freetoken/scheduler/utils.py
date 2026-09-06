@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING, List
 import torch
 
 if TYPE_CHECKING:
-    from freetoken.core import SamplingParams
+    from freetoken.core import MMRope, SamplingParams
 
     from .prefill import ChunkedReq
 
@@ -18,6 +18,7 @@ class PendingReq:
     sampling_params: SamplingParams
     chunked_req: ChunkedReq | None = None
     mm_embeds: torch.Tensor | None = None
+    mm_rope: MMRope | None = None
 
     @property
     def input_len(self) -> int:

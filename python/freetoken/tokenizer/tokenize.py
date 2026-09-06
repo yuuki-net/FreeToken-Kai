@@ -60,20 +60,27 @@ class TokenizeManager:
         # the first request that carries images; None when the checkpoint has none.
         self._processor: Any = None
         self._processor_tried = False
+        # Host-side vision encoder for checkpoints whose tower runs on the CPU (Qwen4Exp);
+        # None when the engine encodes images itself or the model has none.
+        self._host_encoder: Any = None
+        self._host_encoder_tried = False
 
     def tokenize(self, msgs: List[TokenizeMsg]) -> List[torch.Tensor]:
-        return [ids for ids, _ in self.tokenize_with_images(msgs)]
+        """Token ids only (token counting, prompt validation): images are expanded to their
+        placeholders but never encoded."""
+        return [ids for ids, _ in self.tokenize_with_images(msgs, encode=False)]
 
     def tokenize_with_images(
-        self, msgs: List[TokenizeMsg]
+        self, msgs: List[TokenizeMsg], *, encode: bool = True
     ) -> List[Tuple[torch.Tensor, dict[str, torch.Tensor] | None]]:
-        """``tokenize`` that also returns, per message, the processor's image tensors
-        (``pixel_values``, ``image_position_ids``) for a request carrying images, else None."""
+        """``tokenize`` that also returns, per message, the image tensors the scheduler needs
+        for a request carrying images (else None): the HF processor's tensors, or -- for a
+        checkpoint whose vision tower runs here on the CPU -- the encoded soft tokens."""
         results: List[Tuple[torch.Tensor, dict[str, torch.Tensor] | None]] = []
         # TODO: batch tokenization
         for msg in msgs:
             if msg.images:
-                results.append(self._tokenize_multimodal(msg))
+                results.append(self._tokenize_multimodal(msg, encode=encode))
                 continue
             prompt = self.render_prompt(msg)
             # A jinja chat template owns every special token (HF's apply_chat_template
@@ -114,7 +121,14 @@ class TokenizeManager:
         try:
             from transformers import AutoProcessor
 
-            proc = AutoProcessor.from_pretrained(self.model_path)
+            try:
+                proc = AutoProcessor.from_pretrained(self.model_path)
+            except Exception as exc:  # noqa: BLE001
+                if "torchvision" not in str(exc).lower():
+                    raise
+                # the torch image backend needs torchvision; every Qwen-VL family processor
+                # also ships a PIL backend
+                proc = AutoProcessor.from_pretrained(self.model_path, use_fast=False)
         except Exception as exc:  # noqa: BLE001 -- text-only checkpoints have no processor
             logger.info("no image processor for this checkpoint (%s)", exc)
             return None
@@ -136,24 +150,57 @@ class TokenizeManager:
             )
         return proc
 
+    def _host_image_encoder(self) -> Any:
+        if self._host_encoder_tried:
+            return self._host_encoder
+        self._host_encoder_tried = True
+        from .mm_host import build_host_image_encoder
+
+        self._host_encoder = build_host_image_encoder(self.model_path)
+        return self._host_encoder
+
+    def _image_size_kwargs(self, proc: Any) -> dict[str, Any]:
+        """Cap the pixel budget of dynamic-resolution processors (Qwen-VL lineage: ``size`` in
+        total pixels). ``FT_IMAGE_MAX_PIXELS`` (default 1024*1024, about 1k soft tokens)
+        bounds both the CPU vision cost and the prompt length."""
+        size = getattr(getattr(proc, "image_processor", None), "size", None)
+        if not isinstance(size, dict) or "longest_edge" not in size:
+            return {}
+        max_pixels = int(os.environ.get("FT_IMAGE_MAX_PIXELS", str(1024 * 1024)))
+        shortest = int(size.get("shortest_edge") or 0)
+        return {"size": {"shortest_edge": min(shortest, max_pixels) if shortest else 0, "longest_edge": max_pixels}}
+
     def _tokenize_multimodal(
-        self, msg: TokenizeMsg
-    ) -> Tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        self, msg: TokenizeMsg, *, encode: bool = True
+    ) -> Tuple[torch.Tensor, dict[str, torch.Tensor] | None]:
         """Render with the processor's template (it places one image token per
         ``{"type": "image"}`` part) and let the processor expand each into the model's
         placeholder run while producing the vision tensors. ``add_special_tokens=False``
-        for the same reason as the text path: the template already rendered bos."""
+        for the same reason as the text path: the template already rendered bos. With
+        ``encode`` the checkpoint's host-side tower (if any) turns those tensors into the
+        soft tokens the scheduler scatters."""
         proc = self._require_processor(msg)
         prompt = self._render(
             msg.text, msg.tools, self._sanitize_effort(msg.chat_template_kwargs or {}), owner=proc
         )
         images = [_open_image(b) for b in msg.images or ()]
-        out = proc(text=[prompt], images=[images], return_tensors="pt", add_special_tokens=False)
+        out = proc(
+            text=[prompt], images=[images], return_tensors="pt", add_special_tokens=False,
+            **self._image_size_kwargs(proc),
+        )
         input_ids = out["input_ids"].view(-1).to(torch.int32)
-        mm = {
-            "pixel_values": out["pixel_values"].to(torch.float16).cpu(),
-            "image_position_ids": out["image_position_ids"].to(torch.int64).cpu(),
-        }
+        if not encode:
+            return input_ids, None
+        mm: dict[str, torch.Tensor] = {}
+        for key in ("pixel_values", "image_position_ids", "image_grid_thw"):
+            value = out.get(key)
+            if torch.is_tensor(value):
+                if key == "pixel_values":
+                    value = value.to(torch.float16)
+                mm[key] = value.cpu()
+        encoder = self._host_image_encoder()
+        if encoder is not None:
+            mm = encoder.encode(mm)
         return input_ids, mm
 
     def _render(

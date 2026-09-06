@@ -4,7 +4,7 @@ from typing import TYPE_CHECKING, List, NamedTuple, NoReturn, Set, Tuple, TypeAl
 
 import torch
 from freetoken.attention.linear import build_fla_metadata
-from freetoken.core import Batch, Req
+from freetoken.core import Batch, MMRope, Req
 from freetoken.env import ENV
 from freetoken.gpu_select import gpu_identity
 from freetoken.message import (
@@ -786,6 +786,10 @@ class Scheduler(SchedulerIOMixin):
         if batch.is_prefill:
             self._gather_multimodal(batch)
         batch.positions = _make_positions(batch, self.device)
+        batch.rope_cos_sin = _prefill_rope_table(batch)
+        batch.rope_positions = (
+            None if batch.rope_cos_sin is not None else _make_rope_positions(batch, self.device)
+        )
         input_mapping = _make_input_tuple(batch, self.device)
         write_mapping = _make_write_tuple(batch, self.device)
         batch.out_loc = self.engine.page_table[input_mapping]
@@ -824,25 +828,30 @@ class Scheduler(SchedulerIOMixin):
         )
 
     def _encode_multimodal(self, msg: UserMsg) -> str | None:
-        """Online image input: run the vision tower on the request's processor tensors and
-        attach the soft-token embeddings as ``msg.mm_embeds`` (what the offline path
-        precomputes). Returns an error string rather than raising: a bad image must fail
-        that one request, never the scheduler."""
+        """Online image input: turn the request's ``mm_inputs`` into ``msg.mm_embeds`` (what
+        the offline path precomputes) and, for M-RoPE models, ``msg.mm_rope``. Two shapes
+        arrive: ``mm_embeds`` already encoded host-side (the tokenizer worker ran the vision
+        tower on the CPU), or the HF processor's tensors for a model whose tower lives on the
+        GPU (``encode_images``). Returns an error string rather than raising: a bad image must
+        fail that one request, never the scheduler."""
         model = self.engine.model
-        if not hasattr(model, "encode_images") or getattr(model, "vision_tower", None) is None:
-            return (
-                "this model is not serving image input (a multimodal checkpoint started with "
-                "FREETOKEN_LOAD_VISION=1 is required)"
-            )
+        mm = msg.mm_inputs
         image_token_id = getattr(self.config.model_config, "image_token_id", None)
         if image_token_id is None:
             return "this model has no image placeholder token"
         try:
-            with torch.inference_mode():
-                embeds = model.encode_images(
-                    msg.mm_inputs["pixel_values"].to(self.device),
-                    msg.mm_inputs["image_position_ids"].to(self.device),
-                )
+            if "mm_embeds" in mm:
+                embeds = mm["mm_embeds"].to(self.device)
+            else:
+                if not hasattr(model, "encode_images") or getattr(model, "vision_tower", None) is None:
+                    return (
+                        "this model is not serving image input (a multimodal checkpoint started "
+                        "with FREETOKEN_LOAD_VISION=1 is required)"
+                    )
+                with torch.inference_mode():
+                    embeds = model.encode_images(
+                        mm["pixel_values"].to(self.device), mm["image_position_ids"].to(self.device)
+                    )
             if self.device.type == "cuda":
                 torch.cuda.synchronize(self.device)
         except Exception as exc:  # noqa: BLE001 -- the request's problem, not the server's
@@ -854,9 +863,35 @@ class Scheduler(SchedulerIOMixin):
                 f"image placeholder count ({slots}) does not match the vision features "
                 f"({int(embeds.shape[0])}); the prompt was not expanded by this model's processor"
             )
+        rope = self._multimodal_rope(msg, image_token_id)
+        if isinstance(rope, str):
+            return rope
+        msg.mm_rope = rope
         msg.mm_embeds = embeds
         msg.mm_inputs = None
         return None
+
+    def _multimodal_rope(self, msg: UserMsg, image_token_id: int) -> "MMRope | str | None":
+        """M-RoPE for a prompt with images (models whose rotary config carries mrope
+        sections): the HF 3-D position assignment turned into this request's prompt cos/sin
+        table plus the delta every later token ropes at. None for other models."""
+        rotary = getattr(self.config.model_config, "rotary_config", None)
+        section = getattr(rotary, "mrope_section", None) if rotary is not None else None
+        grid = msg.mm_inputs.get("image_grid_thw") if msg.mm_inputs else None
+        if not section or grid is None:
+            return None
+        from freetoken.models.qwen4_exp.mrope import image_rope_positions, mrope_cos_sin
+
+        try:
+            merge = int(msg.mm_inputs.get("merge_size", 2))
+            pos3, delta = image_rope_positions(msg.input_ids, image_token_id, grid, merge)
+            table = mrope_cos_sin(
+                pos3, rotary.rotary_dim, rotary.base, tuple(section),
+                interleaved=getattr(rotary, "mrope_interleaved", True),
+            )
+        except Exception as exc:  # noqa: BLE001
+            return f"could not build the multimodal rope for this prompt: {exc}"
+        return MMRope(delta=delta, cos_sin=table.to(self.device))
 
     def _gather_multimodal(self, batch: Batch) -> None:
         """Concatenate per-request vision soft tokens (in request order) for a prefill
@@ -912,6 +947,42 @@ class Scheduler(SchedulerIOMixin):
         self.token_pool[output_mapping] = forward_output.next_tokens_gpu
         self.decode_manager.filter_reqs(forward_input.batch.reqs)
         return forward_output
+
+
+def _prefill_rope_table(batch: Batch) -> torch.Tensor | None:
+    """The image prompt's own cos/sin table for its (single, solo, uncached) prefill chunk:
+    rope lookups index it by logical position, which is why the prompt runs alone from 0."""
+    if not batch.is_prefill or len(batch.padded_reqs) != 1:
+        return None
+    req = batch.padded_reqs[0]
+    rope = getattr(req, "mm_rope", None)
+    if rope is None or rope.cos_sin is None:
+        return None
+    assert req.cached_len == 0, "an image prompt is never prefix-cached"
+    return rope.cos_sin
+
+
+def _make_rope_positions(batch: Batch, device: torch.device) -> torch.Tensor | None:
+    """``positions`` shifted by each request's M-RoPE delta, or None when no row needs it
+    (the common case: every consumer then ropes at ``positions``)."""
+    deltas = []
+    for req in batch.padded_reqs:
+        rope = getattr(req, "mm_rope", None)
+        deltas.append(int(rope.delta) if rope is not None else 0)
+    if not any(deltas):
+        return None
+    needed = sum(r.extend_len for r in batch.padded_reqs)
+    # pinned like _make_positions (async H2D); plain memory on a CPU-only host
+    host = torch.empty(needed, dtype=torch.int32, pin_memory=device.type == "cuda")
+    offset = 0
+    for req, delta in zip(batch.padded_reqs, deltas):
+        length = req.extend_len
+        torch.arange(
+            req.cached_len + delta, req.device_len + delta, dtype=torch.int32,
+            out=host[offset : offset + length],
+        )
+        offset += length
+    return host.to(device, non_blocking=True)
 
 
 def _make_positions(batch: Batch, device: torch.device) -> torch.Tensor:

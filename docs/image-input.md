@@ -23,4 +23,24 @@ is multimodal and its vision tower is loaded (`FREETOKEN_LOAD_VISION=1`; Gemma 4
   feature count mismatch fails **that request** with a 400-class error; text-only requests
   are unaffected.
 
-The Anthropic and Responses adapters remain text-only (image blocks are dropped as before).
+## Qwen3.8-Flash-Next
+
+The NVFP4 checkpoint keeps the vision tower (`model.visual.*`, bf16, ~0.9 GB) and the
+Qwen3-VL processor config, so the same request shape works there too, with two differences:
+
+* **The tower runs on the CPU, in the tokenizer worker** (transformers' own
+  `Qwen4ExpVisionModel`, float32, loaded on the first request with images). A 12 GB card
+  has no room for it, and one image is a few seconds of CPU time. The worker hands the
+  scheduler the already-projected soft tokens; nothing image-related touches the GPU beyond
+  the scatter. `FT_IMAGE_MAX_PIXELS` (default `1048576`, about 1k soft tokens per image)
+  bounds the resolution the processor keeps.
+* **M-RoPE.** Image tokens rope at 3-D `(t, h, w)` positions and every token after them at
+  `logical + delta` (`delta <= 0`), exactly as the HF model does. FreeToken keeps its logical
+  positions for the QSA ring / slab / causal bookkeeping and swaps only the rope lookups: the
+  image prompt's single prefill chunk ropes from a per-request cos/sin table indexed by
+  logical position (`Batch.rope_cos_sin`; such a prompt is scheduled alone), later tokens
+  rope at `Batch.rope_positions` (a static input of the decode graph). Text-only prompts are
+  bit-for-bit the old path.
+
+Not covered: video, the Anthropic / Responses adapters (text-only, image blocks are dropped
+as before), and speculative decoding with image prompts.

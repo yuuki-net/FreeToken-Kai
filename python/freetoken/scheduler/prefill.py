@@ -185,6 +185,7 @@ class PrefillAdder:
             cache_handle=cache_handle,
             sampling_params=pending_req.sampling_params,
             mm_embeds=pending_req.mm_embeds,
+            mm_rope=pending_req.mm_rope,
         )
         # Hybrid GDN per-request state slots (None for non-hybrid). On a fresh admit these are
         # freshly allocated; on a chunked continuation they are inherited from the prior chunk.
@@ -245,7 +246,10 @@ class PrefillManager:
 
     def add_one_req(self, req: UserMsg) -> None:
         self.pending_list.append(
-            PendingReq(req.uid, req.input_ids, req.sampling_params, mm_embeds=req.mm_embeds)
+            PendingReq(
+                req.uid, req.input_ids, req.sampling_params,
+                mm_embeds=req.mm_embeds, mm_rope=getattr(req, "mm_rope", None),
+            )
         )
 
     def schedule_next_batch(self, prefill_budget: int) -> Batch | None:
@@ -269,6 +273,10 @@ class PrefillManager:
         log_cached_tokens = 0
         for pending_req in self.pending_list:
             is_continuation = pending_req.chunked_req is not None
+            # A prompt with images runs alone: its rope table is indexed by logical position
+            # from 0 (it is never prefix-cached) and cannot share a forward with other rows.
+            if pending_req.mm_embeds is not None and reqs:
+                break
             if req := adder.try_add_one(pending_req):
                 pending_req.chunked_req = None
                 if isinstance(req, ChunkedReq):
@@ -285,6 +293,8 @@ class PrefillManager:
                 log_new_tokens += req.extend_len
                 if not is_continuation:
                     log_cached_tokens += req.cache_handle.cached_len
+                if pending_req.mm_embeds is not None:
+                    break  # solo, see above
             else:
                 break  # We cannot add more requests
         if len(reqs) == 0:

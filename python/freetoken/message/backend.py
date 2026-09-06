@@ -40,6 +40,8 @@ class UserMsg(BaseBackendMsg):
     # Online path: the HF processor's image tensors (CPU ``pixel_values`` and
     # ``image_position_ids``), which the scheduler encodes into ``mm_embeds`` on admission.
     mm_inputs: Dict[str, torch.Tensor] | None = None
+    # Set in-process by the scheduler from mm_inputs (never serialized).
+    mm_rope: object | None = None
 
 
 @dataclass

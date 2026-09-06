@@ -89,6 +89,7 @@ class Qwen4ExpDecoderLayer(BaseOP):
 class Qwen4ExpModel(BaseOP):
     def __init__(self, config: ModelConfig) -> None:
         self.hc_count = config.qwen4_args.hc_count
+        self._image_token_id = config.image_token_id
         self.embed_tokens = VocabParallelEmbedding(
             num_embeddings=config.vocab_size,
             embedding_dim=config.hidden_size,
@@ -106,7 +107,14 @@ class Qwen4ExpModel(BaseOP):
         return list(self._ple)
 
     def forward(self, input_ids: torch.Tensor, batch: Batch) -> torch.Tensor:
-        hidden = self.embed_tokens.forward(input_ids).repeat(1, self.hc_count)
+        embeds = self.embed_tokens.forward(input_ids)
+        mm_embeds = getattr(batch, "mm_embeds", None)
+        if mm_embeds is not None and self._image_token_id is not None:
+            # image soft tokens (vision tower + merger output, already in the text width)
+            # replace the placeholder embeddings; the count was checked at admission
+            mask = (input_ids == self._image_token_id).unsqueeze(-1)
+            embeds = embeds.masked_scatter(mask, mm_embeds.to(embeds.dtype))
+        hidden = embeds.repeat(1, self.hc_count)
         meta = None
         if self._ple:
             from .ple import build_ple_metadata, commit_ngram_context
