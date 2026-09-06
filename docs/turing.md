@@ -1,7 +1,8 @@
 # Running on Turing (sm_75)
 
 Upstream FreeToken states Ampere (RTX 30 series) or newer as the requirement. This fork makes the
-engine run on Turing with three isolated changes. Each fixes a distinct failure that was found on an
+engine run on Turing with six isolated changes: three that make it start (1-3) and three that
+make prefill usable (4-6). Each fixes a distinct failure that was found on an
 RTX 2060 6 GB by narrowing the crash down kernel by kernel; the debugging notes are below so the
 next person does not have to repeat it.
 
@@ -56,6 +57,48 @@ limit, using `(M + 4N)` rows for the split kernel and `(M + 2N)` for the plain o
 head_dim 256 that gives `(32, 16)` (48 KB) for the split kernel. Choices on sm_89 (99 KB) and
 H100 (227 KB) are unchanged, which the unit tests pin down.
 
+## 4. fp8 W8A16 prefill GEMM: dequant + cuBLAS below Ampere
+
+`python/freetoken/kernel/triton/fp8_pertensor_linear.py`, `_gemm_scratch()` / `_scratch_gemm_preferred()`.
+
+**Symptom.** Ornith prefills a 2785-token prompt in 68 s even in fp16. `tools/turing_prefill_bench.py`
+timed each prefill kernel at that shape: the inline-dequant fp8 GEMM used for the GDN and attention
+projections ran at **0.15 TFLOPS** (fp16 and bf16 alike) while cuBLAS fp16 did 19 TFLOPS on the same
+card; the 30 GDN layers' projections alone were ~37 s.
+
+**Fix.** Below Ampere, M>1 W8A16 GEMMs expand the fp8 weight into a per-call scratch in the activation
+dtype (row scale folded in, ~50 MB for a 12288 x 2048 projection) and run cuBLAS. Measured 16.4
+TFLOPS afterwards. The M=1 GEMV (decode) is untouched. `FREETOKEN_FP8_SCRATCH_GEMM=0/1` overrides.
+
+## 5. Arithmetic e2m1 dequant in the prefill MoE kernel
+
+`python/freetoken/kernel/triton/nvfp4_fused_moe.py`, constexpr `ARITH_DEQUANT`.
+
+The prefill MoE kernel looked up each 4-bit code in a 16-entry LUT (two gathers per byte). The dense
+NVFP4 kernels already use a gather-free bit-placement dequant, so the same was wired into the MoE
+kernel. It is bit-identical (max diff 0 against the LUT path) but, on the 2060, **not faster**: the
+kernel stays at 0.56 TFLOPS. Kept as a knob (`FREETOKEN_NVFP4_MOE_ARITH`) since it costs nothing and
+may matter on other GPUs; the real fix is 6.
+
+## 6. NVFP4 prefill MoE: chunked dequant + per-expert cuBLAS below Ampere
+
+`python/freetoken/moe/fused_nvfp4.py`, `_fused_experts_nvfp4_scratch()` / `_scratch_moe_preferred()`.
+
+**Symptom.** The inline-dequant prefill MoE GEMM runs one layer of a 2785-token prompt in 248 ms
+(0.56 TFLOPS), 10 s over 40 layers. A sweep of 11 tile configurations changed nothing (best 0.58
+TFLOPS; larger tiles collapsed to 0.05-0.13). Upstream itself notes that in-kernel-dequant GEMMs are
+~3x slower than cuBLAS even on H100; on Turing the gap is ~40x.
+
+**Fix.** Below Ampere (and only for the silu activation), the layer's experts are dequantised 32 at a
+time into an fp16/bf16 scratch (~200 MB) and each expert runs one cuBLAS GEMM over the tokens routed
+to it; router weights and the sum over a token's routes are applied in fp32. One host sync per layer
+(route counts). Measured 48-53 ms per layer in fp16 (2.9 TFLOPS; the remaining gap to cuBLAS is the
+512 small launches per layer, not the GEMMs), 106 ms in bf16. `FREETOKEN_NVFP4_MOE_SCRATCH=0/1` overrides.
+
+**Result.** The 2785-token prompt went from 68 s to ~8.5 s. About 5 s of that is now the per-chunk
+expert streaming (the CPU-side layers' banks are pageable under WSL and are copied synchronously each
+chunk); the compute part is ~1.3 ms per token.
+
 ## What was checked and found fine
 
 `tools/turing_kernel_probe.py` runs every GPU kernel of the Qwen3.5-MoE decode path in its own
@@ -86,12 +129,15 @@ Two things that look like failures but are not:
 
 ## Performance on the RTX 2060
 
-- Decode: 20-37 tok/s for Ornith-1.5-35B-A3B in `hybrid` mode (3B active parameters, NVFP4
-  experts; the CPU path reads about 0.5 GB per token at 50 GB/s). 13-14 tok/s for gpt-oss-20b.
-- Prefill: slow. Turing has no bf16 tensor cores, so Triton lowers the bf16 matmuls of the MoE and
-  attention prefill kernels to fp32 FMAs; a 5k-token prompt takes minutes. Turing does have fp16
-  tensor cores, so `--dtype float16` should help substantially; this is not yet validated (fp16 has
-  a narrower range than bf16 and some models overflow).
+- Decode: 25-37 tok/s for Ornith-1.5-35B-A3B in `hybrid` mode with `--dtype float16` (3B active
+  parameters, NVFP4 experts; the CPU path reads about 0.5 GB per token at 50 GB/s). 13-14 tok/s
+  for gpt-oss-20b.
+- Prefill (fp16, after changes 4-6): 2785 tokens in ~8.5 s, of which ~5 s is the per-chunk expert
+  streaming and ~1.3 ms/token is compute. Use `--dtype float16`: Turing has fp16 tensor cores but
+  no bf16 ones (cuBLAS 19 vs 3 TFLOPS). Ornith's output is unaffected by fp16.
+- Per-kernel numbers at 2785 tokens (`tools/turing_prefill_bench.py`): fp8 GEMM 16.4 TFLOPS (scratch),
+  MoE prefill 2.9 TFLOPS (scratch), Triton extend attention 0.68 TFLOPS (0.9 s / prefill), GDN chunk
+  0.12-0.19 TFLOPS (2-3 s / prefill), NVFP4 dense 16 TFLOPS.
 
 ## WSL2 notes
 

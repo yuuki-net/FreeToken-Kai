@@ -10,8 +10,8 @@ The fork adds two things upstream does not have:
    text-only: Qwen3.8-Flash-Next and the Qwen3.5-MoE family (Qwen3.6-35B-A3B, Ornith-1.5-35B-A3B).
    The vision tower runs on the CPU, so it costs no VRAM. Works from Open WebUI and any OpenAI
    client that sends `image_url` parts. See [image-input.md](image-input.md).
-2. **Turing (RTX 20 series, sm_75) support.** Upstream requires Ampere or newer; three small,
-   isolated changes make the engine run on an RTX 2060. See [turing.md](turing.md).
+2. **Turing (RTX 20 series, sm_75) support.** Upstream requires Ampere or newer; six small,
+   isolated changes make the engine run on an RTX 2060 at a usable speed. See [turing.md](turing.md).
 
 Everything else is upstream FreeToken. The two feature sets are independent: the image input
 patch also applies to a plain upstream checkout on Ampere+, and the Turing patch is useful on
@@ -28,7 +28,7 @@ for Claude. Bug reports about this fork go to this repository, not to FlashML.
 
 | Machine | Model | Result |
 |---|---|---|
-| RTX 2060 6 GB, 32 GB RAM, Windows 11 + WSL2 (`memory=24GB`) | `ornith-ai/Ornith-1.5-35B-A3B-NVFP4` (35B MoE, 3B active, vision) | Text and image input work. Decode 20-37 tok/s (`--moe-backend hybrid`). Prefill is slow in bf16 (Turing has no bf16 tensor cores); see turing.md |
+| RTX 2060 6 GB, 32 GB RAM, Windows 11 + WSL2 (`memory=24GB`) | `ornith-ai/Ornith-1.5-35B-A3B-NVFP4` (35B MoE, 3B active, vision) | Text and image input work. Decode 25-37 tok/s (`--moe-backend hybrid`, `--dtype float16`). Prefill: a 2785-token prompt in ~8.5 s (68 s before the Turing GEMM changes); ~5 s of that is the per-chunk expert streaming, the rest ~1.3 ms/token |
 | same | `openai/gpt-oss-20b` (MXFP4) | 13-14 tok/s with the Turing patch alone |
 | RTX 3060 12 GB x2, 128 GB RAM, Linux | `RadixArk/Qwen3.8-Flash-Next-NVFP4` (125B MoE, vision) | Image input validated end to end (colour probe 6/6, chunked prefill, M-RoPE). That machine runs a private pipeline-parallel build that is **not** part of this fork; the image code here is the same |
 
@@ -52,8 +52,8 @@ CUDA kernels are JIT-compiled on first use (CUDA 13 toolkit with `nvcc`, as upst
 ## Running Ornith-1.5-35B-A3B on an RTX 2060 (6 GB) under WSL2
 
 ```bash
-FREETOKEN_PIN_BUDGET_GB=6 FT_IMAGE_MAX_PIXELS=262144 ft serve \
-  --model models/Ornith-1.5-35B-A3B-NVFP4 --host 0.0.0.0 --port 1919 \
+FT_IMAGE_MAX_PIXELS=262144 ft serve \
+  --model models/Ornith-1.5-35B-A3B-NVFP4 --dtype float16 --host 0.0.0.0 --port 1919 \
   --moe-backend hybrid --disable-moe-prefill-overlap --max-running-req 1 \
   --kv-reserve-tokens 16384 --max-seq-len-override 16384 --memory-ratio 0.85 \
   --moe-cpu-threads 6
@@ -66,7 +66,7 @@ FREETOKEN_PIN_BUDGET_GB=6 FT_IMAGE_MAX_PIXELS=262144 ft serve \
 | `--max-running-req 1` | GDN state slots 8 -> 2 and one CUDA graph; saves ~200 MB |
 | `--kv-reserve-tokens 16384` | KV pages are carved from the same budget as the expert cache; the default 8192 was too small for Open WebUI prompts, 4096 far too small |
 | `--memory-ratio 0.85` | The ratio is of total VRAM and the desktop's ~600 MB counts against it; 0.92 left 60 MB for graph capture |
-| `FREETOKEN_PIN_BUDGET_GB=6` | WSL caps pinned host memory; the default 40 % of RAM was fine at 16 GB but is worth capping explicitly |
+| `--dtype float16` | Turing has fp16 tensor cores but no bf16 ones (cuBLAS: 19 vs 3 TFLOPS on a 2060); Ornith's output is unaffected |
 | `FT_IMAGE_MAX_PIXELS=262144` | One image becomes at most 256 soft tokens (512 x 512); the default 1024 x 1024 is 1024 tokens |
 | WSL `.wslconfig` `memory=24GB` | The expert banks are 17 GB, the CPU vision tower 1.7 GB in fp32; with `memory=16GB` loading swaps and appears to hang |
 
@@ -80,6 +80,9 @@ line and makes a healthy server look stuck.
 |---|---|---|
 | `FT_IMAGE_MAX_PIXELS` | `1048576` | Resolution cap the image processor keeps (soft tokens per image = pixels / 1024) |
 | `FT_IMAGE_EMBED_CACHE` | `32` | LRU entries of vision-tower output per image (chat clients resend every image each turn); `0` disables |
+| `FREETOKEN_FP8_SCRATCH_GEMM` | arch (on below Ampere) | fp8 W8A16 prefill GEMM as dequant + cuBLAS instead of the inline-dequant Triton kernel |
+| `FREETOKEN_NVFP4_MOE_SCRATCH` | arch (on below Ampere) | NVFP4 prefill MoE as chunked dequant + per-expert cuBLAS instead of the inline-dequant kernel |
+| `FREETOKEN_NVFP4_MOE_ARITH` | arch (on below Ampere) | Arithmetic (gather-free) e2m1 dequant in the prefill MoE kernel; bit-identical, speed knob only |
 
 ## Known limitations
 
@@ -87,8 +90,9 @@ line and makes a healthy server look stuck.
   prompts are not covered.
 - Image prompts bypass the shared prefix cache (by upstream design), so a conversation with images
   is prefilled in full every turn.
-- On Turing, prefill runs bf16 matmuls without tensor cores; a 5k-token prompt takes minutes.
-  Decode is unaffected. `--dtype float16` may help (Turing has fp16 tensor cores); untested.
+- On Turing, use `--dtype float16`. Prefill has a fixed cost of ~5 s per chunk on the 2060 under
+  WSL (the experts of the CPU-side layers are streamed from pageable host memory each chunk);
+  beyond that it is ~1.3 ms per token.
 - The Triton attention backend is used on Turing; flashinfer's JIT attention fails there at
   head_dim 256.
 - DeepStack vision checkpoints (Qwen3-VL proper) are refused; only checkpoints with an empty
@@ -96,7 +100,7 @@ line and makes a healthy server look stuck.
 
 ## Keeping up with upstream
 
-The fork is nine commits on top of `af71ba4`, touching a small set of files (see `git log
+The fork is a dozen commits on top of `af71ba4`, touching a small set of files (see `git log
 af71ba4..`). Rebasing onto a newer upstream is expected to be straightforward until upstream ships
 its own multimodal serving or Turing support, at which point the corresponding part of this fork
 should be dropped in favour of the official code.
