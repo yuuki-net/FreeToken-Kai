@@ -34,9 +34,12 @@ class UserMsg(BaseBackendMsg):
     uid: int
     input_ids: torch.Tensor  # CPU 1D int32 tensor
     sampling_params: SamplingParams
-    # Optional precomputed multimodal soft-token embeddings (GPU tensor). Only used by
-    # the in-process offline path; remains None for the (serialized) online path.
+    # Optional precomputed multimodal soft-token embeddings (GPU tensor). Set in-process by
+    # the offline path, or by the scheduler on admission from ``mm_inputs``; never on the wire.
     mm_embeds: torch.Tensor | None = None
+    # Online path: the HF processor's image tensors (CPU ``pixel_values`` and
+    # ``image_position_ids``), which the scheduler encodes into ``mm_embeds`` on admission.
+    mm_inputs: Dict[str, torch.Tensor] | None = None
 
 
 @dataclass

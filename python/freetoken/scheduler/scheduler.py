@@ -520,6 +520,11 @@ class Scheduler(SchedulerIOMixin):
                 logger.warning_rank0(
                     f"Adjust max_tokens to {max_output_len} for request {msg.uid}."
                 )
+            if msg.mm_inputs is not None:
+                error = self._encode_multimodal(msg)
+                if error is not None:
+                    self.send_result([ErrorReplyMsg(uid=msg.uid, error=error)])
+                    return
             self.prefill_manager.add_one_req(msg)
         elif isinstance(msg, AbortBackendMsg):
             logger.debug_rank0("Aborting request %d", msg.uid)
@@ -817,6 +822,41 @@ class Scheduler(SchedulerIOMixin):
             input_tuple=input_mapping,
             write_tuple=write_mapping,
         )
+
+    def _encode_multimodal(self, msg: UserMsg) -> str | None:
+        """Online image input: run the vision tower on the request's processor tensors and
+        attach the soft-token embeddings as ``msg.mm_embeds`` (what the offline path
+        precomputes). Returns an error string rather than raising: a bad image must fail
+        that one request, never the scheduler."""
+        model = self.engine.model
+        if not hasattr(model, "encode_images") or getattr(model, "vision_tower", None) is None:
+            return (
+                "this model is not serving image input (a multimodal checkpoint started with "
+                "FREETOKEN_LOAD_VISION=1 is required)"
+            )
+        image_token_id = getattr(self.config.model_config, "image_token_id", None)
+        if image_token_id is None:
+            return "this model has no image placeholder token"
+        try:
+            with torch.inference_mode():
+                embeds = model.encode_images(
+                    msg.mm_inputs["pixel_values"].to(self.device),
+                    msg.mm_inputs["image_position_ids"].to(self.device),
+                )
+            if self.device.type == "cuda":
+                torch.cuda.synchronize(self.device)
+        except Exception as exc:  # noqa: BLE001 -- the request's problem, not the server's
+            logger.warning_rank0(f"image encoding failed for request {msg.uid}: {exc!r}")
+            return f"could not encode images: {exc}"
+        slots = int((msg.input_ids == image_token_id).sum().item())
+        if slots != int(embeds.shape[0]):
+            return (
+                f"image placeholder count ({slots}) does not match the vision features "
+                f"({int(embeds.shape[0])}); the prompt was not expanded by this model's processor"
+            )
+        msg.mm_embeds = embeds
+        msg.mm_inputs = None
+        return None
 
     def _gather_multimodal(self, batch: Batch) -> None:
         """Concatenate per-request vision soft tokens (in request order) for a prefill

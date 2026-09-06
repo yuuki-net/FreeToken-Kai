@@ -209,7 +209,9 @@ class FrontendManager:
                 from freetoken.tokenizer.tokenize import TokenizeManager
                 from freetoken.utils import load_tokenizer
 
-                self._frontend_tokenizer = TokenizeManager(load_tokenizer(self.config.model_path))
+                self._frontend_tokenizer = TokenizeManager(
+                    load_tokenizer(self.config.model_path), model_path=self.config.model_path
+                )
             return self._frontend_tokenizer
 
     def warm_frontend_tokenizer(self) -> None:

@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import importlib.util
+import io
 import json
 import os
 import threading
 from types import ModuleType
-from typing import Any, List
+from typing import Any, List, Tuple
 
 import torch
 from freetoken.message import TokenizeMsg
@@ -47,18 +48,33 @@ _EFFORT_PROBE_MESSAGES = [{"role": "user", "content": "ping"}]
 
 
 class TokenizeManager:
-    def __init__(self, tokenizer: PreTrainedTokenizerBase) -> None:
+    def __init__(self, tokenizer: PreTrainedTokenizerBase, model_path: str | None = None) -> None:
         self.tokenizer = tokenizer
+        self.model_path = model_path or getattr(tokenizer, "name_or_path", None)
         self._dsv4_encoder = _load_dsv4_encoder_if_needed(tokenizer)
         self._effort_profile: EffortProfile | None = None
         self._thinking_profile: ThinkingProfile | None = None
         self._effort_lock = threading.Lock()
         self._logged_effort_maps: set[tuple[Any, str | None]] = set()
+        # The checkpoint's HF processor (image processor + tokenizer + template), built on
+        # the first request that carries images; None when the checkpoint has none.
+        self._processor: Any = None
+        self._processor_tried = False
 
     def tokenize(self, msgs: List[TokenizeMsg]) -> List[torch.Tensor]:
-        results: List[torch.Tensor] = []
+        return [ids for ids, _ in self.tokenize_with_images(msgs)]
+
+    def tokenize_with_images(
+        self, msgs: List[TokenizeMsg]
+    ) -> List[Tuple[torch.Tensor, dict[str, torch.Tensor] | None]]:
+        """``tokenize`` that also returns, per message, the processor's image tensors
+        (``pixel_values``, ``image_position_ids``) for a request carrying images, else None."""
+        results: List[Tuple[torch.Tensor, dict[str, torch.Tensor] | None]] = []
         # TODO: batch tokenization
         for msg in msgs:
+            if msg.images:
+                results.append(self._tokenize_multimodal(msg))
+                continue
             prompt = self.render_prompt(msg)
             # A jinja chat template owns every special token (HF's apply_chat_template
             # tokenizes with add_special_tokens=False for the same reason): tokenizers
@@ -71,7 +87,7 @@ class TokenizeManager:
                     prompt, return_tensors="pt", add_special_tokens=not templated
                 )
             )
-            results.append(input_ids.view(-1).to(torch.int32))
+            results.append((input_ids.view(-1).to(torch.int32), None))
         return results
 
     def render_prompt(self, msg: TokenizeMsg) -> str:
@@ -81,19 +97,79 @@ class TokenizeManager:
         validation, count_tokens) must quantize identically."""
         if not isinstance(msg.text, list):
             return msg.text
-        return self._render(
-            msg.text, msg.tools, self._sanitize_effort(msg.chat_template_kwargs or {})
+        kwargs = self._sanitize_effort(msg.chat_template_kwargs or {})
+        if msg.images:
+            return self._render(msg.text, msg.tools, kwargs, owner=self._require_processor(msg))
+        return self._render(msg.text, msg.tools, kwargs)
+
+    # ----- images ---------------------------------------------------------------------------
+    def _image_processor(self) -> Any:
+        """The checkpoint's HF processor, or None when it has no image processor. Built once;
+        a failed build is remembered so a text-only checkpoint does not retry per request."""
+        if self._processor_tried:
+            return self._processor
+        self._processor_tried = True
+        if self._dsv4_encoder is not None or not self.model_path:
+            return None
+        try:
+            from transformers import AutoProcessor
+
+            proc = AutoProcessor.from_pretrained(self.model_path)
+        except Exception as exc:  # noqa: BLE001 -- text-only checkpoints have no processor
+            logger.info("no image processor for this checkpoint (%s)", exc)
+            return None
+        if getattr(proc, "image_processor", None) is None or not getattr(proc, "image_token", None):
+            logger.info("checkpoint processor %s has no image support", type(proc).__name__)
+            return None
+        self._processor = proc
+        logger.info("image input enabled via %s", type(proc).__name__)
+        return proc
+
+    def _require_processor(self, msg: TokenizeMsg) -> Any:
+        proc = self._image_processor()
+        if proc is None:
+            raise ValueError("this model does not accept image input")
+        n_parts = _count_image_parts(msg.text)
+        if n_parts != len(msg.images or ()):
+            raise ValueError(
+                f"{n_parts} image content part(s) but {len(msg.images or ())} image(s) attached"
+            )
+        return proc
+
+    def _tokenize_multimodal(
+        self, msg: TokenizeMsg
+    ) -> Tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        """Render with the processor's template (it places one image token per
+        ``{"type": "image"}`` part) and let the processor expand each into the model's
+        placeholder run while producing the vision tensors. ``add_special_tokens=False``
+        for the same reason as the text path: the template already rendered bos."""
+        proc = self._require_processor(msg)
+        prompt = self._render(
+            msg.text, msg.tools, self._sanitize_effort(msg.chat_template_kwargs or {}), owner=proc
         )
+        images = [_open_image(b) for b in msg.images or ()]
+        out = proc(text=[prompt], images=[images], return_tensors="pt", add_special_tokens=False)
+        input_ids = out["input_ids"].view(-1).to(torch.int32)
+        mm = {
+            "pixel_values": out["pixel_values"].to(torch.float16).cpu(),
+            "image_position_ids": out["image_position_ids"].to(torch.int64).cpu(),
+        }
+        return input_ids, mm
 
     def _render(
         self,
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None,
         chat_template_kwargs: dict[str, Any],
+        owner: Any = None,
     ) -> str:
         """Raw render, no effort sanitation — the probe needs unsupported values
-        to actually reach the template so rejection is observable."""
+        to actually reach the template so rejection is observable. ``owner`` is what
+        applies the template: the tokenizer, or the checkpoint's processor for a
+        prompt with images (its template knows the image placeholder)."""
         if self._dsv4_encoder is not None:
+            if owner is not None:
+                raise ValueError("this model does not accept image input")
             return _apply_dsv4_chat_encoder(
                 self._dsv4_encoder, messages, tools, chat_template_kwargs
             )
@@ -108,7 +184,7 @@ class TokenizeManager:
             )
         if tools is not None:
             chat_template_kwargs = {**chat_template_kwargs, "tools": tools}
-        prompt = self.tokenizer.apply_chat_template(
+        prompt = (owner or self.tokenizer).apply_chat_template(
             messages,
             tokenize=False,
             add_generation_prompt=True,
@@ -167,6 +243,28 @@ class TokenizeManager:
         else:
             sanitized["reasoning_effort"] = mapped
         return sanitized
+
+
+def _count_image_parts(messages: Any) -> int:
+    if not isinstance(messages, list):
+        return 0
+    n = 0
+    for m in messages:
+        content = m.get("content") if isinstance(m, dict) else None
+        if isinstance(content, list):
+            n += sum(1 for p in content if isinstance(p, dict) and p.get("type") == "image")
+    return n
+
+
+def _open_image(data: bytes) -> Any:
+    try:
+        from PIL import Image
+    except ImportError as exc:  # pragma: no cover - environment-specific
+        raise ValueError("image input needs Pillow installed on the server") from exc
+    try:
+        return Image.open(io.BytesIO(data)).convert("RGB")
+    except Exception as exc:  # noqa: BLE001 -- a client's bad file is a request error
+        raise ValueError(f"could not decode image: {exc}") from exc
 
 
 def _load_dsv4_encoder_if_needed(tokenizer: PreTrainedTokenizerBase) -> ModuleType | None:

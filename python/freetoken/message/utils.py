@@ -32,10 +32,16 @@ def serialize_type(self) -> Dict:
     serialized = {}
 
     if isinstance(self, torch.Tensor):
-        assert self.dim() == 1, "we can only serialize 1D tensor for now"
+        # Any rank: the shape rides along and the decoder restores it. bfloat16 has no
+        # numpy dtype, so it travels as its int16 bit pattern and is viewed back on decode.
+        t = self.detach().contiguous().cpu()
+        dtype = str(t.dtype)
+        if t.dtype is torch.bfloat16:
+            t = t.view(torch.int16)
         serialized["__type__"] = "Tensor"
-        serialized["buffer"] = self.numpy().tobytes()
-        serialized["dtype"] = str(self.dtype)
+        serialized["buffer"] = t.numpy().tobytes()
+        serialized["dtype"] = dtype
+        serialized["shape"] = list(self.shape)
         return serialized
 
     # normal type
@@ -68,10 +74,13 @@ def deserialize_type(cls_map: Dict[str, Type], data: Dict) -> Any:
     if type_name == "Tensor":
         buffer = data["buffer"]
         dtype_str = data["dtype"].replace("torch.", "")
-        np_dtype = getattr(np, dtype_str)
         assert isinstance(buffer, bytes)
-        np_tensor = np.frombuffer(buffer, dtype=np_dtype)
-        return torch.from_numpy(np_tensor.copy())
+        if dtype_str == "bfloat16":
+            t = torch.from_numpy(np.frombuffer(buffer, dtype=np.int16).copy()).view(torch.bfloat16)
+        else:
+            t = torch.from_numpy(np.frombuffer(buffer, dtype=getattr(np, dtype_str)).copy())
+        shape = data.get("shape")  # absent on a message from an older peer: 1-D
+        return t.reshape(shape) if shape is not None else t
 
     cls = cls_map.get(type_name)
     if cls is None:
