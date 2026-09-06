@@ -146,14 +146,18 @@ class Qwen3_5GatedDeltaNet(BaseOP):
     def _conv_weight(self) -> torch.Tensor:
         return self.conv1d.weight.squeeze(1)  # [conv_dim, kernel] for the fused kernel
 
-    def _conv_prefill(self, conv_in, pool, cu_seqlens, cache_indices, has_initial_state) -> torch.Tensor:
+    def _conv_prefill(self, conv_in, pool, cu_seqlens, cache_indices, has_initial_state,
+                      max_seq_len: int | None = None) -> torch.Tensor:
         """Varlen causal conv (fused sgl_kernel) with silu; reads/updates each request's
         conv state in place by ``cache_indices`` slot. ``conv_in`` [total, conv_dim].
-        ``cu_seqlens`` / ``cache_indices`` / ``has_initial_state`` come from FLAMetadata."""
+        ``cu_seqlens`` / ``cache_indices`` / ``has_initial_state`` come from FLAMetadata.
+        ``max_seq_len``: the longest extend when the caller knows it (a one-request MTP verify
+        window: ``total``), so the Triton fallback needs no device->host read (graph capture)."""
         li = pool.local_index(self.layer_id)
         x = channels_first_copy(conv_in)  # [conv_dim, total]; the kernel writes silu(conv) in place
         out = causal_conv1d_varlen(x, self._conv_weight(), pool.conv_states[li],
-                                   cu_seqlens, cache_indices, has_initial_state)
+                                   cu_seqlens, cache_indices, has_initial_state,
+                                   max_seq_len=max_seq_len)
         return out.transpose(0, 1)  # [total, conv_dim]
 
     def _conv_decode(self, conv_in: torch.Tensor, table_idx: torch.Tensor, pool) -> torch.Tensor:
@@ -228,7 +232,8 @@ class Qwen3_5GatedDeltaNet(BaseOP):
                 pool.conv_states[li].index_select(0, fla.cache_indices.long()).clone() if spec else None
             )
             mixed = self._conv_prefill(
-                conv_in, pool, fla.cu_seqlens, fla.cache_indices, fla.has_initial_state)
+                conv_in, pool, fla.cu_seqlens, fla.cache_indices, fla.has_initial_state,
+                max_seq_len=total if spec else None)  # a verify window is one request
             # fla chunk handles GQA in-kernel: q/k stay at num_k_heads, v at num_v_heads.
             qf, kf, vf = torch.split(mixed, [self.key_dim, self.key_dim, self.value_dim], dim=-1)
             q = qf.reshape(1, total, self.num_k_heads, self.head_k_dim).to(dtype)

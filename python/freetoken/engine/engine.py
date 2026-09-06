@@ -375,6 +375,14 @@ class _SpecProfiler:
         self.steps = 0
 
 
+def _traceback_tail(exc: BaseException, lines: int = 14) -> str:
+    """The last frames of an exception's traceback (capture-failure diagnostics)."""
+    import traceback
+
+    tb = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__)).strip().splitlines()
+    return "\n".join(tb[-lines:])
+
+
 def _expand_sampling_args(args: BatchSamplingArgs, rows: int) -> BatchSamplingArgs:
     """Per-row sampling params for a verify window (one request, ``rows`` logits rows)."""
     if args.temperatures is None or args.temperatures.numel() == rows:
@@ -584,7 +592,10 @@ class Engine:
             sg = SpecVerifyGraph(self, rows)
             sg.capture()
         except Exception as exc:  # noqa: BLE001
-            logger.warning(f"--spec-mtp: verify-window graph capture failed, staying eager: {exc!r}")
+            logger.warning(
+                f"--spec-mtp: verify-window graph capture failed, staying eager: {exc!r}\n"
+                + _traceback_tail(exc)
+            )
             if self.moe_offload_cache is not None:
                 self.moe_offload_cache.reset()
             return
@@ -593,7 +604,10 @@ class Engine:
             try:
                 sg.capture_mtp()
             except Exception as exc:  # noqa: BLE001
-                logger.warning(f"--spec-mtp: draft-head graph capture failed, the head stays eager: {exc!r}")
+                logger.warning(
+                    f"--spec-mtp: draft-head graph capture failed, the head stays eager: {exc!r}\n"
+                    + _traceback_tail(exc)
+                )
                 sg.g_window = sg.g_chain = None
                 if self.moe_offload_cache is not None:
                     self.moe_offload_cache.reset()
