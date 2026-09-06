@@ -275,6 +275,20 @@ def _scratch_moe_preferred() -> bool:
 
 
 _SCRATCH_EXPERTS_PER_CHUNK = 32  # 32 experts x (2I x H + H x I) fp16 ~ 200 MB for Qwen3.5-35B-A3B
+_SCRATCH_BUFFERS: dict = {}
+
+
+def _scratch_buffer(name: str, shape, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
+    """One persistent buffer per (name, shape, dtype, device). The dequant scratches are
+    allocated once and reused across chunks, layers and requests instead of being freed and
+    re-allocated per chunk: on a full 6 GB card the caching allocator otherwise ends up
+    unmapping expandable segments while the copy / host-callback streams are still busy, which
+    surfaces as ``CUDA driver error: device not ready`` in whatever op allocates next."""
+    key = (name, tuple(int(d) for d in shape), dtype, str(device))
+    buf = _SCRATCH_BUFFERS.get(key)
+    if buf is None:
+        buf = _SCRATCH_BUFFERS[key] = torch.empty(shape, dtype=dtype, device=device)
+    return buf
 
 
 def _fused_experts_nvfp4_scratch(
@@ -317,8 +331,15 @@ def _fused_experts_nvfp4_scratch(
         if l_max == 0:
             continue
         slots = torch.arange(base, top, dtype=torch.int32, device=dev)
-        w_gu = dequant_nvfp4(gate_up_packed, gate_up_scale, gate_up_global, slots, dtype=dt)
-        w_d = dequant_nvfp4(down_packed, down_scale, down_global, slots, dtype=dt)
+        n = top - base
+        w_gu = dequant_nvfp4(
+            gate_up_packed, gate_up_scale, gate_up_global, slots,
+            out=_scratch_buffer("gate_up", (n, 2 * inter, H), dt, dev), dtype=dt,
+        )
+        w_d = dequant_nvfp4(
+            down_packed, down_scale, down_global, slots,
+            out=_scratch_buffer("down", (n, H, inter), dt, dev), dtype=dt,
+        )
         # padded route table for the chunk: pos[j, l] = the l-th route of expert base+j
         ar = torch.arange(l_max, device=dev)
         valid = ar[None, :] < counts[base:top, None]                       # [c, L]
@@ -334,7 +355,7 @@ def _fused_experts_nvfp4_scratch(
         y = torch.bmm(a, w_d.transpose(1, 2)).float()                      # [c, L, H]
         y = y * (valid[..., None] if apply_router_weight_on_input else rw[..., None])
         out.index_add_(0, tok.reshape(-1), y.reshape(-1, H))
-        del w_gu, w_d, x_pad, h, a, y
+        del x_pad, h, a, y
     return out.to(dt)
 
 
