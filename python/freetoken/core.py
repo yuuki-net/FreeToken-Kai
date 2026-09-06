@@ -232,6 +232,9 @@ class Context:
     # MTP verify forward: per-GDN-layer state stashes (see the model's GDN op) consumed by
     # the model's spec_rollback once the accepted length is known.
     spec_stash: list = field(default_factory=list)
+    # diagnostics (FT_SPEC_CHECK_STEP): when a list, the model appends (layer_id, residual
+    # stream) after every decoder layer of the active forward
+    debug_layer_outs: list | None = None
     _batch: Batch | None = field(default=None, init=False)
 
     @property

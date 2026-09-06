@@ -131,8 +131,11 @@ class Qwen3_5Model(BaseOP):
             mask = (input_ids == self._image_token_id).unsqueeze(-1)
             x = x.masked_scatter(mask, mm_embeds.to(x.dtype))
         residual: torch.Tensor | None = None
-        for layer in self.layers.op_list:
+        dbg = get_global_ctx().debug_layer_outs
+        for i, layer in enumerate(self.layers.op_list):
             x, residual = layer.forward(x, residual)
+            if dbg is not None:  # FT_SPEC_CHECK_STEP: the residual stream after layer i
+                dbg.append((i, (residual + x).detach().clone()))
         x, _ = self.norm.forward_add_residual(x, residual)
         self._last_hidden = x  # the MTP draft head reads the final hidden state (lm_head input)
         return x

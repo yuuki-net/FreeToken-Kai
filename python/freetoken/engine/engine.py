@@ -325,6 +325,10 @@ _MTP_EXPERT_RE = re.compile(r"^mtp\.layers\.0\.mlp\.experts\.(gate_up_proj|down_
 
 # FT_SPEC_TRACE=n: log the first n verify windows (ids, samples, drafts, top logits)
 _SPEC_TRACE_LEFT = [int(os.environ.get("FT_SPEC_TRACE", "0") or 0)]
+# FT_SPEC_CHECK_STEP=n: cross-check the first n one-row verify windows (FT_SPEC_MAX_DRAFTS=0)
+# against the plain decode path from the same state: per-layer residual stream, final logits,
+# and the GDN state each path leaves behind
+_SPEC_CHECK_STEP_LEFT = [int(os.environ.get("FT_SPEC_CHECK_STEP", "0") or 0)]
 # FT_SPEC_PROFILE=1: synchronize between the phases of a verify step and log their mean wall
 # time every 20 steps (the syncs themselves add a little, so read it as a breakdown, not a total)
 _SPEC_PROFILE = os.environ.get("FT_SPEC_PROFILE") == "1"
@@ -1130,6 +1134,11 @@ class Engine:
                 # single-request decode step runs eagerly instead
                 use_graph = False
         rows = batch.input_ids.numel() if batch.is_prefill else batch.size
+        # diagnostics: cross-check a one-row verify window against the plain decode path
+        check = _SPEC_CHECK_STEP_LEFT[0] > 0 and batch.spec_verify and rows == 1 and not use_graph
+        snap = self._spec_snapshot(batch.reqs[0]) if check else None
+        if check:
+            self.ctx.debug_layer_outs = []
         prof = None
         if _SPEC_PROFILE and batch.spec_verify:
             prof = self._spec_profiler
@@ -1140,6 +1149,9 @@ class Engine:
             logits = self.graph_runner.replay(batch) if use_graph else self.model.forward()
         if prof is not None:
             prof.mark("target_forward")
+        if check:
+            v_outs, self.ctx.debug_layer_outs = self.ctx.debug_layer_outs, None
+            v_final = logits[:rows].detach().clone()
         if self.cpu_moe_executor is not None:
             # One pinned read: surfaces a fired flag-handshake watchdog (dead coordinator
             # -> stale expert outputs) as a loud error instead of silent corruption.
@@ -1194,9 +1206,115 @@ class Engine:
                 next_tokens_cpu = next_tokens_gpu.to("cpu", non_blocking=True)
         if prof is not None and batch.spec_verify:
             prof.step()
+        if check:
+            _SPEC_CHECK_STEP_LEFT[0] -= 1
+            self._spec_check_step(batch, snap, v_outs, v_final)
         copy_done_event = torch.cuda.Event()
         copy_done_event.record(self.stream)
         return ForwardOutput(next_tokens_gpu, next_tokens_cpu, copy_done_event, spec_res)
+
+    # ------------------------------------------------------------------ spec diagnostics
+    def _spec_slot(self, req: Req) -> int:
+        return req.linear_slot_idx if req.linear_slot_idx is not None else req.table_idx
+
+    def _spec_snapshot(self, req: Req) -> dict:
+        """Copy the per-request GDN slot state (recurrent + conv, plus any slot states) so the
+        plain decode path can be replayed from the same point."""
+        pool = self.linear_state_pool
+        slot = self._spec_slot(req)
+        snap: dict = {"slot": slot}
+        if pool is not None:
+            snap["rec"] = pool.recurrent_states[:, slot].clone()
+            snap["conv"] = pool.conv_states[:, slot].clone()
+            for name, t in pool.slot_states.items():
+                snap["ss:" + name] = t[:, slot].clone()
+        return snap
+
+    def _spec_restore(self, snap: dict) -> None:
+        pool = self.linear_state_pool
+        if pool is None:
+            return
+        slot = snap["slot"]
+        pool.recurrent_states[:, slot] = snap["rec"]
+        pool.conv_states[:, slot] = snap["conv"]
+        for name, t in pool.slot_states.items():
+            t[:, slot] = snap["ss:" + name]
+
+    def _spec_state_digest(self, req: Req) -> dict:
+        """The GDN recurrent + conv state of every linear layer for this request (clones)."""
+        d: dict = {}
+        pool = self.linear_state_pool
+        if pool is not None:
+            slot = self._spec_slot(req)
+            for li in range(pool.recurrent_states.shape[0]):
+                d[f"rec{li}"] = pool.recurrent_states[li, slot].clone()
+                d[f"conv{li}"] = pool.conv_states[li, slot].clone()
+        return d
+
+    def _spec_check_step(self, batch: Batch, snap: dict, v_outs: list, v_final: torch.Tensor) -> None:
+        """FT_SPEC_CHECK_STEP: after a one-row verify window (verified + rolled back), rewind the
+        slot state and run the same token through the plain decode path (eager, phase 'decode');
+        log the per-layer divergence of the residual stream, of the final logits, and of the GDN
+        state the two paths leave behind. The plain path's state stays (both are the state after
+        this token)."""
+        from types import SimpleNamespace
+
+        from freetoken.attention.linear import build_fla_metadata
+
+        req = batch.reqs[0]
+        pos = int(batch.positions[0].item())
+        token = int(batch.input_ids[0].item())
+        state_v = self._spec_state_digest(req)  # what the verify path + rollback left behind
+        self._spec_restore(snap)
+        proxy = SimpleNamespace(
+            table_idx=req.table_idx, extend_len=1, device_len=pos + 1, cached_len=pos,
+            linear_slot_idx=req.linear_slot_idx, uid=req.uid, mm_embeds=None,
+            mamba_restore_src=None, mamba_ping_pong=None, decode_batch_idx=0,
+            input_ids=req.input_ids, mm_rope=getattr(req, "mm_rope", None),
+        )
+        mini = Batch(reqs=[proxy], phase="decode")
+        mini.padded_reqs = [proxy]
+        mini.positions = torch.tensor([pos], dtype=torch.int32, device=self.device)
+        rope = getattr(req, "mm_rope", None)
+        if rope is not None and int(rope.delta):
+            mini.rope_positions = torch.tensor([pos + int(rope.delta)], dtype=torch.int32, device=self.device)
+        mini.input_ids = torch.tensor([token], dtype=torch.int32, device=self.device)
+        mini.out_loc = self.page_table[req.table_idx, pos : pos + 1]
+        mini.active_table_idx = torch.tensor([req.table_idx], dtype=torch.int32, device=self.device)
+        if self.linear_state_pool is not None:
+            mini.linear_table_idx = torch.tensor([snap["slot"]], dtype=torch.int32, device=self.device)
+            mini.fla_metadata = build_fla_metadata(mini, self.device)
+        self.attn_backend.prepare_metadata(mini)
+        self.ctx.debug_layer_outs = []
+        with self.ctx.forward_batch(mini), self.model.forward_host_ctx(mini, False):
+            out = self.model.forward()
+        d_outs, self.ctx.debug_layer_outs = self.ctx.debug_layer_outs, None
+        state_d = self._spec_state_digest(req)  # what the plain decode path leaves behind
+        groups: dict[str, list[str]] = {}
+        for name, dv in state_v.items():
+            dd = state_d.get(name)
+            if dd is None:
+                continue
+            a, b = dv.float().reshape(-1), dd.float().reshape(-1)
+            grp = name.rstrip("0123456789")
+            groups.setdefault(grp, []).append(
+                f"{name[len(grp):]}={(a - b).abs().max().item():.0e}/{b.abs().max().item():.0e}"
+            )
+        logger.warning(
+            f"spec state diff pos={pos} (verify+rollback vs decode, max|diff|/max|decode| per GDN layer): "
+            + " | ".join(f"{g}: " + " ".join(v) for g, v in groups.items())
+        )
+        parts = []
+        for (i, a), (_j, b) in zip(v_outs, d_outs):
+            a, b = a.float().reshape(-1), b.float().reshape(-1)
+            parts.append(f"L{i}:{(a - b).abs().max().item():.1e}/{b.abs().max().item():.1e}")
+        a, b = v_final.float().reshape(-1), out[:1].float().reshape(-1)
+        msg = (
+            f"final:{(a - b).abs().max().item():.1e}/{b.abs().max().item():.1e}"
+            f" top3 verify={a.topk(3).indices.tolist()} decode={b.topk(3).indices.tolist()}"
+            f" argmax_equal={bool(a.argmax() == b.argmax())}"
+        )
+        logger.warning(f"spec step check pos={pos} tok={token} {msg} | " + " ".join(parts))
 
     # ------------------------------------------------------------------ MTP draft head
     def _mtp_draft(
