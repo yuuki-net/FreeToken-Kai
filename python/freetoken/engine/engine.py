@@ -534,6 +534,7 @@ class Engine:
 
         post_free_memory = self._sync_get_memory()[0]
         logger.info_rank0(f"Free memory after initialization: {mem_GB(post_free_memory)}")
+        self._preallocate_prefill_scratch(config)
 
         # ======================= Graph capture initialization ========================
         self.dummy_req = Req(
@@ -579,6 +580,34 @@ class Engine:
     @staticmethod
     def _premap_enabled() -> bool:
         return os.environ.get("FREETOKEN_PREMAP_VRAM") == "1"
+
+    def _preallocate_prefill_scratch(self, config: EngineConfig) -> None:
+        """Below Ampere the prefill paths dequantize into persistent scratches (MoE experts in
+        chunks, fp8 projections). Take them now, with the pools sized and the GPU idle, instead
+        of inside the first prefill: on a full card under WSL2 the allocator's segment growth
+        under load failed intermittently with ``CUDA driver error: device not ready``."""
+        from freetoken.kernel.triton.fp8_pertensor_linear import _scratch_gemm_preferred
+        from freetoken.moe.fused_nvfp4 import _scratch_moe_preferred
+
+        mc = config.model_config
+        taken = 0
+        torch.cuda.synchronize(self.device)
+        if _scratch_moe_preferred() and getattr(mc, "expert_quant", "none") == "nvfp4" and mc.moe_enabled:
+            from freetoken.moe.fused_nvfp4 import preallocate_scratch
+
+            taken += preallocate_scratch(mc.hidden_size, mc.moe_intermediate_size, self.dtype, self.device)
+        if _scratch_gemm_preferred():
+            fp8 = [t.numel() for t in self.model.state_dict().values() if t.dtype == torch.float8_e4m3fn]
+            if fp8:
+                from freetoken.kernel.triton.fp8_pertensor_linear import preallocate_scratch as prealloc_fp8
+
+                taken += prealloc_fp8(max(fp8), self.dtype, self.device)
+        if taken:
+            torch.cuda.synchronize(self.device)
+            logger.info(
+                f"pre-Ampere prefill scratches allocated: {mem_GB(taken)} "
+                f"(free {mem_GB(torch.cuda.mem_get_info(self.device)[0])})"
+            )
 
     def _premap_vram(self) -> None:
         """Opt-in (``FREETOKEN_PREMAP_VRAM=1``): once every pool and graph exists, take all but
