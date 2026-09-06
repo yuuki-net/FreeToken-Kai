@@ -985,6 +985,54 @@ class OffloadMoeCache:
             "norm_entropy": norm_ent,
         }
 
+    # ----- non-pinned layers: staged whole-layer copy -------------------------------------
+    def _staging(self):
+        """Two pinned staging buffers (``FREETOKEN_STAGED_COPY_MB`` each, default 32) and their
+        DMA-done events, allocated on first use."""
+        st = getattr(self, "_stage", None)
+        if st is None:
+            from freetoken.kernel.pinned import alloc_pinned_tensor
+
+            mb = int(os.environ.get("FREETOKEN_STAGED_COPY_MB", "32") or 32)
+            size = max(1, mb) << 20
+            bufs = [alloc_pinned_tensor(size, dtype=torch.uint8) for _ in range(2)]
+            events = [torch.cuda.Event() for _ in range(2)]
+            st = self._stage = (bufs, events, size)
+        return st
+
+    def _staged_h2d(self, dst: torch.Tensor, src: torch.Tensor) -> None:
+        """Host -> device copy of a whole bank layer that lives in non-pinned (LOCKED or
+        PAGEABLE) memory. A plain pageable ``copy_`` serialises the driver's internal memcpy
+        and the DMA and ran at ~1.7 GB/s on an RTX 2060 under WSL2 (about 5 s of every prefill
+        chunk for 19 CPU-side layers of Ornith). Here the layer goes through two pinned staging
+        buffers: the CPU copies piece i+1 into one buffer (multi-threaded ``copy_``) while the
+        DMA of piece i drains the other on the current stream. ``FREETOKEN_STAGED_COPY=0``
+        restores the plain copy."""
+        if (
+            dst.device.type != "cuda"
+            or src.is_pinned()
+            or os.environ.get("FREETOKEN_STAGED_COPY") == "0"
+        ):
+            dst.copy_(src)
+            return
+        d = dst.reshape(-1).view(torch.uint8)
+        s = src.reshape(-1).view(torch.uint8)
+        assert d.numel() == s.numel(), (dst.shape, src.shape, dst.dtype, src.dtype)
+        bufs, events, size = self._staging()
+        stream = torch.cuda.current_stream(dst.device)
+        n = d.numel()
+        off = 0
+        i = 0
+        while off < n:
+            m = min(size, n - off)
+            events[i].synchronize()  # the DMA that last read this buffer is done
+            stage = bufs[i][:m]
+            stage.copy_(s[off : off + m])  # host memcpy into pinned memory
+            d[off : off + m].copy_(stage, non_blocking=True)  # async DMA on the stream
+            events[i].record(stream)
+            off += m
+            i ^= 1
+
     def copy_missing(self) -> None:
         assert self.banks, "set_bank_sources must register the banks first"
         layer_id = self._pending_src_layer
@@ -996,10 +1044,10 @@ class OffloadMoeCache:
                     f"pageable materialize (position == expert id); ensure_experts's "
                     f"LRU slot remap cannot be honored without a device alias"
                 )
-            # the only copy a non-pinned layer ever needs is the non-overlap prefill materialize, which schedules the whole layer into slots [0, num_experts) with position == expert id -- a plain synchronous pageable H2D copy
+            # the only copy a non-pinned layer ever needs is the non-overlap prefill materialize, which schedules the whole layer into slots [0, num_experts) with position == expert id
             # never CUDA-graph captured: prefill is not captured, and decode never reaches this branch (it routes to the CPU executor)
             for per_layer, cache in self.banks:
-                cache[: self.num_experts].copy_(per_layer[layer_id])
+                self._staged_h2d(cache[: self.num_experts], per_layer[layer_id])
             return
         if self._copy_fused_ok:
             from freetoken.kernel.fast_index_copy import fast_index_copy_multi_jit
