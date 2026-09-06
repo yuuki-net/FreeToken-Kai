@@ -70,6 +70,7 @@ class Qwen3_5DecoderLayer(BaseOP):
 
 class Qwen3_5Model(BaseOP):
     def __init__(self, config: ModelConfig):
+        self._image_token_id = config.image_token_id
         self.embed_tokens = VocabParallelEmbedding(
             num_embeddings=config.vocab_size,
             embedding_dim=config.hidden_size,
@@ -81,6 +82,12 @@ class Qwen3_5Model(BaseOP):
 
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
         x = self.embed_tokens.forward(input_ids)
+        mm_embeds = getattr(get_global_ctx().batch, "mm_embeds", None)
+        if mm_embeds is not None and self._image_token_id is not None:
+            # image soft tokens (vision tower + merger output, already in the text width)
+            # replace the placeholder embeddings; the count was checked at admission
+            mask = (input_ids == self._image_token_id).unsqueeze(-1)
+            x = x.masked_scatter(mask, mm_embeds.to(x.dtype))
         residual: torch.Tensor | None = None
         for layer in self.layers.op_list:
             x, residual = layer.forward(x, residual)

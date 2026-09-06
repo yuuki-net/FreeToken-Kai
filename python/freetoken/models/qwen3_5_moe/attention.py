@@ -63,7 +63,13 @@ class Qwen3_5Attention(BaseOP):
     def _project(self, x: torch.Tensor):
         """Returns (q, k, v, gate): q [N, num_q, head_dim] post qk-norm+rope,
         k [N, num_kv*head_dim] post norm+rope, v [N, num_kv*head_dim], gate [N, num_q*head_dim]."""
-        positions = get_global_ctx().batch.positions
+        batch = get_global_ctx().batch
+        # M-RoPE (image prompts): the prefill ropes from the request's own cos/sin table
+        # (indexed by logical position); tokens after the images rope at logical + delta.
+        # Text-only prompts leave both None, which is the plain path.
+        table = getattr(batch, "rope_cos_sin", None)
+        rope_pos = getattr(batch, "rope_positions", None)
+        positions = batch.positions if table is not None or rope_pos is None else rope_pos
         qkv = self.qkv_proj.forward(x)
         qg, k, v = torch.split(qkv, self._qkv_split, dim=-1)
         qg = qg.view(-1, self.num_q, self.head_dim * 2)
@@ -73,7 +79,7 @@ class Qwen3_5Attention(BaseOP):
         v = v.contiguous()  # split view has the qkv row stride; the KV store needs contiguous
         q = self.q_norm.forward(q).reshape(-1, self.qo_attn_dim)
         k = self.k_norm.forward(k).reshape(-1, self.kv_attn_dim)
-        q, k = self.rotary.forward(positions, q, k)
+        q, k = self.rotary.forward(positions, q, k, cos_sin_cache=table)
         return q.view(-1, self.num_q, self.head_dim), k, v, gate
 
     def _combine(self, attn_out: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:

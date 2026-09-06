@@ -85,9 +85,12 @@ class _QwenHostEncoder:
 
 
 def build_host_image_encoder(model_path: str | None) -> Any | None:
-    if not model_path or _model_type(model_path) != "qwen4_exp":
+    """A CPU vision tower for the checkpoint, or None when its model_type has none here
+    (Qwen3.8-Flash-Next and the Qwen3.5-MoE family -- Qwen3.6-35B-A3B, Ornith-1.5 -- do)."""
+    from freetoken.models.qwen4_exp.vision_cpu import HOST_VISION_MODEL_TYPES, Qwen4ExpCpuVision
+
+    if not model_path or _model_type(model_path) not in HOST_VISION_MODEL_TYPES:
         return None
-    from freetoken.models.qwen4_exp.vision_cpu import Qwen4ExpCpuVision
 
     logger.info("loading the vision tower on the CPU for image input (%s)", model_path)
     tower = Qwen4ExpCpuVision.from_checkpoint(model_path)

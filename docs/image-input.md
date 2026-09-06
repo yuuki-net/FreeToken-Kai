@@ -45,5 +45,16 @@ Qwen3-VL processor config, so the same request shape works there too, with two d
   rope at `Batch.rope_positions` (a static input of the decode graph). Text-only prompts are
   bit-for-bit the old path.
 
+## Qwen3.5-MoE family (Qwen3.6-35B-A3B, Ornith-1.5-35B-A3B)
+
+The NVFP4 repacks of these checkpoints keep the vision tower (`model.visual.*`, bf16, 333
+tensors), the Qwen3-VL processor config and an image-aware chat template, and their text
+side uses the same M-RoPE parameters as Flash-Next (interleaved sections `[11, 11, 10]`,
+partial rotary 0.25, no DeepStack). The Flash-Next path above therefore applies unchanged:
+transformers' `Qwen3_5MoeVisionModel` runs on the CPU in the tokenizer worker, the model
+scatters the soft tokens at `image_token_id` (248056) and ropes the full-attention layers
+from the request's table / at `logical + delta`. The GDN layers carry no rope. A checkpoint
+with non-empty `deepstack_visual_indexes` is refused (not implemented).
+
 Not covered: video, the Anthropic / Responses adapters (text-only, image blocks are dropped
 as before), and speculative decoding with image prompts.

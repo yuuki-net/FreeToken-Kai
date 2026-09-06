@@ -196,12 +196,17 @@ def parse_config(hf_config: Any) -> ModelConfig:
     full_ids = tuple(i for i, t in enumerate(layer_types) if t == "full_attention")
     linear_ids = tuple(i for i, t in enumerate(layer_types) if t == "linear_attention")
 
+    # M-RoPE sections ride along for image prompts (the scheduler builds their cos/sin table
+    # from them); text-only prompts never look at them.
+    mrope_section = rope_params.get("mrope_section")
     full_rotary = RotaryConfig(
         head_dim=head_dim,
         rotary_dim=rotary_dim,
         max_position=text.max_position_embeddings,
         base=rope_theta,
         scaling=rope_scaling,
+        mrope_section=tuple(int(s) for s in mrope_section) if mrope_section else None,
+        mrope_interleaved=bool(rope_params.get("mrope_interleaved", True)),
     )
     full_group = FullAttentionGroupConfig(
         name="full",

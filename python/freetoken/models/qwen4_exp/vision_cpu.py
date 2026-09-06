@@ -1,9 +1,10 @@
-"""Qwen3.8-Flash-Next vision tower on the CPU.
+"""Qwen vision tower on the CPU (Qwen3.8-Flash-Next and the Qwen3.5-MoE family).
 
-The checkpoint ships ``model.visual.*`` in bf16 (~0.9 GB); the GPU budget on a 12 GB card
-has no room for it, and one image is a few seconds of CPU work, so the tower runs in the
-tokenizer worker with transformers' own ``Qwen4ExpVisionModel`` (no reimplementation) and
-hands the scheduler already-projected soft tokens (``[num_soft_tokens, text_hidden]``).
+These checkpoints ship ``model.visual.*`` in bf16 (~0.9 GB); the GPU budget on a 12 GB (or
+6 GB) card has no room for it, and one image is a few seconds of CPU work, so the tower runs
+in the tokenizer worker with transformers' own vision module (no reimplementation) and hands
+the scheduler already-projected soft tokens (``[num_soft_tokens, text_hidden]``). The text
+model then only scatters them at the placeholder rows and ropes with M-RoPE positions.
 """
 
 from __future__ import annotations
@@ -16,6 +17,26 @@ from typing import Any, Dict, Iterable
 import torch
 
 VISUAL_PREFIXES = ("model.visual.", "visual.")
+
+# HF model_type -> (module, class) of the vision tower transformers implements for it.
+_VISION_CLASSES = {
+    "qwen4_exp": ("transformers.models.qwen4_exp.modeling_qwen4_exp", "Qwen4ExpVisionModel"),
+    "qwen3_5_moe": ("transformers.models.qwen3_5_moe.modeling_qwen3_5_moe", "Qwen3_5MoeVisionModel"),
+}
+HOST_VISION_MODEL_TYPES = tuple(_VISION_CLASSES)
+
+
+def vision_model_class(model_type: str):
+    """The transformers vision tower class for ``model_type`` (ValueError if unsupported)."""
+    import importlib
+
+    try:
+        module, name = _VISION_CLASSES[model_type]
+    except KeyError:
+        raise ValueError(
+            f"no CPU vision tower for model_type {model_type!r} (supported: {HOST_VISION_MODEL_TYPES})"
+        ) from None
+    return getattr(importlib.import_module(module), name)
 
 
 def load_prefixed_state(
@@ -55,7 +76,8 @@ def load_prefixed_state(
 
 
 class Qwen4ExpCpuVision:
-    """The HF vision tower + merger, resident on the CPU."""
+    """The HF vision tower + merger, resident on the CPU (any model_type in
+    ``HOST_VISION_MODEL_TYPES``; the name predates the Qwen3.5-MoE support)."""
 
     def __init__(self, model: Any, spatial_merge_size: int, dtype: torch.dtype) -> None:
         self.model = model
@@ -65,14 +87,17 @@ class Qwen4ExpCpuVision:
     @classmethod
     def from_checkpoint(cls, model_path: str, dtype: torch.dtype = torch.float32) -> "Qwen4ExpCpuVision":
         from transformers import AutoConfig
-        from transformers.models.qwen4_exp.modeling_qwen4_exp import Qwen4ExpVisionModel
 
         hf = AutoConfig.from_pretrained(model_path)
         vc = getattr(hf, "vision_config", None)
         if vc is None:
             raise ValueError(f"{model_path}: config has no vision_config")
+        if getattr(vc, "deepstack_visual_indexes", None):
+            # DeepStack injects vision features into several early decoder layers; this path
+            # only scatters the merger output at the placeholder rows.
+            raise ValueError(f"{model_path}: DeepStack vision (deepstack_visual_indexes) is not supported")
         vc._attn_implementation = "sdpa"
-        model = Qwen4ExpVisionModel(vc).to(dtype).eval()
+        model = vision_model_class(getattr(hf, "model_type", "")) (vc).to(dtype).eval()
         model.load_state_dict(load_prefixed_state(model_path), strict=True)
         return cls(model, vc.spatial_merge_size, dtype)
 
@@ -84,4 +109,13 @@ class Qwen4ExpCpuVision:
         return out.pooler_output.to(torch.bfloat16).contiguous()
 
 
-__all__ = ["Qwen4ExpCpuVision", "load_prefixed_state", "VISUAL_PREFIXES"]
+CpuVisionTower = Qwen4ExpCpuVision
+
+__all__ = [
+    "CpuVisionTower",
+    "HOST_VISION_MODEL_TYPES",
+    "Qwen4ExpCpuVision",
+    "VISUAL_PREFIXES",
+    "load_prefixed_state",
+    "vision_model_class",
+]
