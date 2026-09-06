@@ -138,6 +138,8 @@ setups as a correctness-verified feature, not a speed-up.
 | `FREETOKEN_FP8_SCRATCH_GEMM` | arch (on below Ampere) | fp8 W8A16 prefill GEMM as dequant + cuBLAS instead of the inline-dequant Triton kernel |
 | `FREETOKEN_NVFP4_MOE_SCRATCH` | arch (on below Ampere) | NVFP4 prefill MoE as chunked dequant + per-expert cuBLAS instead of the inline-dequant kernel |
 | `FREETOKEN_NVFP4_MOE_ARITH` | arch (on below Ampere) | Arithmetic (gather-free) e2m1 dequant in the prefill MoE kernel; bit-identical, speed knob only |
+| `FREETOKEN_CPU_PREFILL_MAX_TOKENS` | `256` | Prefill extends up to this many rows compute their routed experts on the CPU executor (offload/hybrid) instead of streaming every layer's bank; `0` disables |
+| `FREETOKEN_STAGED_COPY` / `FREETOKEN_STAGED_COPY_MB` | on / `32` | Whole-layer prefill copies of non-pinned bank layers go through two pinned staging buffers of this size |
 | `FT_SPEC_TRACE` | `0` | Log the first n verify windows of `--spec-mtp` (input ids, drafts, samples, accepted, next drafts, top-3 logits) |
 | `FT_SPEC_PROFILE` | off | Per-phase wall time of the verify step (target forward, sample, rollback, head window, head chain), logged every 20 steps |
 | `FT_SPEC_PLAIN` | off | Drafts are produced but never verified (plain decode; measures the head's own cost) |
@@ -154,9 +156,11 @@ setups as a correctness-verified feature, not a speed-up.
   yet) and reads the head from modelopt MIXED_PRECISION checkpoints only.
 - Image prompts bypass the shared prefix cache (by upstream design), so a conversation with images
   is prefilled in full every turn.
-- On Turing, use `--dtype float16`. Prefill has a fixed cost of ~5 s per chunk on the 2060 under
-  WSL (the experts of the CPU-side layers are streamed from pageable host memory each chunk);
-  beyond that it is ~1.3 ms per token.
+- On Turing, use `--dtype float16`. A long prefill chunk costs ~5 s of expert streaming on the
+  2060 under WSL (every layer's bank crosses PCIe at ~3.4 GB/s) plus ~1.3 ms per token; extends
+  of up to `FREETOKEN_CPU_PREFILL_MAX_TOKENS` (256) rows -- a chat turn behind a cached prefix
+  -- skip the streaming and compute their experts on the CPU executor instead (a follow-up
+  turn answers in 2-3 s including 64 generated tokens, against ~6 s before).
 - Under WSL2 on a full 6 GB card, PyTorch's expandable-segment allocator intermittently died
   with `CUDA driver error: device not ready` when it had to release cached segments while
   other streams were busy. The Turing prefill scratches (MoE dequant chunks, fp8 dequant) are
