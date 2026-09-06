@@ -60,6 +60,7 @@ class TokenizeManager:
         # the first request that carries images; None when the checkpoint has none.
         self._processor: Any = None
         self._processor_tried = False
+        self._processor_error: str | None = None  # why it could not be built (missing library)
         # Host-side vision encoder for checkpoints whose tower runs on the CPU (Qwen4Exp);
         # None when the engine encodes images itself or the model has none.
         self._host_encoder: Any = None
@@ -126,11 +127,19 @@ class TokenizeManager:
             except Exception as exc:  # noqa: BLE001
                 if "torchvision" not in str(exc).lower():
                     raise
-                # the torch image backend needs torchvision; every Qwen-VL family processor
-                # also ships a PIL backend
-                proc = AutoProcessor.from_pretrained(self.model_path, use_fast=False)
+                # the torch image backend needs torchvision; the Qwen-VL family also ships a
+                # PIL backend (older transformers spell the switch use_fast=False)
+                try:
+                    proc = AutoProcessor.from_pretrained(self.model_path, backend="pil")
+                except Exception:  # noqa: BLE001
+                    proc = AutoProcessor.from_pretrained(self.model_path, use_fast=False)
         except Exception as exc:  # noqa: BLE001 -- text-only checkpoints have no processor
-            logger.info("no image processor for this checkpoint (%s)", exc)
+            reason = " ".join(str(exc).split())[:300]
+            # a missing library is the server's problem, not a text-only checkpoint: keep the
+            # reason so the request's error says what to install
+            if any(w in reason.lower() for w in ("torchvision", "pil ", "pillow", "pil library")):
+                self._processor_error = reason
+            logger.info("no image processor for this checkpoint (%s)", reason)
             return None
         if getattr(proc, "image_processor", None) is None or not getattr(proc, "image_token", None):
             logger.info("checkpoint processor %s has no image support", type(proc).__name__)
@@ -142,7 +151,11 @@ class TokenizeManager:
     def _require_processor(self, msg: TokenizeMsg) -> Any:
         proc = self._image_processor()
         if proc is None:
-            raise ValueError("this model does not accept image input")
+            detail = self._processor_error
+            raise ValueError(
+                "this model does not accept image input"
+                + (f" (image processor unavailable on the server: {detail})" if detail else "")
+            )
         n_parts = _count_image_parts(msg.text)
         if n_parts != len(msg.images or ()):
             raise ValueError(
