@@ -13,6 +13,8 @@
 
 Unlock datacenter-class intelligence on the hardware you already own — Run 290B+ frontier MoE models locally on your gaming PC at blistering interactive speeds.
 
+> **FreeToken Kai (改)** is an unofficial fork of [FlashML-org/FreeToken](https://github.com/FlashML-org/FreeToken) (upstream `main` at `af71ba4`). It adds **image input** over the OpenAI API for Qwen3.8-Flash-Next and the Qwen3.5-MoE family (Qwen3.6-35B-A3B, Ornith-1.5-35B-A3B) with the vision tower on the CPU, and it **runs on Turing (RTX 20 series, sm_75)**: a 35B-A3B MoE decodes at 20+ tok/s on an RTX 2060 6 GB. Not affiliated with or supported by FlashML. The changes were written by Claude Fable 5.1 (Anthropic) at the request of the fork's maintainer, who tested them on the hardware listed in [docs/kai.md](docs/kai.md). Turing details: [docs/turing.md](docs/turing.md). Image input: [docs/image-input.md](docs/image-input.md).
+
 ## About
 
 FreeToken is an edge-native Mixture-of-Experts (MoE) serving engine designed for running frontier-scale open-weight models on personal and consumer hardware. It treats heterogeneous edge resources—GPUs, CPUs, host memory, and interconnects—as a unified, elastic inference platform. Its core features include:  
