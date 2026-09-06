@@ -355,6 +355,9 @@ class ModelConfig:
     # MTP draft head served as decoder layer ``mtp_layer_id`` (== num_layers): it joins the
     # full-attention group for KV allocation and the model builds the head. None = no head.
     mtp_layer_id: int | None = None
+    # --host-embedding: the input embedding table stays in pinned host memory (rows gathered by
+    # the GPU in place over PCIe); models that support it build ``HostEmbedding``.
+    embed_host: bool = False
 
     @property
     def is_moe(self) -> bool:

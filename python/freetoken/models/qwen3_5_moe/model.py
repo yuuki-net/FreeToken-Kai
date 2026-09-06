@@ -7,6 +7,7 @@ from freetoken.core import get_global_ctx
 from freetoken.layers import (
     BaseOP,
     GemmaRMSNorm,
+    HostEmbedding,
     LinearReplicated,
     OPList,
     ParallelLMHead,
@@ -113,10 +114,15 @@ class Qwen3_5MTP(BaseOP):
 class Qwen3_5Model(BaseOP):
     def __init__(self, config: ModelConfig):
         self._image_token_id = config.image_token_id
-        self.embed_tokens = VocabParallelEmbedding(
-            num_embeddings=config.vocab_size,
-            embedding_dim=config.hidden_size,
-        )
+        if getattr(config, "embed_host", False):
+            # --host-embedding: the table stays in pinned host memory, rows gathered in place
+            assert not config.tie_word_embeddings, "host embedding needs an untied lm_head"
+            self.embed_tokens = HostEmbedding(config.vocab_size, config.hidden_size)
+        else:
+            self.embed_tokens = VocabParallelEmbedding(
+                num_embeddings=config.vocab_size,
+                embedding_dim=config.hidden_size,
+            )
         self.layers = OPList(
             [Qwen3_5DecoderLayer(config, layer_id) for layer_id in range(config.num_layers)]
         )
@@ -167,6 +173,14 @@ class Qwen3_5MoEForCausalLM(BaseLLMModel):
                 tied_embedding=self.model.embed_tokens if config.tie_word_embeddings else None,
             )
         super().__init__()
+
+    @property
+    def host_resident_prefixes(self) -> tuple[str, ...]:
+        """State-dict key prefixes the engine materializes in pinned host memory instead of on
+        the device (the input embedding table under --host-embedding)."""
+        if getattr(self.model.embed_tokens, "host_resident", False):
+            return ("model.embed_tokens.",)
+        return ()
 
     @property
     def last_hidden(self) -> torch.Tensor:

@@ -57,6 +57,42 @@ class VocabParallelEmbedding(BaseOP):
         return y
 
 
+class HostEmbedding(BaseOP):
+    """An input embedding table that lives in pinned + mapped host memory; the GPU gathers the
+    looked-up rows in place over PCIe (``kernel/triton/host_embed``), inside CUDA graphs like
+    any other kernel. Frees the table's VRAM (1 GB for a 250k x 2048 fp16 vocabulary) for KV
+    pages on small cards. The engine materializes the keys under ``host_resident_prefixes`` in
+    pinned host memory (see ``_materialize_loaded_weight_state_dict``). TP=1, untied only."""
+
+    host_resident = True
+
+    def __init__(self, num_embeddings: int, embedding_dim: int):
+        super().__init__()
+        assert get_tp_info().size == 1, "host embedding is TP=1 only"
+        self.num_embeddings = num_embeddings
+        self.embedding_dim = embedding_dim
+        self.weight = torch.empty(num_embeddings, embedding_dim)
+        self._table_ptr: int | None = None
+
+    def _ptr(self) -> int:
+        if self._table_ptr is None:
+            from freetoken.kernel.pinned import device_ptr
+
+            w = self.weight
+            assert not w.is_cuda and w.is_pinned(), "host embedding table must be pinned host memory"
+            self._table_ptr = device_ptr(w)
+        return self._table_ptr
+
+    @nvtx_annotate("Embedding")
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        from freetoken.kernel.triton.host_embed import host_gather_rows
+
+        ids = x.reshape(-1)
+        out = torch.empty(ids.numel(), self.embedding_dim, dtype=self.weight.dtype, device=x.device)
+        host_gather_rows(self._ptr(), self.num_embeddings, self.embedding_dim, ids, out)
+        return out.view(*x.shape, self.embedding_dim)
+
+
 class ParallelLMHead(VocabParallelEmbedding):
     def __init__(
         self,

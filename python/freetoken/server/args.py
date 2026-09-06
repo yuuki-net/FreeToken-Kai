@@ -235,6 +235,17 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--host-embedding",
+        action="store_true",
+        default=False,
+        help=(
+            "Keep the input embedding table in pinned host memory; the GPU gathers the rows it "
+            "needs in place over PCIe (also inside CUDA graphs). Frees the table's VRAM (about "
+            "1 GB for a 250k x 2048 vocabulary) for KV pages on small cards. Qwen3.5-MoE family."
+        ),
+    )
+
+    parser.add_argument(
         "--spec-mtp",
         type=int,
         default=0,

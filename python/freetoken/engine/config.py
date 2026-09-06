@@ -81,6 +81,9 @@ class EngineConfig:
     # (the checkpoint's mtp.* block) is built as one extra full-attention layer (id =
     # num_layers) with its own KV slab and one extra expert-bank layer. Single request.
     spec_mtp: int = 0
+    # --host-embedding: keep the input embedding table in pinned host memory (the GPU gathers
+    # rows in place); ~1 GB of VRAM back for KV pages on a 250k-vocabulary model.
+    host_embedding: bool = False
     max_seq_len_override: int | None = None
     num_page_override: int | None = None  # if not None, will override the number of pages
     # KV capacity in tokens; resolved into num_page_override by _adjust_config once page_size
@@ -101,6 +104,10 @@ class EngineConfig:
 
             # the draft head joins the full-attention group as layer num_layers
             config = with_mtp_layer(config, config.num_layers)
+        if self.host_embedding:
+            from dataclasses import replace
+
+            config = replace(config, embed_host=True)
         return config
 
     @property

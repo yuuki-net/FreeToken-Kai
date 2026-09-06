@@ -254,15 +254,31 @@ def _validate_attention_backend_choice(config, override, required: frozenset[Att
             )
 
 
+def _to_pinned_host(t: torch.Tensor) -> torch.Tensor:
+    """A pinned + mapped host copy of ``t`` (FreeToken's cudaHostAlloc: Portable | Mapped, so
+    the GPU can dereference it in place); plain host memory when there is no CUDA allocator
+    (CPU-only tests)."""
+    t = t.to("cpu")
+    try:
+        from freetoken.kernel.pinned import copy_to_pinned_tensor
+
+        return copy_to_pinned_tensor(t.contiguous())
+    except Exception:  # noqa: BLE001
+        return t
+
+
 def _make_dummy_weight_state_dict(
     model_state: Dict[str, torch.Tensor],
     *,
     device: torch.device,
+    host_prefixes: Tuple[str, ...] = (),
 ) -> Dict[str, torch.Tensor]:
     state_dict: Dict[str, torch.Tensor] = {}
     fp8_dtypes = (torch.float8_e4m3fn, torch.float8_e5m2)
     for key, param in model_state.items():
-        if param.dtype in fp8_dtypes:
+        if host_prefixes and key.startswith(host_prefixes):
+            state_dict[key] = _to_pinned_host(torch.randn(param.shape, dtype=param.dtype))
+        elif param.dtype in fp8_dtypes:
             # torch.randn is not implemented for fp8; fill via a uint8 view with small
             # codes (avoid NaN/inf fp8 encodings). Lets dummy-weight startup work for
             # block-fp8 models (the dense fp8 linears are fp8 regardless of moe_backend).
@@ -288,14 +304,22 @@ def _materialize_loaded_weight_state_dict(
     weights: Iterable[Tuple[str, torch.Tensor]],
     *,
     device: torch.device,
+    host_prefixes: Tuple[str, ...] = (),
 ) -> Dict[str, torch.Tensor]:
+    """Cast each loaded tensor to its model-buffer dtype on ``device``; keys under
+    ``host_prefixes`` (a model's ``host_resident_prefixes``, e.g. the embedding table under
+    --host-embedding) land in pinned host memory instead."""
     state_dict: Dict[str, torch.Tensor] = {}
     for key, weight in weights:
         expected = model_state.get(key)
-        if expected is None:
-            state_dict[key] = weight.to(device=device)
+        dtype = weight.dtype if expected is None else expected.dtype
+        if host_prefixes and key.startswith(host_prefixes):
+            state_dict[key] = _to_pinned_host(weight.to(dtype=dtype))
+            del weight
+            if device.type == "cuda":
+                torch.cuda.empty_cache()  # the reader had placed it on the device
         else:
-            state_dict[key] = weight.to(device=device, dtype=expected.dtype)
+            state_dict[key] = weight.to(device=device, dtype=dtype)
     return state_dict
 
 
@@ -474,6 +498,7 @@ class Engine:
         if hasattr(self.model, "load_host_tables"):
             self._host_tables_bytes = int(self.model.load_host_tables(config) or 0)
         self._host_tables_bytes += self._mtp_bank_bytes  # the draft head's pinned bank layer
+        self._host_tables_bytes += getattr(self, "_host_resident_bytes", 0)  # --host-embedding
         if is_offload_moe_backend(config.moe_backend):
             self._init_offload_moe_cache(config)
         if hasattr(self.model, "prepare_for_runtime"):
@@ -728,8 +753,11 @@ class Engine:
 
     def _load_weight_state_dict(self, config: EngineConfig) -> Dict[str, torch.Tensor]:
         model_state = self.model.state_dict()
+        host_prefixes = tuple(getattr(self.model, "host_resident_prefixes", ()))
+        if host_prefixes:
+            logger.info(f"host-resident weights (pinned RAM, gathered by the GPU in place): {host_prefixes}")
         if config.use_dummy_weight:
-            return _make_dummy_weight_state_dict(model_state, device=self.device)
+            return _make_dummy_weight_state_dict(model_state, device=self.device, host_prefixes=host_prefixes)
         # _materialize casts each loaded tensor to its model-param dtype (model_state), so
         # models declaring per-tensor dtypes (e.g. DSV4's mixed fp8/fp32/bf16) are preserved;
         # offload models exclude experts (served from the offload cache, not dense weights).
@@ -743,9 +771,15 @@ class Engine:
         if has_mtp:
             weights = self._capture_mtp_experts(weights)
         weights = _drop_unknown_mtp(weights, model_state)
-        state = _materialize_loaded_weight_state_dict(model_state, weights, device=self.device)
+        state = _materialize_loaded_weight_state_dict(
+            model_state, weights, device=self.device, host_prefixes=host_prefixes
+        )
         if has_mtp:
             self._quantize_mtp_experts()
+        # the pinned tables count against the host pin quota the bank residency planner sees
+        self._host_resident_bytes = sum(
+            t.numel() * t.element_size() for k, t in state.items() if host_prefixes and k.startswith(host_prefixes)
+        )
         return state
 
     # ------------------------------------------------------------------ MTP expert bank layer
