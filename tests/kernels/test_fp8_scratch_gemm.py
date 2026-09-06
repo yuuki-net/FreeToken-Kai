@@ -41,16 +41,39 @@ def test_scratch_dispatch_follows_arch_and_override(monkeypatch):
     fp8mod._scratch_gemm_preferred.cache_clear()
 
 
-def test_linear_routes_m_gt_1_through_scratch_when_preferred(monkeypatch):
+def test_linear_routes_large_m_through_scratch_when_preferred(monkeypatch):
     """No GPU needed: with the scratch path preferred, fp8_pertensor_linear never touches the
-    Triton kernels for M > 1 (the GEMV / GEMM launchers would fail on CPU tensors)."""
+    Triton kernels for M >= _SCRATCH_GEMM_MIN_M (the GEMV / GEMM launchers would fail on CPU
+    tensors)."""
     torch.manual_seed(0)
     w = torch.randn(64, 128) * 0.02
     q, s = _quant(w)
-    a = torch.randn(5, 128, dtype=torch.bfloat16)
+    a = torch.randn(fp8mod._SCRATCH_GEMM_MIN_M + 3, 128, dtype=torch.bfloat16)
     monkeypatch.setattr(fp8mod, "_scratch_gemm_preferred", lambda: True)
     monkeypatch.setattr(fp8mod, "e4m3_native", lambda: False)
     monkeypatch.setattr(fp8mod, "_gemm", lambda *a, **k: pytest.fail("triton GEMM used"))
     out = fp8mod.fp8_pertensor_linear(a, q, s)
     ref = a.float() @ (q.float() * s[:, None]).t()
     torch.testing.assert_close(out.float(), ref, rtol=2e-2, atol=2e-2)
+
+
+def test_linear_keeps_small_m_on_the_inline_kernel(monkeypatch):
+    """A few rows (an MTP verify window, a small decode batch) skip the scratch: the full
+    weight dequant would cost more traffic than the inline kernel's single fp8 read."""
+    torch.manual_seed(0)
+    w = torch.randn(64, 128) * 0.02
+    q, s = _quant(w)
+    a = torch.randn(4, 128, dtype=torch.bfloat16)
+    calls = []
+
+    def fake_gemm(x, weight, scale, out_dtype):
+        calls.append(x.shape)
+        return (x.float() @ (q.float() * s[:, None]).t()).to(out_dtype)
+
+    monkeypatch.setattr(fp8mod, "_scratch_gemm_preferred", lambda: True)
+    monkeypatch.setattr(fp8mod, "e4m3_native", lambda: False)
+    monkeypatch.setattr(fp8mod, "e4m3_kernel_view", lambda w: w)
+    monkeypatch.setattr(fp8mod, "_gemm", fake_gemm)
+    monkeypatch.setattr(fp8mod, "_gemm_scratch", lambda *a, **k: pytest.fail("scratch used for M=4"))
+    out = fp8mod.fp8_pertensor_linear(a, q, s)
+    assert calls == [(4, 128)] and out.shape == (4, 64)

@@ -218,6 +218,13 @@ def _gemm_kernel(
     tl.store(c_ptrs, acc.to(compute_type), mask=m_mask[:, None] & n_mask[None, :])
 
 
+# Below this many rows the scratch path loses: dequantising the whole [N, K] weight to fp16
+# (read 1 B + write 2 B + the scale pass + cuBLAS reading 2 B per element) is ~10 GB of traffic
+# per forward of a 1.3B-parameter dense stack, while the inline kernel reads the fp8 bytes once.
+# An MTP verify window (K+1 = 4..8 rows) and small decode batches take the inline kernel.
+_SCRATCH_GEMM_MIN_M = 64
+
+
 @functools.cache
 def _scratch_gemm_preferred() -> bool:
     """Whether M>1 W8A16 GEMMs go through ``_gemm_scratch`` instead of the inline-dequant
@@ -382,8 +389,8 @@ def fp8_pertensor_linear(
         ).reshape(*lead, N)
     elif x.numel() // K == 1:
         out = _gemv(x.reshape(K), e4m3_kernel_view(weight), weight_scale, x.dtype).reshape(*lead, N)
-    elif _scratch_gemm_preferred():
-        # pre-Ampere: dequant to a scratch and let cuBLAS run the GEMM (see the helper)
+    elif _scratch_gemm_preferred() and x.numel() // K >= _SCRATCH_GEMM_MIN_M:
+        # pre-Ampere prefill: dequant to a scratch and let cuBLAS run the GEMM (see the helper)
         out = _gemm_scratch(x.reshape(-1, K), weight, weight_scale, x.dtype).reshape(*lead, N)
     else:
         out = _gemm(
