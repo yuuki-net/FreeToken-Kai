@@ -611,6 +611,25 @@ class Engine:
                 sg.g_window = sg.g_chain = None
                 if self.moe_offload_cache is not None:
                     self.moe_offload_cache.reset()
+        # The window graph keeps the K+1 per-token GDN states of every layer resident (~250 MB
+        # for a 30-layer GDN stack at K=3). On a card that is left with almost no free VRAM after
+        # that, the eager parts of every step (sampling, staging, the offload cache's fetches)
+        # fight the allocator and the step gets slower than eager -- measured on an RTX 2060
+        # 6 GB (145 ms eager vs 185 ms graph with 0.1 GiB free). Keep the graphs only with
+        # headroom; FT_SPEC_GRAPH_MIN_FREE_MB overrides the floor (0 = always keep).
+        min_free_mb = int(os.environ.get("FT_SPEC_GRAPH_MIN_FREE_MB", "256") or 0)
+        torch.cuda.synchronize(self.device)
+        free_mb = torch.cuda.mem_get_info(self.device)[0] // 2**20
+        if free_mb < min_free_mb:
+            logger.warning(
+                f"--spec-mtp: only {free_mb} MB of VRAM free after the verify-window graphs "
+                f"(floor {min_free_mb} MB): dropping them, the window and the head run eagerly "
+                "(FT_SPEC_GRAPH_MIN_FREE_MB=0 keeps them)"
+            )
+            self._spec_graph = None
+            del sg
+            gc.collect()
+            torch.cuda.empty_cache()
 
     def _init_communication(self, config: EngineConfig) -> torch.distributed.ProcessGroup:
         if config.tp_info.size == 1 or config.use_pynccl:
