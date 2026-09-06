@@ -257,6 +257,12 @@ def _dequant_scratch(numel: int, dtype: torch.dtype, device: torch.device) -> to
     return buf
 
 
+def preallocate_scratch(numel: int, dtype: torch.dtype, device: torch.device) -> int:
+    """Allocate the dequant scratch for the largest fp8 projection once, while the GPU is idle
+    (engine init). Returns the bytes taken."""
+    return _dequant_scratch(numel, dtype, device).numel() * torch.empty((), dtype=dtype).element_size()
+
+
 def _gemm_scratch(a: torch.Tensor, weight: torch.Tensor, weight_scale: torch.Tensor,
                   out_dtype: torch.dtype) -> torch.Tensor:
     """M>1 W8A16 GEMM as dequant + cuBLAS: ``weight`` [N, K] fp8 (the fp8 tensor, not the

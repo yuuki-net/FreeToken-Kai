@@ -274,7 +274,7 @@ def _scratch_moe_preferred() -> bool:
     return is_pre_ampere()
 
 
-_SCRATCH_EXPERTS_PER_CHUNK = 32  # 32 experts x (2I x H + H x I) fp16 ~ 200 MB for Qwen3.5-35B-A3B
+_SCRATCH_EXPERTS_PER_CHUNK = 16  # 16 experts x (2I x H + H x I) fp16 ~ 100 MB for Qwen3.5-35B-A3B
 _SCRATCH_ROWS_PER_BLOCK = 64     # rows per expert per bmm; bounds the loop's buffers (~45 MB total)
 _SCRATCH_BUFFERS: dict = {}
 
@@ -295,6 +295,24 @@ def _scratch_buffer(name: str, shape, dtype: torch.dtype, device: torch.device) 
             torch.cuda.synchronize(device)
         buf = _SCRATCH_BUFFERS[key] = torch.empty(shape, dtype=dtype, device=device)
     return buf
+
+
+def preallocate_scratch(hidden: int, inter: int, dtype: torch.dtype, device: torch.device) -> int:
+    """Allocate every buffer ``_fused_experts_nvfp4_scratch`` uses, once, while the GPU is idle
+    (engine init, before the graphs). Returns the bytes taken. Lazily growing them inside the
+    first prefill put the allocator's segment growth under load, which on a full card under
+    WSL2 failed with ``CUDA driver error: device not ready``."""
+    C, LB = _SCRATCH_EXPERTS_PER_CHUNK, _SCRATCH_ROWS_PER_BLOCK
+    bufs = [
+        _scratch_buffer("gate_up", (C, 2 * inter, hidden), dtype, device),
+        _scratch_buffer("down", (C, hidden, inter), dtype, device),
+        _scratch_buffer("x", (C * LB, hidden), dtype, device),
+        _scratch_buffer("h", (C, LB, 2 * inter), dtype, device),
+        _scratch_buffer("a", (C, LB, inter), dtype, device),
+        _scratch_buffer("y16", (C, LB, hidden), dtype, device),
+        _scratch_buffer("y32", (C, LB, hidden), torch.float32, device),
+    ]
+    return sum(b.numel() * b.element_size() for b in bufs)
 
 
 def _fused_experts_nvfp4_scratch(
@@ -355,11 +373,11 @@ def _fused_experts_nvfp4_scratch(
         slots = torch.tensor(chunk, dtype=torch.int32, device=dev)
         w_gu = dequant_nvfp4(
             gate_up_packed, gate_up_scale, gate_up_global, slots,
-            out=_scratch_buffer("gate_up", (n, 2 * inter, H), dt, dev), dtype=dt,
+            out=_scratch_buffer("gate_up", (C, 2 * inter, H), dt, dev)[:n], dtype=dt,
         )
         w_d = dequant_nvfp4(
             down_packed, down_scale, down_global, slots,
-            out=_scratch_buffer("down", (n, H, inter), dt, dev), dtype=dt,
+            out=_scratch_buffer("down", (C, H, inter), dt, dev)[:n], dtype=dt,
         )
         e_ids = slots.long()
         for l0 in range(0, counts_cpu[chunk[0]], LB):
