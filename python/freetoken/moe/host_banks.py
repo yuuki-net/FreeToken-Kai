@@ -144,10 +144,25 @@ class HostBank:
     def release(self) -> None:
         """Drop the resident pages; the address space stays valid, the contents become undefined.
 
-        For buffers that are done being read (the converter). No-op for born-pinned banks: registered pages cannot be dropped."""
+        For buffers that are done being read (the converter, and the --moe-bank-ram loader,
+        which releases each layer as it spills it). No-op for born-pinned banks: registered
+        pages cannot be dropped.
+
+        MADV_REMOVE first, and that matters. CPython's anonymous ``mmap`` is MAP_SHARED, so
+        the pages belong to a shmem object; MADV_DONTNEED drops only this mapping's page
+        table entries and the object keeps them, so nothing is returned to the host. Under
+        --moe-bank-ram that left the originals resident beside the mapped copy -- 50 GiB of
+        Shmem and the machine in swap. MADV_REMOVE punches them out of the object."""
         if self._pinned:
             return
-        self._buf.madvise(mmap.MADV_DONTNEED)
+        for advice in (getattr(mmap, "MADV_REMOVE", None), mmap.MADV_DONTNEED):
+            if advice is None:
+                continue
+            try:
+                self._buf.madvise(advice)
+                return
+            except (OSError, ValueError):
+                continue
 
     def lock(self) -> None:
         """mlock the (now-filled) buffer: resident without CUDA pin quota, but no device address -- only the CPU executor can serve a locked layer.
