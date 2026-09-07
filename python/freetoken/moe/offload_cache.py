@@ -277,6 +277,9 @@ class OffloadMoeCache:
         self._prefill_buffer_layer: list[int | None] = [None, None]
         self._prefill_buffer_released: list[bool] = [True, True]
         self._prefill_buffer_has_release_event: list[bool] = [False, False]
+        # --moe-bank-ram: the buffer's non-resident remainder has been issued to the
+        # bounce path or not yet. See prefetch_prefill_layer.
+        self._prefill_pending_bounce: list[int | None] = [None, None]
         # hit-D2D split state: pinned begin-of-chunk snapshot of slot_for_id (the
         # classification input; frozen for the chunk -- no decode runs inside one,
         # and buffer invalidation only clears slot < 2E entries, which classify as
@@ -466,6 +469,7 @@ class OffloadMoeCache:
         self.prefill_release_events = []
         self._prefill_buffer_layer = [None, None]
         self._prefill_buffer_released = [True, True]
+        self._prefill_pending_bounce = [None, None]
         self._prefill_buffer_has_release_event = [False, False]
         # 2. Drop old GPU tensors (free-before-alloc).
         self.banks = []
@@ -592,6 +596,7 @@ class OffloadMoeCache:
         assert self.banks, "set_bank_sources must register the banks first"
         self._prefill_buffer_layer = [None, None]
         self._prefill_buffer_released = [True, True]
+        self._prefill_pending_bounce = [None, None]
         self._prefill_buffer_has_release_event = [False, False]
         # The double buffers borrow the slot cache's first 2 * num_experts slots
         # (one full expert layer per buffer), one view per registered bank.
@@ -632,6 +637,7 @@ class OffloadMoeCache:
             return
         self._prefill_buffer_layer = [None, None]
         self._prefill_buffer_released = [True, True]
+        self._prefill_pending_bounce = [None, None]
         if self.prefill_copy_stream is not None:
             # Fence this prefill's copy-stream work behind everything already enqueued
             # on the compute stream. The release/ready events only order against the
@@ -668,8 +674,12 @@ class OffloadMoeCache:
 
         def copy() -> None:
             self._invalidate_prefill_buffer(buffer_id)
-            for (per_layer, _), buffer in zip(self.banks, self.prefill_bank_buffers):
-                buffer[buffer_id].copy_(per_layer[layer_id], non_blocking=True)
+            for src, dst in self._prefill_pairs(layer_id, buffer_id):
+                hot = self._prefill_hot(src)
+                if hot < src.size(0):
+                    dst[:hot].copy_(src[:hot], non_blocking=True)
+                else:
+                    dst.copy_(src, non_blocking=True)
 
         if self._prefill_hit_d2d_active:
             self._prefetch_split(layer_id, buffer_id)
@@ -680,10 +690,55 @@ class OffloadMoeCache:
                 if self._prefill_buffer_has_release_event[buffer_id]:
                     self.prefill_copy_stream.wait_event(self.prefill_release_events[buffer_id])
                 copy()
-                self.prefill_ready_events[buffer_id].record(self.prefill_copy_stream)
+                if not self._has_bounce(layer_id):
+                    self.prefill_ready_events[buffer_id].record(self.prefill_copy_stream)
 
         self._prefill_buffer_layer[buffer_id] = layer_id
         self._prefill_buffer_released[buffer_id] = False
+        if self.prefill_copy_stream is not None and self._has_bounce(layer_id):
+            # The registered rows are on their way. The rest goes through _staged_h2d, which
+            # blocks the host -- and this call sits BEFORE the current layer's GEMMs are
+            # issued, so blocking here stalls a GPU with nothing queued. Leave it pending;
+            # finish_prefill_prefetch runs it once the GEMMs are in flight.
+            self._prefill_pending_bounce[buffer_id] = layer_id
+
+    def _prefill_pairs(self, layer_id: int, buffer_id: int):
+        return [
+            (per_layer[layer_id], buffer[buffer_id])
+            for (per_layer, _), buffer in zip(self.banks, self.prefill_bank_buffers)
+        ]
+
+    def _prefill_hot(self, src: torch.Tensor) -> int:
+        """Rows of ``src`` the GPU can DMA out of: all of them unless --moe-bank-ram left a
+        non-resident remainder past the registered prefix."""
+        hot = self.prefix_pinned_rows
+        return src.size(0) if hot is None else min(hot, src.size(0))
+
+    def _has_bounce(self, layer_id: int) -> bool:
+        if self.prefix_pinned_rows is None:
+            return False
+        return any(
+            self._prefill_hot(per_layer[layer_id]) < per_layer[layer_id].size(0)
+            for per_layer, _ in self.banks
+        )
+
+    def finish_prefill_prefetch(self) -> None:
+        """Run any deferred bounce copy. Call once this layer's GEMMs are issued: the copy
+        blocks the host, and the point of deferring it is that the GPU has work to do
+        meanwhile. A buffer whose bounce is still pending has no ready event yet, so
+        wait_prefill_layer forces it rather than waiting on an event that never comes."""
+        if self.prefill_copy_stream is None:
+            return
+        for buffer_id, layer_id in enumerate(self._prefill_pending_bounce):
+            if layer_id is None:
+                continue
+            with torch.cuda.stream(self.prefill_copy_stream):
+                for src, dst in self._prefill_pairs(layer_id, buffer_id):
+                    hot = self._prefill_hot(src)
+                    if hot < src.size(0):
+                        self._staged_h2d(dst[hot:], src[hot:])
+                self.prefill_ready_events[buffer_id].record(self.prefill_copy_stream)
+            self._prefill_pending_bounce[buffer_id] = None
 
     def _hit_d2d_usable(self) -> bool:
         """Whether the hit-D2D split can serve this prefill; logs the first fallback.
@@ -694,7 +749,11 @@ class OffloadMoeCache:
         """
         from freetoken.kernel.fast_index_copy import _skip_fast_index_copy_enabled
 
-        if self._prefill_slot_snapshot is None or self.prefill_copy_stream is None:
+        if self.prefix_pinned_rows is not None:
+            # --moe-bank-ram registers only the resident prefix; the hit-D2D split builds its
+            # own pointer list and would batch-memcpy out of the unregistered rows.
+            reason = "the mapped bank is only registered up to its resident prefix"
+        elif self._prefill_slot_snapshot is None or self.prefill_copy_stream is None:
             reason = "prefill overlap buffers are not initialized for this device"
         elif _skip_fast_index_copy_enabled():
             reason = "FREETOKEN_SKIP_FAST_INDEX_COPY is set (the hit gather would be a no-op)"
@@ -809,6 +868,11 @@ class OffloadMoeCache:
         assert self.prefill_bank_buffers
         self.prefetch_prefill_layer(layer_id)
         buffer_id = layer_id % 2
+        if self._prefill_pending_bounce[buffer_id] is not None:
+            # Nothing has been issued for this layer to hide behind -- the first layer of a
+            # chunk always lands here. Pay for it now; every later layer's bounce was
+            # already run behind the previous layer's GEMMs.
+            self.finish_prefill_prefetch()
         assert self._prefill_buffer_layer[buffer_id] == layer_id
         if self.prefill_ready_events:
             torch.cuda.current_stream(self.device).wait_event(self.prefill_ready_events[buffer_id])
