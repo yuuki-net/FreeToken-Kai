@@ -22,6 +22,7 @@ from freetoken.layers import set_rope_device
 from freetoken.models import create_model, load_weight
 from freetoken.moe import create_moe_backend, is_offload_moe_backend
 from freetoken.moe.expert_banks import load_expert_banks
+from freetoken.moe.host_banks import HostResidency as _HostResidency
 from freetoken.moe.offload_cache import OffloadMoeCache, attach_offload_moe_cache
 from freetoken.utils import (
     align_ceil,
@@ -1057,12 +1058,22 @@ class Engine:
                 "(locked layers prefill via synchronous pageable copies)"
             )
             object.__setattr__(config, "moe_prefill_overlap", False)
+        # bound outside the branch: the model-hook path below never builds one
+        bank_tier = None
+        if cache_factory is not None and config.moe_bank_ram:
+            # that path builds its banks through the model's own hook, which has no layer
+            # sink to attach to; silently ignoring the cap would look like it worked
+            raise NotImplementedError(
+                "--moe-bank-ram is not supported for this model's expert setup hook "
+                "(no per-layer sink to split on)"
+            )
         if cache_factory is None:
             # Fast path: an FTW checkpoint loads its repacked banks directly.
             # Slow path: load_expert_banks auto-picks parallel vs serial baseline by
             # expert-tensor granularity. Both pin-after-fill.
             # --expert-load: serial/parallel force the read; auto (None) lets load_expert_banks
             # pick (parallel for scattered experts, with a low-RAM fallback to serial).
+            bank_tier = self._build_bank_tier(config)
             expert_parallel = {"serial": False, "parallel": True}.get(config.expert_load, None)
             requested_residency = None
             if split_residency:
@@ -1082,7 +1093,11 @@ class Engine:
                 parallel=expert_parallel,
                 decode_target=("cpu" if decode_target in ("cpu", "hybrid") else "gpu"),
                 layer_residency=requested_residency,
+                layer_sink=bank_tier.sink if bank_tier else None,
             )
+            if bank_tier is not None:
+                bank_tier.finish()
+                banks.sources.update(bank_tier.sources)
             self._mtp_bank_layers = self._append_mtp_bank(banks)
             if config.moe_cache_auto:
                 size, pages, overlap = self._resolve_auto_moe_cache_size(config, banks)
@@ -1119,7 +1134,32 @@ class Engine:
             )
             # before set_bank_sources: the residency validation and the copy plan's skip of non-pinned layers key on the CPU-layer set
             cache.cpu_layer_ids = cpu_layer_ids
-            cache.set_bank_sources(banks.sources, layer_residency=banks.layer_residency)
+            mapped_pinned = bank_tier is not None and bool(
+                bank_tier.banks and bank_tier.banks.registered_bytes
+            )
+            if bank_tier is not None and not mapped_pinned:
+                # Nothing registered: a mapped bank then has no device address at all, so
+                # every layer has to decode on the CPU executor -- which is the state the
+                # residency label below declares, and set_bank_sources checks the two agree.
+                # This costs the VRAM expert cache, so it is the fallback, not the plan.
+                cache.cpu_layer_ids = frozenset(range(len(next(iter(banks.sources.values())))))
+            cache.set_bank_sources(
+                banks.sources,
+                # a mapped bank is mlocked, not registered, which is exactly what LOCKED
+                # means here: the CPU executor reads it directly and the GPU movement paths
+                # must take their pageable branch
+                layer_residency=(
+                    # length must match the bank sources, which --spec-mtp extends by one
+                    [
+                        (
+                            _HostResidency.PINNED if mapped_pinned else _HostResidency.LOCKED
+                        ).value
+                    ]
+                    * len(next(iter(banks.sources.values())))
+                    if bank_tier is not None
+                    else banks.layer_residency
+                ),
+            )
             cache.set_alphas(banks.gate_up_alpha, banks.down_alpha)
         else:
             cache = cache_factory(config, self.device)
@@ -1130,7 +1170,17 @@ class Engine:
             self._resolve_hybrid_fetch(config, cache)
         # Must be set before CUDA graph capture so the (device-side) accumulation ops are
         # captured and re-run on every decode replay.
+        if bank_tier is not None:
+            bank_tier.attach(cache, self.device)
         cache.collect_stats = config.moe_collect_stats
+        # Per-expert routing histogram: the hot/cold placement table for a disk-backed
+        # expert bank is exactly this, ordered. Unlike collect_stats it is a torch-level
+        # scatter in ensure_experts rather than an in-kernel accumulate, so it only sees
+        # real routing when decode runs eagerly (--disable-cuda-graph).
+        cache.collect_decode_freq = bool(config.moe_stats_out)
+        self._moe_stats_out = config.moe_stats_out
+        self._moe_stats_layer_range = getattr(config, "pp_layer_range", None)
+        self._moe_stats_rank = (config.tp_info.rank, config.tp_info.size)
         # attach_offload_moe_cache walks for OffloadMoELayers, or defers to a model's
         # _iter_offload_moe_layers() hook when its MoE blocks are bespoke nn.Modules (DSV4).
         layers = attach_offload_moe_cache(self.model, cache)
@@ -1869,9 +1919,87 @@ class Engine:
         )
 
     def shutdown(self) -> None:
+        self._write_moe_stats()
         self.graph_runner.destroy_cuda_graphs()
         torch.distributed.destroy_process_group()
         destroy_distributed()
+
+    def _build_bank_tier(self, config: EngineConfig):
+        """``--moe-bank-ram``: the mapped expert banks, or None when off or unnecessary.
+
+        Built before the load, not after: the banks are written per layer as the checkpoint
+        streams in, because holding the originals and a second copy at once needs more RAM
+        than the host that wants this feature has (moe/mapped_bank.py).
+        """
+        if not config.moe_bank_ram:
+            return None
+        from freetoken.moe import bank_disk
+        from freetoken.moe.mapped_bank import MappedTier
+
+        # --moe-bank-ram is a whole-host cap, but each rank builds its own banks and every
+        # rank of a layer split lives on the same machine -- so the per-rank share is what
+        # the placement is solved against. Taking the flag per rank instead would silently
+        # double the RAM a two-GPU run uses.
+        total = bank_disk.parse_size(config.moe_bank_ram)
+        ranks = max(1, config.tp_info.size)
+        budget = total // ranks
+        layers = list(range(config.model_config.num_moe_layers))
+        placement, cell_bytes = bank_disk.plan_from_config(
+            config.model_config, budget, layers, config.moe_bank_stats
+        )
+        bank_gib = (cell_bytes or 0) * len(layers) * config.model_config.num_experts / 2**30
+        if placement is None:
+            logger.info_rank0(
+                f"--moe-bank-ram {config.moe_bank_ram}: {budget / 2**30:.1f} GiB per rank "
+                f"({ranks} ranks) covers this rank's {bank_gib:.1f} GiB of banks; no split"
+            )
+            return None
+        logger.info_rank0(
+            f"--moe-bank-ram {config.moe_bank_ram}: {budget / 2**30:.1f} GiB per rank "
+            f"({ranks} ranks) against {bank_gib:.1f} GiB of banks"
+        )
+        if not config.moe_bank_stats:
+            logger.warning(
+                "--moe-bank-ram without --moe-bank-stats: the split ignores routing, so the "
+                "resident half is an arbitrary slice. Collect a histogram with "
+                "--moe-stats-out --disable-cuda-graph first."
+            )
+        if config.moe_prefill_overlap:
+            # The overlap prefetch DMAs a whole layer asynchronously out of the bank. A
+            # mapped bank is mlocked but not registered, so that copy is not a legal async
+            # source -- it failed with cudaErrorInvalidValue on the first request. The
+            # synchronous materialize path reads any host memory, which is the same trade
+            # --moe-cpu-layers already makes for its locked layers.
+            logger.info_rank0(
+                "--moe-bank-ram: disabling MoE prefill overlap (a mapped bank is not a "
+                "legal async DMA source; prefill streams synchronously instead)"
+            )
+            object.__setattr__(config, "moe_prefill_overlap", False)
+        return MappedTier(
+            placement,
+            bank_disk.bank_file_path(
+                config.model_path, config.tp_info.rank, config.tp_info.size, config.moe_bank_dir
+            ),
+            layers,
+            log=logger.info_rank0,
+        )
+
+    def _write_moe_stats(self) -> None:
+        """Dump the decode instrumentation to ``--moe-stats-out`` on an orderly stop.
+
+        Ctrl+C / SIGTERM reach here via uvicorn's lifespan; a hard kill loses the window,
+        which is acceptable for an opt-in instrumentation run.
+        """
+        from freetoken.engine.moe_stats import write_moe_stats
+
+        rank, size = getattr(self, "_moe_stats_rank", (0, 1))
+        write_moe_stats(
+            getattr(self.ctx, "moe_offload_cache", None),
+            getattr(self, "_moe_stats_out", None),
+            rank,
+            size,
+            getattr(self, "_moe_stats_layer_range", None),
+        )
 
 
 def _profile_gpu(index: "int | None" = None) -> Tuple[str | None, str | None]:
