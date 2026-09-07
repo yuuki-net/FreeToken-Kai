@@ -29,14 +29,19 @@ Every number below was measured on the hardware in the row, not extrapolated.
 
 | GPU | Host RAM | Model | Context | Decode |
 |---|---|---|---|---|
-| 1× RTX 3060 12 GB | 64 GB | `openai/gpt-oss-120b` (117B MoE, MXFP4) | — | **15 tok/s** (`--moe-bank-ram 48G`) |
+| 1× RTX 3060 12 GB | 64 GB | `openai/gpt-oss-120b` (117B MoE, MXFP4) | 32k | **15 tok/s** (`--moe-bank-ram 48G`) |
 | 2× RTX 3060 12 GB | 128 GB | `RadixArk/Qwen3.8-Flash-Next-NVFP4` (125B MoE, vision) | **128k** | **18–20 tok/s** (`--pp-size 2`) |
 | 2× RTX 3060 12 GB | 64 GB | same | 128k | 14–15 tok/s (`--moe-bank-ram 48G`) |
 | 1× RTX 2060 6 GB | 32 GB | `ornith-ai/Ornith-1.5-35B-A3B-NVFP4` (35B-A3B, vision) | **64k** | **25–39 tok/s** |
-| 1× RTX 2060 6 GB | 32 GB | `openai/gpt-oss-20b` (21B MoE, MXFP4) | — | 13–14 tok/s |
+| 1× RTX 2060 6 GB | 32 GB | `openai/gpt-oss-20b` (21B MoE, MXFP4) | not recorded | 13–14 tok/s |
 
 Qwen3.8-Flash-Next does not fit one 12 GB card at all; the two-card rows are what make it run.
 gpt-oss-120b puts 98% of its parameters in experts, which is why a single 12 GB card can serve it.
+
+**The context lengths are not comparable across rows.** gpt-oss-120b was measured at 32k, not at
+Flash-Next's 128k: half of its 36 layers are full attention at 2048 B per token per layer, so 128k
+of KV would want 4.7–5.5 GiB against the 1.62 GiB free after initialisation. Whether it can be made
+to fit is untested.
 
 ## Is this for you?
 

@@ -118,6 +118,14 @@ wider than the widest block. Being under that threshold does not mean it is opti
 Two RTX 3060 12 GB, 8 CPU cores, NVMe, WSL2. RAM restricted with a locked balloon so a 110 GiB
 host behaves like a smaller one.
 
+Every gpt-oss-120b row was run at 32k of context (`--max-seq-len-override 32768
+--kv-reserve-tokens 32768`, which page rounding turns into 32889 tokens, K + V = 1.37 GiB); the
+Flash-Next rows at 128k (`131072`, K + V = 1.55 GiB). The decode figures are therefore not a
+like-for-like comparison between the two models. gpt-oss-120b was not run at 128k: half of its 36
+layers are full attention at 2048 B per token per layer, so 36.9 kB/token, and 128k of KV would
+want 4.7-5.5 GiB against the 1.62 GiB free after initialisation. Whether it can be made to fit is
+untested.
+
 | | RAM | Decode | Prefill, 4096-token chunk |
 |---|---|---|---|
 | Qwen3.8-Flash-Next, banks pinned | 128 GB | 18-20 tok/s | 6 s |
