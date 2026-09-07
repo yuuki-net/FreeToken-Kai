@@ -87,6 +87,11 @@ See [models.md](models.md#moe-backends) for what each backend does.
 | `--moe-hybrid-max-fetch` | auto | With `hybrid`: max experts fetched over PCIe per layer per step; rest computed on CPU |
 | `--moe-prefill-hit-d2d` | off | Prefill: copy cache-hit experts device-side, stream only misses (CUDA >= 13) |
 | `--disable-moe-prefill-overlap` | overlap on | Disable the two-buffer prefill copy overlap |
+| `--moe-bank-ram` | off | Half the RAM: keep only the frequently routed experts resident, map the rest from disk. Whole-host cap (`48G`), split across ranks. See [bank-ram.md](bank-ram.md) |
+| `--moe-bank-stats` | — | Routing histograms (from `--moe-stats-out`) that decide which experts stay resident |
+| `--moe-bank-dir` | `~/.cache/freetoken/bankmap` | Where the mapped bank file lives |
+| `--moe-stats-out` | off | Write the per-expert decode routing histogram on shutdown (pass `--disable-cuda-graph`) |
+| `--disable-cuda-graph` | graphs on | Decode eagerly; needed for `--moe-stats-out` to see real routing |
 
 ### API behaviour
 
