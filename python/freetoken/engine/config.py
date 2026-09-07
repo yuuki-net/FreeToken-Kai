@@ -41,6 +41,23 @@ class EngineConfig:
     # (cudaMemcpyBatchAsync); no-op unless moe_cache_size > 2 * num_experts.
     moe_prefill_hit_d2d: bool = False
     moe_collect_stats: bool = False  # capture decode miss-rate counters into the cuda graph
+    # --moe-stats-out: write the decode routing histogram (per layer, per expert), the
+    # realized miss rates and OffloadMoeCache.decode_routing_stats() to this path at
+    # shutdown. Setting it also turns on the per-expert histogram
+    # (OffloadMoeCache.collect_decode_freq), which the cache only accumulates outside a
+    # captured graph -- pass --disable-cuda-graph for a collection run, or the histogram
+    # counts the capture-time warmup routing instead of the real one.
+    moe_stats_out: str | None = None
+    # --moe-bank-ram: cap on host RAM for the expert banks. Experts beyond the cap are
+    # renumbered out of the resident range and read from a cold bank file instead (see
+    # moe/bank_disk.py). Unset = every expert resident, which is today's behaviour.
+    moe_bank_ram: str | None = None
+    # --moe-bank-stats: --moe-stats-out histogram(s) that order the placement. Without one
+    # the ordering falls back to logical id, i.e. it ignores routing entirely and the cold
+    # half is an arbitrary fifth of the experts.
+    moe_bank_stats: list[str] | None = None
+    # --moe-bank-dir: where the cold bank file lives. Defaults beside the checkpoint.
+    moe_bank_dir: str | None = None
     # CPU MoE backend (--moe-backend cpu): number of CPU worker threads computing
     # the decode experts. 0 = auto (physical cores). Ignored by other backends.
     moe_cpu_threads: int = 0

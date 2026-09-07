@@ -600,6 +600,60 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--moe-collect-stats",
+        action="store_true",
+        default=ServerArgs.moe_collect_stats,
+        help=(
+            "Accumulate decode miss-rate counters in the offload MoE cache (device-side, "
+            "captured into the decode graph). Read back by --moe-stats-out."
+        ),
+    )
+    parser.add_argument(
+        "--moe-stats-out",
+        default=ServerArgs.moe_stats_out,
+        help=(
+            "Write the decode routing histogram (per layer, per expert) and the realized "
+            "miss rates to this JSON path at shutdown; implies --moe-collect-stats. One "
+            "file per pipeline rank (.rank<N>.json) when --pp-size > 1. The histogram is "
+            "only accumulated outside a captured graph, so pair it with "
+            "--disable-cuda-graph for a collection run."
+        ),
+    )
+    parser.add_argument(
+        "--disable-cuda-graph",
+        action="store_true",
+        help=(
+            "Run decode eagerly (no CUDA graph capture). Much slower; for instrumentation "
+            "runs whose counters must see the real per-step routing."
+        ),
+    )
+
+    parser.add_argument(
+        "--moe-bank-ram",
+        default=ServerArgs.moe_bank_ram,
+        help=(
+            "Cap host RAM for the expert banks (e.g. 50G), across the whole host: a "
+            "--pp-size 2 run splits it between the two ranks. Experts past the cap move to "
+            "a cold bank file on disk, chosen by measured routing frequency. Needs an NVMe: "
+            "the cold half is read per token."
+        ),
+    )
+    parser.add_argument(
+        "--moe-bank-stats",
+        nargs="+",
+        default=ServerArgs.moe_bank_stats,
+        help=(
+            "--moe-stats-out histogram(s) ordering the --moe-bank-ram placement (one file "
+            "per pipeline rank). Without them the ordering ignores routing entirely."
+        ),
+    )
+    parser.add_argument(
+        "--moe-bank-dir",
+        default=ServerArgs.moe_bank_dir,
+        help="Directory for the cold bank file. Defaults beside the checkpoint.",
+    )
+
+    parser.add_argument(
         "--moe-cache-policy",
         default=ServerArgs.moe_cache_policy,
         choices=["lru"],
@@ -762,6 +816,25 @@ def parse_args(
         kwargs["reasoning_parser"] = _infer_reasoning_parser(kwargs["model_path"])
     elif kwargs["reasoning_parser"] == "off":
         kwargs["reasoning_parser"] = None
+
+    # --disable-cuda-graph is spelled as its own flag rather than exposing cuda_graph_bs:
+    # an empty bs list is already the "graphs off" contract downstream (CudaGraphRunner
+    # returns early on max_graph_bs == 0), and a list-valued CLI flag would invite
+    # half-disabled states.
+    if kwargs.pop("disable_cuda_graph", False):
+        kwargs["cuda_graph_bs"] = []
+
+    # --moe-stats-out is the only reader of the miss-rate counters, so asking for the dump
+    # is asking for the counters; requiring both flags would only produce empty files.
+    if kwargs.get("moe_stats_out"):
+        kwargs["moe_collect_stats"] = True
+
+    # Fail on a malformed size here rather than deep in the loader, after the weights have
+    # been read.
+    if kwargs.get("moe_bank_ram"):
+        from freetoken.moe.bank_disk import parse_size
+
+        parse_size(kwargs["moe_bank_ram"])
 
     # Offload-family backends (offload/cpu/hybrid) need a slot cache; if the user gave no
     # sizing flag at all, default to --moe-cache-auto so a bare `ft serve <FTW MoE>` works

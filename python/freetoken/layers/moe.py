@@ -5,6 +5,7 @@ import torch
 from freetoken.core import get_global_ctx
 from freetoken.distributed import DistributedCommunicator, get_tp_info
 from freetoken.moe import is_offload_moe_backend
+from freetoken.moe.bank_disk import apply_permutation
 from freetoken.moe.fused import fused_experts_decode_impl, fused_experts_impl, fused_topk
 from freetoken.moe.offload_cache import OffloadMoeCache
 from freetoken.utils import div_even
@@ -195,6 +196,16 @@ class MoELayer(BaseOP):
 
 
 class OffloadMoELayer(MoELayer):
+    # logical -> physical expert id for this layer, when --moe-bank-ram renumbered the bank
+    # so the resident experts occupy rows [0, hot). None = every expert resident, which is
+    # the identity map and skips the remap entirely. Set per layer by
+    # attach_offload_moe_cache; see moe/bank_disk.py.
+    #
+    # Declared on the class, not in __init__: the routed entry points are exercised against
+    # instances built with __new__ (tests/moe/test_cpu_prefill_short.py drives the dispatch
+    # threshold without a real layer), and those never run __init__.
+    expert_perm: "torch.Tensor | None" = None
+
     def __init__(
         self,
         layer_id: int,
@@ -305,6 +316,11 @@ class OffloadMoELayer(MoELayer):
         ids), so no ``ensure_experts``/``copy_missing`` here."""
         cache = self.offload_cache
         assert cache is not None
+        # Renumbering is applied here, before anything reads an expert id: the slot cache,
+        # copy_missing and the CPU executor all address the physical row. The bank keeps its
+        # [num_experts, ...] shape either way -- rows past the resident prefix are file-backed
+        # pages that fault in -- so nothing downstream can tell. No-op when nothing was moved.
+        apply_permutation(topk_ids, self.expert_perm)
         if cache.is_cpu_layer(self.layer_id):
             executor = cache.cpu_executor
             assert executor is not None, "CPU MoE executor was not initialized"
@@ -343,7 +359,19 @@ class OffloadMoELayer(MoELayer):
         executor = cache.cpu_executor
         assert executor is not None, "CPU MoE executor was not initialized"
         raw = topk_ids.clone()  # raw expert ids for the CPU partial
-        cache.ensure_experts_hybrid(self.layer_id, topk_ids)  # -> slot (hit/fetched) or -1
+        # --moe-bank-ram: the GPU can only address the registered prefix, so a miss on a row
+        # past it must not be fetched. The fetch choice lives in the kernel, so steer it from
+        # here instead: hand those positions expert 0 (rank 0 of the renumbering -- the
+        # hottest expert, so all but certainly a hit costing no fetch), then overwrite the
+        # slot it returns with -1 so the CPU partial takes them. raw still holds the true
+        # ids, which is what the CPU executor and the routing histogram read.
+        cold = None
+        if cache.prefix_pinned_rows is not None:
+            cold = raw >= cache.prefix_pinned_rows
+            topk_ids.masked_fill_(cold, 0)
+        cache.ensure_experts_hybrid(self.layer_id, topk_ids, freq_ids=raw)  # -> slot or -1
+        if cold is not None:
+            topk_ids.masked_fill_(cold, -1)
         if cache.collect_stats:
             cache.record_decode_stats_hybrid(self.layer_id)
         on_gpu = topk_ids >= 0
@@ -381,10 +409,11 @@ class OffloadMoELayer(MoELayer):
     ) -> torch.Tensor:
         """Prefill movement: stream whole layers -- double-buffered behind the
         previous layer's GEMMs when ``prefill_overlap`` is on, else a synchronous
-        ``materialize_layer``. In both, position == expert id, so the routing ids
-        pass through unmapped."""
+        ``materialize_layer``. In both, position == expert id (physical, after the
+        --moe-bank-ram renumbering), so the routing ids pass through unmapped."""
         cache = self.offload_cache
         assert cache is not None
+        apply_permutation(topk_ids, self.expert_perm)
         # short extends take the CPU executor whether or not the overlap double buffer is on:
         # the decision is per forward (every layer sees the same row count), so a forward that
         # goes this way never touches the overlap machinery

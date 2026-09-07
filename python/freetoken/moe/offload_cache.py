@@ -154,6 +154,10 @@ class OffloadMoeCache:
         # offload/PCIe path. Set by the engine after construction (empty = all-GPU,
         # all layers = the plain --moe-backend cpu case).
         self.cpu_layer_ids: frozenset = frozenset()
+        # --moe-bank-ram: rows [0, prefix_pinned_rows) of every bank are registered and so
+        # device-addressable; the rest are host pages the GPU has no address for. None means
+        # the usual all-or-nothing residency.
+        self.prefix_pinned_rows: int | None = None
         # num_experts floor + nvfp4_marlin slot cap, shared with the runtime-rebuild path.
         self.validate_rebuild(self.cache_size)
         assert not self.prefill_overlap or self.cache_size >= 2 * self.num_experts, (
@@ -238,6 +242,10 @@ class OffloadMoeCache:
         # analysis. Accumulated in ``ensure_experts`` from the raw expert ids before the
         # kernel rewrites them to slots. Only accurate with CUDA graphs disabled (the
         # captured graph would not re-run this host-side scatter on replay).
+        # --moe-bank-ram: per-MoE-layer logical->physical expert id maps, or None when
+        # every expert is resident (the identity, and the only state today's behaviour has).
+        # The MoE layers read theirs at attach time; see moe/bank_disk.py.
+        self.expert_perm: list[torch.Tensor] | None = None
         self.collect_decode_freq = False
         self.decode_freq = torch.zeros(
             (self.num_layers, self.num_experts), dtype=torch.int64, device=self.device
@@ -829,7 +837,9 @@ class OffloadMoeCache:
         self._pending_whole_layer = False
         ensure_experts(self, layer_id, expert_ids)
 
-    def ensure_experts_hybrid(self, layer_id: int, expert_ids: torch.Tensor) -> None:
+    def ensure_experts_hybrid(
+        self, layer_id: int, expert_ids: torch.Tensor, freq_ids: torch.Tensor | None = None
+    ) -> None:
         """Capped-fetch LRU for the hybrid backend.
 
         Like :meth:`ensure_experts` but assigns slots to (and schedules copies for) at
@@ -842,7 +852,9 @@ class OffloadMoeCache:
         from freetoken.moe.offload_kernels import ensure_experts_hybrid
 
         if self.collect_decode_freq:
-            ids = expert_ids.reshape(-1).long()
+            # freq_ids: the caller may have rewritten non-resident ids before this call (see
+            # OffloadMoELayer._decode_hybrid); the histogram wants what was actually routed.
+            ids = (expert_ids if freq_ids is None else freq_ids).reshape(-1).long()
             self.decode_freq[layer_id].scatter_add_(0, ids, torch.ones_like(ids))
         self._pending_src_layer = layer_id
         self._pending_whole_layer = False
@@ -1037,7 +1049,13 @@ class OffloadMoeCache:
         assert self.banks, "set_bank_sources must register the banks first"
         layer_id = self._pending_src_layer
         assert layer_id is not None, "no staged misses (ensure_experts/materialize_layer first)"
-        if layer_id in self._unpinned_layers:
+        # A prefix-registered bank is pinned for decode (the misses are clamped to the
+        # registered rows) but not for the whole-layer prefill sweep, which touches every
+        # row including the unregistered ones. That sweep takes the pageable branch below;
+        # a plain cudaMemcpy reads any host memory, registered or not.
+        if layer_id in self._unpinned_layers or (
+            self.prefix_pinned_rows is not None and self._pending_whole_layer
+        ):
             if not self._pending_whole_layer:
                 raise RuntimeError(
                     f"layer {layer_id} is unpinned: its only copy is the whole-layer "
@@ -1107,4 +1125,8 @@ def attach_offload_moe_cache(model, cache: OffloadMoeCache) -> list:
     layers = list(iter_offload_moe_layers(model))
     for layer in layers:
         layer.offload_cache = cache
+        # cached on the layer rather than looked up per forward: this runs once per MoE
+        # layer per step and the list index would be pure Python overhead in the decode path
+        if cache.expert_perm is not None:
+            layer.expert_perm = cache.expert_perm[layer.layer_id]
     return layers
