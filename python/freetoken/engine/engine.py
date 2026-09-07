@@ -1098,6 +1098,20 @@ class Engine:
             if bank_tier is not None:
                 bank_tier.finish()
                 banks.sources.update(bank_tier.sources)
+                if config.moe_prefill_overlap and not (
+                    bank_tier.banks and bank_tier.banks.registered_bytes
+                ):
+                    # Nothing registered: no part of the bank is a legal async DMA source,
+                    # so the overlap prefetch cannot run at all. With the prefix registered
+                    # it can -- prefetch_prefill_layer sends those rows on the copy stream
+                    # and bounces the rest. Decided here rather than in _build_bank_tier so
+                    # it keys on what actually got registered, and before --moe-cache-auto
+                    # so the VRAM plan sees the right answer.
+                    logger.info_rank0(
+                        "--moe-bank-ram: disabling MoE prefill overlap (nothing registered, "
+                        "so no part of a mapped bank is a legal async DMA source)"
+                    )
+                    object.__setattr__(config, "moe_prefill_overlap", False)
             self._mtp_bank_layers = self._append_mtp_bank(banks)
             if config.moe_cache_auto:
                 size, pages, overlap = self._resolve_auto_moe_cache_size(config, banks)
@@ -1964,17 +1978,8 @@ class Engine:
                 "resident half is an arbitrary slice. Collect a histogram with "
                 "--moe-stats-out --disable-cuda-graph first."
             )
-        if config.moe_prefill_overlap:
-            # The overlap prefetch DMAs a whole layer asynchronously out of the bank. A
-            # mapped bank is mlocked but not registered, so that copy is not a legal async
-            # source -- it failed with cudaErrorInvalidValue on the first request. The
-            # synchronous materialize path reads any host memory, which is the same trade
-            # --moe-cpu-layers already makes for its locked layers.
-            logger.info_rank0(
-                "--moe-bank-ram: disabling MoE prefill overlap (a mapped bank is not a "
-                "legal async DMA source; prefill streams synchronously instead)"
-            )
-            object.__setattr__(config, "moe_prefill_overlap", False)
+        # Whether the overlap survives is decided after the banks are opened, on what
+        # actually got registered -- see the caller.
         return MappedTier(
             placement,
             bank_disk.bank_file_path(
