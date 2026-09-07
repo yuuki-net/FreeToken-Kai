@@ -4,7 +4,7 @@ An unofficial fork of [FlashML-org/FreeToken](https://github.com/FlashML-org/Fre
 based on upstream `main` at commit `af71ba4` (2026-09-03). It is not affiliated with, endorsed
 by, or supported by FlashML. The license is unchanged (Apache-2.0).
 
-The fork adds five things upstream does not have:
+The fork adds six things upstream does not have:
 
 1. **Image input over the OpenAI API** for checkpoints that ship a vision tower but were served
    text-only: Qwen3.8-Flash-Next and the Qwen3.5-MoE family (Qwen3.6-35B-A3B, Ornith-1.5-35B-A3B).
@@ -22,10 +22,18 @@ The fork adds five things upstream does not have:
    cards of different sizes. It is what runs Qwen3.8-Flash-Next (10.4 GB of dense weights) on
    two 12 GB cards with 128k of context; it does not make a model that already fits one card
    faster. See [pipeline.md](pipeline.md).
+6. **Half the host RAM** an offloaded MoE needs (`--moe-bank-ram`): the expert banks become a
+   file mapping with a locked resident prefix instead of one pinned allocation, so the rest is
+   served from the page cache. Qwen3.8-Flash-Next runs on two 12 GB cards with 64 GB of RAM
+   instead of 128, and gpt-oss-120b on a single 12 GB card with 64 GB. Two things the flag
+   alone will not do for you: one profiling run to learn which experts to keep resident
+   (`--moe-stats-out`), and one `read_ahead_kb` setting that is worth 2.5x by itself. See
+   [bank-ram.md](bank-ram.md).
 
 Everything else is upstream FreeToken. The feature sets are independent: image input, the MTP
-head, the host embedding and the layer split also apply to a plain upstream checkout on
-Ampere+, and the Turing patch is useful on its own for text-only models such as gpt-oss-20b.
+head, the host embedding, the layer split and the bank mapping also apply to a plain upstream
+checkout on Ampere+, and the Turing patch is useful on its own for text-only models such as
+gpt-oss-20b.
 
 Please keep questions and bug reports about this fork in this repository. The FreeToken
 maintainers have no part in it; do not contact them about anything you find here.
@@ -65,9 +73,9 @@ Nothing in this fork is limited to Turing, and nothing is taken away from newer 
   Triton attention default, the 64 KB extend tiles, the dequant + cuBLAS prefill paths and their
   startup scratches only engage below compute capability 8.0. On Ampere and newer the engine runs
   upstream's kernels and backends unchanged.
-- Image input, `--spec-mtp`, `--host-embedding`, the CPU short-prefill path and `--pp-size`
-  are architecture-independent. Two details to know: the verify-window CUDA graphs need an
-  attention backend that stages the window, which today means the Triton backend
+- Image input, `--spec-mtp`, `--host-embedding`, the CPU short-prefill path, `--pp-size` and
+  `--moe-bank-ram` are architecture-independent. Two details to know: the verify-window CUDA
+  graphs need an attention backend that stages the window, which today means the Triton backend
   (`--attention-backend triton`) or Flash-Next's qsa_sparse backend; with another backend the
   window runs eagerly and says so in the log. And the host embedding needs pinned memory the
   GPU can dereference (Linux/UVA, or WDDM through the mapped address), which is how FreeToken's
