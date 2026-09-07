@@ -1019,6 +1019,12 @@ class Engine:
             and config.moe_cpu_layers is None
             and config.moe_backend in ("offload", "hybrid")
             and _pin_budget_bytes(self._host_tables_bytes) is not None
+            # --moe-bank-ram already answers the question this split exists to answer: the
+            # banks are a file mapping and only the resident prefix is locked, so the pin
+            # budget is not what decides how much of them fits. Splitting anyway takes the
+            # VRAM expert cache away from the layers it locks -- for gpt-oss-120b that was
+            # 9 of 36 layers, and the loader's own warning said it saved no pinned quota.
+            and not config.moe_bank_ram
         ):
             cpu_layer_ids = _auto_cpu_layers(
                 config, config.model_config.num_moe_layers, reserved=self._host_tables_bytes
