@@ -159,9 +159,9 @@ cache than this one did.
   the KV occupancy, so a fresh short request was just as slow and only a restart helped; prefill
   was unaffected, because the same overhead lands once per 4096-token chunk. Single-GPU runs
   never took that path. If you are on such a build, update. The fix is unit-tested, and decode
-  held flat over the first 9,000 steps of live serving, where the old build had already begun to
-  fall.
-  A multi-hour run confirming that it stays flat was still going when this was published.
+  held flat across 175,000 decode steps of live serving over 4.8 hours -- 19.2 tok/s at the point
+  where the old build had fallen to 2.3, and a residual drift of 0.05 us per step against the old
+  build's 2.5, which is to say none that this measurement can separate from load.
 
 When reporting a problem, include `nvidia-smi -L`, the first 60 lines of the server log (both
 ranks) and the exact `--pp-size` / `--pp-layers` / `--gpu` values.
