@@ -219,6 +219,21 @@ def _validate_attention_backend_choice(config, override, required: frozenset[Att
                 f"SWA models require, got {config.attention_backend!r}."
             )
 
+    # --kv-cache-dtype: only the triton backend dequantizes the code slabs. Any other
+    # backend would read the uint8 codes as 16-bit floats -- no exception, just wrong
+    # numbers -- and "auto" resolves to flashinfer on sm_80+, so this is the common case
+    # on every card newer than the one it was developed on, not an exotic one.
+    from freetoken.kvcache.kv_quant import resolve as _resolve_kv_quant
+
+    if _resolve_kv_quant(getattr(config, "kv_cache_dtype", None)) is not None:
+        wrong = [p for p in backend_parts if p != "triton"]
+        if wrong:
+            raise ValueError(
+                f"--kv-cache-dtype {config.kv_cache_dtype} is only read by the triton "
+                f"attention backend; got {config.attention_backend!r}. Pass "
+                f"--attention-backend triton, or drop --kv-cache-dtype."
+            )
+
     # An explicitly-selected backend may require a package that isn't installed. Auto
     # never resolves to one of these when its package is missing, so this only fires for
     # explicit --attention-backend choices.
