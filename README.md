@@ -1,6 +1,7 @@
 # FreeToken Kai (改)
 
-**A 125B MoE on two RTX 3060 12 GB. gpt-oss-120b on one. A 35B MoE on an RTX 2060 6 GB.**
+**gpt-oss-120b on one RTX 3060 12 GB. A 35B MoE at 250k of context on the same card, still 25 tok/s
+at the far end. A 125B MoE on two of them. A 35B MoE on an RTX 2060 6 GB.**
 
 > An unofficial fork of [FlashML-org/FreeToken](https://github.com/FlashML-org/FreeToken), based on
 > upstream `main` at `af71ba4` (2026-09-03). Not affiliated with, endorsed by, or supported by
@@ -18,30 +19,81 @@ This fork adds six things on top of it. They are independent — take one, ignor
 | 2 | **Half the host RAM** an offloaded MoE needs. Expert banks become a file mapping with a locked resident prefix, so 128 GB configurations run in 64 GB. | `--moe-bank-ram 48G` |
 | 3 | **Turing (RTX 20 series, sm_75) support.** Upstream requires Ampere or newer. Six small, isolated changes. | automatic |
 | 4 | **Image input over the OpenAI API** for checkpoints that ship a vision tower but were served text-only. The vision tower runs on the CPU, so it costs no VRAM. | send `image_url` parts |
-| 5 | **Speculative decoding with the checkpoint's own MTP head.** Verify window and draft head captured as CUDA graphs. | `--spec-mtp 5` |
+| 5 | **Speculative decoding with the checkpoint's own MTP head.** Verify window and draft head captured as CUDA graphs. Correctness-verified. It pays off only where a multi-row verify costs about what a single row costs: with the experts in host RAM that means long acceptance, so it wins on code and tool calls on two cards and loses on free prose and on one card. | `--spec-mtp 5` |
 | 6 | **64k of context on a 6 GB card.** The input embedding table lives in host memory and the GPU reads rows from it directly. | `--host-embedding` |
 
 Everything else is upstream FreeToken.
 
 ## Measured results
 
-Every number below was measured on the hardware in the row, not extrapolated.
+Every number below was measured on the hardware in the row, not extrapolated, and every row is
+plain decode. `--spec-mtp` is kept out of the table because it does not move these numbers in one
+direction: on the single-card rows it is clearly slower (8–22 tok/s against 25–37 on the 2060,
+19–35 against 41–46 on one 3060), while on the two-card Flash-Next row it depends on the text —
+30–36 tok/s on code and tool calls, 11–14 on free prose, against 18–20 plain. With the experts in
+host RAM every row of the verify window pays its own expert traffic, so the window only earns its
+cost where acceptance runs long. [docs/kai.md](docs/kai.md) has the per-step timings.
 
 | GPU | Host RAM | Model | Context | Decode |
 |---|---|---|---|---|
+| 1× RTX 2060 6 GB | 32 GB | `openai/gpt-oss-20b` (21B MoE, MXFP4) | not recorded | 13–14 tok/s |
+| 1× RTX 2060 6 GB | 32 GB | `ornith-ai/Ornith-1.5-35B-A3B-NVFP4` (35B-A3B, vision) | **64k** | **25–39 tok/s** |
+| 2× RTX 3060 12 GB, one card used | 128 GB | `ornith-ai/Ornith-1.5-35B-A3B-NVFP4` (35B-A3B, vision) | **256k** | **39–47 tok/s** near the start, **25** at 250k |
 | 1× RTX 3060 12 GB | 64 GB | `openai/gpt-oss-120b` (117B MoE, MXFP4) | 32k | **15 tok/s** (`--moe-bank-ram 48G`) |
 | 2× RTX 3060 12 GB | 128 GB | `RadixArk/Qwen3.8-Flash-Next-NVFP4` (125B MoE, vision) | **128k** | **18–20 tok/s** (`--pp-size 2`) |
-| 2× RTX 3060 12 GB | 64 GB | same | 128k | 14–15 tok/s (`--moe-bank-ram 48G`) |
-| 1× RTX 2060 6 GB | 32 GB | `ornith-ai/Ornith-1.5-35B-A3B-NVFP4` (35B-A3B, vision) | **64k** | **25–39 tok/s** |
-| 1× RTX 2060 6 GB | 32 GB | `openai/gpt-oss-20b` (21B MoE, MXFP4) | not recorded | 13–14 tok/s |
+| 2× RTX 3060 12 GB | 64 GB | same model, `--moe-bank-ram 48G` | 128k | 14–15 tok/s |
 
 Qwen3.8-Flash-Next does not fit one 12 GB card at all; the two-card rows are what make it run.
 gpt-oss-120b puts 98% of its parameters in experts, which is why a single 12 GB card can serve it.
+
+### 250k of context on one 12 GB card
+
+The 256k row is one card of the two-card machine (`--gpu 0`), and it was measured all the way down,
+not only at the shallow end. Decode against the depth actually held in the KV cache, 22 sampled
+steps each:
+
+| Context held | Decode (median) | |
+|---|---|---|
+| 8,185 tokens | 39.2 tok/s | |
+| 63,655 tokens | 34.8 tok/s | −11% |
+| **249,948 tokens** | **25.2 tok/s** | −36% |
+
+**Thirty times the context costs a third of the speed.** The last row is a KV cache at 95% of its
+capacity on a 12 GB card, and it still answers at conversational speed.
+
+What pays for it is the expert cache: 256k of KV takes 5.00 GiB, leaving 680 expert slots against
+the 2,947 a shallow context leaves. Decode does not care, because on this host the expert transfer
+was never the bottleneck — so almost the whole expert cache can be spent on context. The cost lands
+on prefill instead, which is the section above.
 
 **The context lengths are not comparable across rows.** gpt-oss-120b was measured at 32k, not at
 Flash-Next's 128k: half of its 36 layers are full attention at 2048 B per token per layer, so 128k
 of KV would want 4.7–5.5 GiB against the 1.62 GiB free after initialisation. Whether it can be made
 to fit is untested.
+
+## Prefill, and the wait before the first token
+
+Decode is the number everyone quotes, but a long prompt spends most of its wall clock in prefill,
+and two of the changes here are prefill changes.
+
+| Hardware, model | Prefill | Follow-up turn behind a cached prefix |
+|---|---|---|
+| 1× RTX 2060 6 GB, Ornith-1.5-35B-A3B | a 2,062-token prompt in **~7.8 s** — it was **68 s** before the Turing GEMM changes | 2–3 s |
+| 2× RTX 3060 12 GB, Qwen3.8-Flash-Next | **6 s** per 4,096-token chunk, against 12 s before the two ranks overlapped; 16,159 tokens in **~29 s** against ~48 s | 2.4–4.5 s, against 9 s before the CPU short-prefill path |
+
+The follow-up-turn column is the one a person actually feels in a chat client: the prefix is
+already cached, only the new message is prefilled. Getting it from 9 s to 2.4–4.5 s took removing
+the expert streaming that a cached prefix was still paying for every turn.
+
+Prefill is also where a very long context is paid for. Filling 250k tokens on one RTX 3060 12 GB
+(Ornith-1.5-35B-A3B, 8,192-token chunks) took **435 s**, and the per-chunk rate falls as the prefix
+grows — 896 tok/s over the first chunk, 600 at 82k, 509 at 123k, 371 at 221k. So a 250k context is
+about seven minutes to load and then 25 tok/s to talk to; it is not seven minutes per turn, because
+the next turn only prefills what you added.
+
+The last prefill chunk cannot overlap — its sampled token is the one decoding starts from — so a
+short prompt sees less of the two-rank speed-up than a long one. [docs/pipeline.md](docs/pipeline.md)
+has the chunk-by-chunk timings.
 
 ## Is this for you?
 
@@ -91,6 +143,7 @@ CUDA kernels are JIT-compiled on first use (CUDA 13 toolkit with `nvcc`, as upst
 | [docs/bank-ram.md](docs/bank-ram.md) | Half the host RAM (`--moe-bank-ram`), and the `read_ahead_kb` that is worth 2.5x |
 | [docs/turing.md](docs/turing.md) | Turing (sm_75): six symptoms, six causes, six fixes |
 | [docs/image-input.md](docs/image-input.md) | Image input over the OpenAI API |
+| [docs/gguf.md](docs/gguf.md) | Why 3-bit and 2-bit GGUF experts are not the shortcut they look like — a road not taken, with the numbers |
 
 ## Who wrote this
 

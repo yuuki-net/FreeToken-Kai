@@ -103,6 +103,24 @@ prompt. Full specs, and why the second slot is x4, are in kai.md.
 | Ornith-1.5-35B-A3B-NVFP4 | 41-46 tok/s (hybrid, 2,947 slots) | 40-44 tok/s (`--pp-layers 25 --moe-backend offload`, 3,833 slots per card); 25-30 with the even split and hybrid | equal at best |
 | gpt-oss-120b (MXFP4) | 9-12 tok/s (202 slots; 9 layers decode on the CPU because 57 GB of banks exceed the pin budget) | 12-17 tok/s (`--pp-layers 26 --moe-backend hybrid`, 394 slots per card, all banks pinned) | +30-40% |
 
+### Prefill
+
+Decode is the number people quote, but a long prompt spends most of its wall clock in prefill,
+and this is where the overlap described above pays. Qwen3.8-Flash-Next, `--max-prefill-length
+4096`, timed from the intervals between `Prefill batch` lines in the log:
+
+| | Ranks in sequence | Ranks overlapped |
+|---|---|---|
+| One 4,096-token chunk | ~12 s | **6 s** |
+| 16,159 tokens (4 chunks) | ~48 s | **~29 s** |
+| 4,096 + 1,164-1,946 tokens (2 chunks) | ~17 s | 11-12 s |
+| 128k of input (32 chunks) | ~6 min | — |
+
+The last chunk cannot overlap — its sampled token is the one that starts decoding — so a
+short prompt sees less of this than a long one. What a user actually feels on a follow-up turn,
+where the prefix is already cached and only the new message is prefilled, is 2.4-4.5 s (9 s
+before the CPU short-prefill path removed the per-turn expert streaming).
+
 What the per-rank timer (`FT_STEP_PROFILE=1`) shows for Ornith with the even split: the
 hand-off costs 0.6 ms, and the step is the sum of the two forwards (11-13 ms on rank 0 and
 16-19 ms on rank 1 for 20 layers each), against ~22 ms for all 40 layers on one card. On this
