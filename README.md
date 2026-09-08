@@ -10,6 +10,11 @@ at the far end. A 125B MoE on two of them. A 35B MoE on an RTX 2060 6 GB.**
 > **Please keep questions and bug reports about this fork in this repository.** The FreeToken
 > maintainers have no part in it; do not contact them about anything you find here.
 
+> **2026-09-09 — pull if you cloned before this date and run `--pp-size`.** Multi-rank decoding
+> slowed steadily for as long as the server stayed up: 17.9 -> 2.3 tok/s over one 12.5-hour
+> session on two RTX 3060s, unrelated to context length, reset only by a restart. The cause and
+> the fix are in [docs/pipeline.md](docs/pipeline.md). Single-GPU runs were never affected.
+
 Upstream FreeToken serves one model on one GPU, on Ampere (RTX 30 series) or newer, text only.
 This fork adds six things on top of it. They are independent — take one, ignore the rest.
 
