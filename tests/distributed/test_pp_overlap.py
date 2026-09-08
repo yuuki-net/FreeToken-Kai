@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import os
 import tempfile
+from collections import deque
 
 import torch
 
@@ -52,20 +53,59 @@ def _count_worker(rank: int, init_file: str) -> None:
     dist.init_process_group("gloo", init_method=f"file:///{init_file}", rank=rank, world_size=2)
     io = SchedulerIOMixin.__new__(SchedulerIOMixin)
     io.tp_cpu_group = dist.group.WORLD
-    io._pending_count_sends = []
+    io._pending_count_sends = deque()
     counts = [0, 3, 0, 1, 7]
     if rank == 0:
         # rank 0 runs ahead: every count is published before rank 1 asks for any of them
         for c in counts:
             io._publish_msg_count(c)
-        assert len(io._pending_count_sends) <= len(counts)
+        assert len(io._pending_count_sends) == len(counts)  # all still in flight, none waited
         for _, w in io._pending_count_sends:
             w.wait()
+        io._pending_count_sends.clear()
     else:
         got = [io._await_msg_count() for _ in counts]
         assert got == counts, got
     dist.barrier()
     dist.destroy_process_group()
+
+
+def _bound_worker(rank: int, init_file: str) -> None:
+    """Regression: the pending-send backlog must stay bounded no matter how far rank 0 runs.
+
+    gloo's SendWork only marks itself completed inside wait(), so the old
+    ``[... if not w.is_completed()]`` filter never retired an entry: the list grew by one per
+    scheduler iteration and every iteration re-walked it, making each decode step cost
+    O(steps served so far)."""
+    import torch.distributed as dist
+
+    from freetoken.scheduler.io import _MAX_PENDING_COUNT_SENDS, SchedulerIOMixin
+
+    dist.init_process_group("gloo", init_method=f"file:///{init_file}", rank=rank, world_size=2)
+    io = SchedulerIOMixin.__new__(SchedulerIOMixin)
+    io.tp_cpu_group = dist.group.WORLD
+    n = _MAX_PENDING_COUNT_SENDS * 4
+    if rank == 0:
+        io._pending_count_sends = deque()
+        for i in range(n):
+            io._publish_msg_count(i % 5)
+            assert len(io._pending_count_sends) <= _MAX_PENDING_COUNT_SENDS, i
+        for _, w in io._pending_count_sends:
+            w.wait()
+        io._pending_count_sends.clear()
+    else:
+        got = [io._await_msg_count() for _ in range(n)]
+        assert got == [i % 5 for i in range(n)], got
+    dist.barrier()
+    dist.destroy_process_group()
+
+
+def test_pending_count_sends_stay_bounded():
+    import torch.multiprocessing as mp
+
+    with tempfile.TemporaryDirectory() as d:
+        init_file = os.path.join(d, "init").replace("\\", "/")
+        mp.spawn(_bound_worker, args=(init_file,), nprocs=2, join=True)
 
 
 def test_msg_count_channel_lets_rank0_run_ahead():

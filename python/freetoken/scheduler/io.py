@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Final, List
+from collections import deque
+from typing import TYPE_CHECKING, Deque, Final, List, Tuple
 
 import torch
 from freetoken.message import BaseBackendMsg, BaseTokenizerMsg, BatchTokenizerMsg
@@ -13,6 +14,10 @@ logger = init_logger(__name__)
 
 # gloo tag of the per-step "how many raw messages follow" note (pipeline hidden/tokens: 1/2)
 _MSG_COUNT_TAG = 7
+# How many un-retired count sends rank 0 may carry. The channel exists so rank 0 can run
+# ahead of the last rank (one prefill chunk); this bounds how far. Retiring is a wait() on
+# the oldest, which returns as soon as the peer has taken that message.
+_MAX_PENDING_COUNT_SENDS: Final = 64
 
 
 class SchedulerIOMixin:
@@ -52,7 +57,7 @@ class SchedulerIOMixin:
         if tp_info.size > 1:
             if tp_info.is_primary():
                 recv = self._recv_msg_multi_rank0
-                self._pending_count_sends: list = []
+                self._pending_count_sends: Deque[Tuple[torch.Tensor, object]] = deque()
                 self._send_into_ranks: Final = ZmqPubQueue(
                     config.zmq_scheduler_broadcast_addr, create=True, encoder=BaseBackendMsg.encoder
                 )
@@ -127,15 +132,25 @@ class SchedulerIOMixin:
         step. Point-to-point and asynchronous rather than a broadcast: a collective holds
         rank 0 until every rank reaches the same step, and the pipeline engine wants rank 0
         one prefill chunk ahead of the last rank (distributed/pipeline). Each rank consumes
-        exactly one count per step, in order, so the sends never pile up; the tensors stay
-        referenced until their send has completed."""
-        self._pending_count_sends = [
-            (t, w) for t, w in self._pending_count_sends if not w.is_completed()
-        ]
+        exactly one count per step, in order; the tensors stay referenced until their send
+        has been retired.
+
+        Retiring is a wait() on the OLDEST entry once the backlog exceeds the window, not a
+        scan for finished ones: gloo's SendWork marks itself completed inside wait(), so
+        ``is_completed()`` stays False for the life of the object even after the peer has
+        long since taken the message. Filtering on it retired nothing -- the list grew by one
+        entry per scheduler iteration and every iteration re-walked all of it, so each step
+        paid a cost proportional to the number of steps served so far (Flash-Next on 2x3060:
+        18 -> 2.3 tok/s over a 12-hour session, +0.4 s per decode step; prefill was unaffected
+        because a 6 s chunk hides it). The window keeps both the run-ahead and the walk
+        bounded."""
         count_t = torch.tensor([count], dtype=torch.int64)
         for dst in range(1, self.tp_cpu_group.size()):
             work = self.tp_cpu_group.send([count_t], dst, _MSG_COUNT_TAG)
             self._pending_count_sends.append((count_t, work))
+        while len(self._pending_count_sends) > _MAX_PENDING_COUNT_SENDS:
+            _, oldest = self._pending_count_sends.popleft()
+            oldest.wait()
 
     def _await_msg_count(self) -> int:
         """Other ranks: this step's message count from rank 0 (blocks until rank 0 got there)."""
