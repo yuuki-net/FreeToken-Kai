@@ -23,6 +23,20 @@ grouped GEMM then indexes expert weights with garbage ids. The error surfaces fa
 All four call sites (`kernel/causal_conv1d.py` x2, `layers/norm.py`, `moe/fused.py`) already have
 Triton or native fallbacks.
 
+**Four things this was not.** The symptom lands inside a Triton kernel, so every one of these is a
+natural next guess, and each one cost time to rule out. They are all wrong:
+
+- *Triton's `tl.dot` does not support bf16 on Turing.* It does. fp16 and bf16 `tl.dot` were both run
+  directly on sm_75 under Triton 3.6 and give correct results.
+- *Everything has to be forced to fp16 on Turing.* Not for correctness. fp16 is worth choosing on
+  Turing for speed (there are no bf16 tensor cores — see section 4), but it is not what fixes this.
+- *Triton 3.6 does not support Turing.* It does.
+- *This PyTorch build has no sm_75.* Check before believing it: `torch.cuda.get_arch_list()` lists
+  `sm_75`.
+
+The cause is in a different package, and it fails silently: a launch whose error nobody checks, and
+a `torch.empty` output passed downstream still uninitialised.
+
 ## 2. The automatic attention backend skips flashinfer below Ampere
 
 `python/freetoken/engine/engine.py` (`_resolve_auto_attention_backend`), `python/freetoken/utils/arch.py`

@@ -142,6 +142,37 @@ At 77% residency the static placement covers 87.5% of routes out-of-sample -- te
 better than an arbitrary slice. The steady state behaves better than that, around 3% of routes
 actually reaching the disk, because of the page cache above.
 
+## What this looked like while it was wrong
+
+Two of the three biggest wins here were not tuning. They were the design failing to do what it said
+it did, in ways no model predicted, and the reason to write them down is that both are easy to
+inherit and neither announces itself. A slow run does not tell you which of these it is.
+
+**The VRAM expert cache was being skipped entirely (worth 40%).** `_decode_routed` in
+`layers/moe.py` checks `is_cpu_layer` *before* the hybrid branch, so a layer listed as a CPU layer
+goes straight to the CPU executor and never consults the VRAM cache. Declaring the mapped banks
+locked, and listing every layer in `cpu_layer_ids` for consistency, quietly routed all of them past
+a 1,180-slot cache that was measurably being hit. Nothing logs this: throughput is simply lower than
+it should be. If you change which layers are CPU layers, check that the cache hit counters still
+move.
+
+**Readahead was the whole story (worth 2.5x), and the first explanation of it was also wrong.**
+The kernel default of `read_ahead_kb 8192` turns a random 512 KB expert row into an 8 MB read.
+Setting it to 256 was worth more than every code change in this document combined. But the first
+diagnosis of *why* was that the mapping lacked `MADV_SEQUENTIAL`/`MADV_WILLNEED`, and that a single
+`madvise` would be worth 3-4x. Both claims were false; the madvise changes measured as noise, and
+the startup log never showed `fault readahead` engaging. Only the block-device setting mattered.
+
+**And the theory that sent us looking was wrong too.** The slow case was assumed to be page faults
+against a file that had fallen out of RAM. `smaps` said otherwise: both ranks had `Rss == Size`
+(33,269,760 kB, 144 VMAs), i.e. the entire mapping was resident, and it was still 8 tok/s. On a
+110 GiB host the file never goes cold, so the disk-bound case this design was built for had not
+actually been reproduced there at all — a 64 GB host is the only place to confirm it.
+
+The estimate that drove the design ("77% resident covers 87.5% of routes, which is fast enough")
+held up. The intermediate numbers along the way — +4 ms here, 31 ms there, "3-4x from madvise" —
+were worth about a factor of two, and should not have been quoted as if they were measurements.
+
 ## Limits and caveats
 
 - **Prefill is 2-7x slower.** Each chunk still streams every expert of every layer, and the
