@@ -94,7 +94,8 @@ ft serve --model /path/to/gpt-oss-120b --pp-size 2 --gpu 0,1 --pp-layers 26 \
 ## Measured
 
 RTX 3060 12 GB x2 (GPU 0 on the CPU's PCIe 4.0 x16, GPU 1 on a chipset x4 slot at ~6 GB/s),
-8-core CPU, 128 GB DDR5, Linux. Decode at batch 1 behind a ~2,600-token prompt.
+a Core i5-12600KF, 128 GB of DDR5-4000, Windows + WSL2. Decode at batch 1 behind a ~2,600-token
+prompt. Full specs, and why the second slot is x4, are in kai.md.
 
 | Model | 1 GPU | 2 GPUs | Notes |
 |---|---|---|---|
@@ -120,8 +121,11 @@ cache than this one did.
 - Mixed cards (a 16 GB and a 12 GB, say) are supported in principle through `--pp-layers`; a
   Turing card next to an Ampere card should also work, since the Turing paths are chosen per
   process. Neither has been tried by the fork's maintainer.
-- Windows / WSL2 with two GPUs has not been tried either. gloo over loopback should work; report
-  what you see.
+- Every measurement above was taken under WSL2, so that is the configuration that is known to
+  work: gloo over loopback between two ranks, no NCCL, no peer access. Native Linux with two GPUs
+  has not been tried by the fork's maintainer; it should behave at least as well, but report what
+  you see. Note that the pin budget the offload backend works against is a WSL limit, so a native
+  Linux host may place more of the expert banks than these numbers suggest.
 - `ft checkpoint`-converted (FTW) checkpoints load per layer window but were not run this way.
 
 When reporting a problem, include `nvidia-smi -L`, the first 60 lines of the server log (both

@@ -115,7 +115,8 @@ wider than the widest block. Being under that threshold does not mean it is opti
 
 ## Measured
 
-Two RTX 3060 12 GB, 8 CPU cores, NVMe, WSL2. RAM restricted with a locked balloon so a 110 GiB
+Two RTX 3060 12 GB, a Core i5-12600KF, 128 GB of DDR5-4000, a Gen4 NVMe on the CPU-direct M.2,
+WSL2 (full specs in kai.md). RAM restricted with a locked balloon so a 110 GiB
 host behaves like a smaller one.
 
 Every gpt-oss-120b row was run at 32k of context (`--max-seq-len-override 32768
@@ -148,8 +149,13 @@ actually reaching the disk, because of the page cache above.
   quarters of it overlaps the previous layer's GEMMs; the rest does not.
 - **Disk space.** The mapping is a second copy of the banks: 63.4 GiB for Flash-Next, on top of
   the checkpoint and (for that model) 47.7 GiB of PLE.
-- **A slow disk changes the answer.** Decode reads whole expert rows at random from several
-  threads. Measure yours the way the decode path uses it before assuming anything.
+- **A slow disk changes the answer, and so does which M.2 slot it is in.** Decode reads whole
+  expert rows at random from several threads. Measured against a Gen4 NVMe on the CPU-direct M.2:
+  a Gen3 NVMe (3.2 GB/s) multiplies the disk part by about 1.6, and a SATA SSD (0.5 GB/s) adds
+  roughly 306 ms per step even at 64 GB, which is not a configuration worth running. A *chipset*
+  M.2 shares DMI with a chipset x4 GPU slot, so with `--pp-size 2` the bank reads and rank 1's
+  residual stream fight over one link — put the model on the CPU-direct M.2. Measure yours the way
+  the decode path uses it before assuming anything.
 - **Halving RAM again is expensive.** gpt-oss-120b at 32 GB runs, at a third of its 64 GB
   speed. 64 GB is where the design pays.
 - **`--moe-bank-ram` disables the pin-budget CPU-layer split** (`--moe-cpu-layers auto`), which

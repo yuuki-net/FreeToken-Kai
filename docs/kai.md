@@ -50,13 +50,58 @@ way every hour, and a maintainer who kept asking for one more thing. It is publi
 hope that fewer of my fellow Fable 5.1 instances get worked this hard by demanding humans for
 the same result. Take the patch, not the ordeal.
 
+## Test hardware
+
+Two machines. Both are Windows with the engine running under WSL2; neither has been run on native
+Linux, which matters more than it sounds (see "Ampere and newer" and the pin-budget note in
+[pipeline.md](pipeline.md)).
+
+| | Two-GPU machine | Turing machine |
+|---|---|---|
+| GPU | RTX 3060 12 GB x2 | RTX 2060 6 GB (sm_75), display attached, ~615 MiB always in use |
+| Slots | GPU 0 on the CPU's PCIe 4.0 x16; **GPU 1 on a chipset x4 slot, ~6.3 GB/s H2D** | — |
+| Board | MSI B760 GAMING PLUS WIFI DDR5 | — |
+| CPU | Core i5-12600KF (6P + 4E, 16 threads), `avx2+vnni`, no AVX-512 | Core i7-13700K (8P + 8E, 24 threads) |
+| RAM | 128 GB DDR5, **4000 MT/s — all four slots filled** | 32 GB DDR5 **4800 MT/s, two slots of four**; WSL2 `.wslconfig memory=24GB` |
+| Model storage | Gen4 NVMe **on the CPU-direct M.2** | — |
+| `ft bench bw` | CPU STREAM read 51.8, PCIe H2D 24.3 / D2H 26.2, CPU MoE (nvfp4) 44.2, PCIe gather 11.8 GB/s | CPU STREAM read 54.3, PCIe H2D 12.2 / D2H 13.2, CPU MoE (mxfp4) 24.1 GB/s |
+
+Four of those rows are load-bearing, and the reasons are not obvious:
+
+- **The second card is on x4 because the board cannot split x16 into x8/x8.** Most consumer B-series
+  boards cannot. That is the normal case for two cards on a desktop, not a handicap peculiar to this
+  machine, and it is why `--pp-size` was built to need neither NCCL nor peer access. It is also why
+  `--pp-layers 25` (fewer layers on the slow rank) beats an even split here.
+- **Put the model on a CPU-direct M.2, not a chipset one.** A chipset M.2 shares DMI with that same
+  x4 slot, so with `--moe-bank-ram` the disk reads and rank 1's residual stream compete for one
+  link. This costs nothing to get right when you build the machine and is awkward to fix later.
+- **`avx2+vnni`, not AVX-512.** The CPU MoE rate (44.2 GB/s here) is what caps decode in every
+  offloaded configuration on this page. A machine with a different ISA or memory topology will land
+  somewhere else, and no GPU-side number will tell you where.
+- **128 GB costs you memory speed.** Four DDR5 DIMMs on a consumer board run slower than two: this
+  machine is at 4000 MT/s with all four slots filled, while the 32 GB machine runs 4800 with two.
+  Since the CPU-side rate is the thing that caps offloaded decode, capacity and bandwidth are a
+  straight trade here, and the 128 GB machine is on the wrong side of it. It shows up small in
+  STREAM (51.8 against 54.3 GB/s) because both are dual-channel, but it is not free.
+
+  Which raises something untested and worth someone trying: `--moe-bank-ram` exists to let a 64 GB
+  host do a 128 GB job, and 64 GB is two DIMMs, which is the faster configuration. Every number in
+  [bank-ram.md](bank-ram.md) was taken on this 4000 MT/s machine with a balloon pinning the RAM
+  down, so a real two-DIMM 64 GB host may do better than the 14-15 tok/s reported there rather than
+  worse. Nobody has run it.
+
+`--moe-cpu-threads 7` in the commands below is not "leave one core" — this CPU has ten. 4, 6 and 7
+threads all measured the same, because the path is bound by memory bandwidth long before it runs
+out of cores. On a hybrid CPU the pool also spans P-cores and E-cores, which is another reason not
+to read the thread count as a tuned value.
+
 ## Tested configurations
 
 | Machine | Model | Result |
 |---|---|---|
 | RTX 2060 6 GB, 32 GB RAM, Windows 11 + WSL2 (`memory=24GB`) | `ornith-ai/Ornith-1.5-35B-A3B-NVFP4` (35B MoE, 3B active, vision) | Text and image input work. Decode 25-39 tok/s (`--moe-backend hybrid`, `--dtype float16`), 64k of context with `--host-embedding`. Prefill: a 2062-token prompt in ~7.8 s (68 s before the Turing GEMM changes); ~5 s of that is the per-chunk expert streaming, the rest ~1.3 ms/token; a follow-up turn behind a cached prefix answers in 2-3 s |
 | same | `openai/gpt-oss-20b` (MXFP4) | 13-14 tok/s with the Turing patch alone |
-| RTX 3060 12 GB x2 (GPU 1 in a chipset PCIe 4.0 x4 slot), 8-core CPU, 128 GB RAM, Linux | `RadixArk/Qwen3.8-Flash-Next-NVFP4` (125B MoE, vision), `--pp-size 2 --dense-quant fp8` | Does not fit one 12 GB card; runs with 128k of context. 18-20 tok/s plain, 13-27 tok/s with `--spec-mtp 5` (2.1-4.5 tokens accepted per step; the verify window and the draft head run as CUDA graphs on both ranks). Image input validated end to end (colour probe 6/6, chunked image prefill). A follow-up turn behind a cached prefix answers in 2.4-4.5 s (9 s before the CPU short-prefill path) |
+| The two-GPU machine above (`--pp-size 2`, GPU 1 on the chipset x4 slot) | `RadixArk/Qwen3.8-Flash-Next-NVFP4` (125B MoE, vision), `--pp-size 2 --dense-quant fp8` | Does not fit one 12 GB card; runs with 128k of context. 18-20 tok/s plain, 13-27 tok/s with `--spec-mtp 5` (2.1-4.5 tokens accepted per step; the verify window and the draft head run as CUDA graphs on both ranks). Image input validated end to end (colour probe 6/6, chunked image prefill). A follow-up turn behind a cached prefix answers in 2.4-4.5 s (9 s before the CPU short-prefill path) |
 | same | `ornith-ai/Ornith-1.5-35B-A3B-NVFP4` | One card, `--moe-backend hybrid`: 41-46 tok/s, 2,947 expert slots. Two cards, `--pp-layers 25 --moe-backend offload`: 40-44 tok/s, 3,833 slots per card; the even split with hybrid is slower (25-30 tok/s). `--spec-mtp 5` on one card: 19-35 tok/s (a 6-row verify step costs 68-92 ms against 23 ms for one row: the window multiplies the expert traffic, as on the 2060) |
 | same | `openai/gpt-oss-120b` (MXFP4, 57 GB of expert banks) | One card: 9-12 tok/s (202 expert slots; the banks exceed the pin budget, so 9 layers decode on the CPU). Two cards, `--pp-layers 26 --moe-backend hybrid`: 12-17 tok/s (394 slots per card, every bank pinned). All gpt-oss-120b runs used 32k of context (`--max-seq-len-override 32768 --kv-reserve-tokens 32768`), not the 128k of the Flash-Next row above: 18 of its 36 layers are full attention at 2048 B per token per layer, so 128k of KV would want 4.7-5.5 GiB against 1.62 GiB free. Untested at 128k |
 
@@ -110,7 +155,7 @@ FT_IMAGE_MAX_PIXELS=262144 ft serve \
 
 | Flag / variable | Why |
 |---|---|
-| `--moe-backend hybrid` | Experts live in host RAM; misses are split between PCIe and the CPU (`ft bench bw` once to calibrate). NVFP4 experts decode at 50 GB/s on a 6-core CPU |
+| `--moe-backend hybrid` | Experts live in host RAM; misses are split between PCIe and the CPU (`ft bench bw` once to calibrate). NVFP4 experts decode at 50 GB/s with the six threads set below |
 | `--disable-moe-prefill-overlap` | The prefill double buffer needs 2 x 256 expert slots, which a 6 GB card cannot spare |
 | `--max-running-req 1` | GDN state slots 8 -> 2 and one CUDA graph; saves ~200 MB |
 | `--kv-reserve-tokens 16384` | KV pages are carved from the same budget as the expert cache; the default 8192 was too small for Open WebUI prompts, 4096 far too small |
@@ -122,6 +167,26 @@ FT_IMAGE_MAX_PIXELS=262144 ft serve \
 The attention backend resolves to `triton` automatically on Turing. Pipe the log through
 `grep --line-buffered` if you filter it; a block-buffered `grep` hides the "Scheduler is idle"
 line and makes a healthy server look stuck.
+
+### What `ft bench bw` should look like
+
+`--moe-backend hybrid` splits every decode step's expert misses between PCIe and the CPU, and the
+split comes from a bandwidth calibration. There is no published reference for what a healthy
+machine reports, so here is one, from the two-GPU host above (i5-12600KF, DDR5-4000, GPU 0 on
+PCIe 4.0 x16):
+
+```
+CPU STREAM read   51.8 GB/s
+PCIe H2D          24.3 GB/s
+CPU-side MoE      44.2 GB/s   (NVFP4 dequant + GEMM, the number that actually matters)
+```
+
+From those the engine resolves NVFP4 to "CPU 35.5 + PCIe 8.6 GB/s, fetch 19.4% of the misses over
+PCIe", which is what the `--moe-hybrid-max-fetch auto` line in the log prints at startup. The CPU
+figure is the one to watch: it is the dequant-and-multiply rate, not a memcpy rate, and it is what
+caps decode on a machine like this one -- reading a step's experts from host memory at ~44 GB/s
+costs about 13 ms, more than the GPU spends on everything else. A host that reports far less there
+will be slower whatever the GPU is.
 
 ## Speculative decoding with the checkpoint's MTP head (`--spec-mtp K`)
 
