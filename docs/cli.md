@@ -82,7 +82,7 @@ See [models.md](models.md#moe-backends) for what each backend does.
 | `--moe-backend` | auto | `fused`/`offload`/`cpu`/`hybrid`; auto → offload, or hybrid with a `ft bench bw` profile |
 | `--moe-cache-size` / `--moe-cache-rate` / `--moe-cache-auto` | auto | GPU expert-cache size as slots / fraction of all experts / sized from free VRAM (mutually exclusive; auto is enabled by default for offload-family backends) |
 | `--kv-reserve-tokens` | 8192 | KV token floor reserved before `--moe-cache-auto` fills experts |
-| `--kv-cache-dtype` | auto | Store the paged KV as block-quantized codes: `q8_0` (1.88x smaller) or `q4_0` (3.56x). Plain paged-attention models on `--attention-backend triton` only; refused at startup otherwise. See [kv-cache-quant.md](kv-cache-quant.md) |
+| `--kv-cache-dtype` | auto | Store the paged KV as block-quantized codes: `q8_0` (1.88x smaller) or `q4_0` (3.56x). Plain paged-attention models on `--attention-backend triton` only; refused at startup otherwise. See [kv-cache-quant.md](kv-cache-quant.md); whether the freed VRAM buys you anything depends on your machine, see [vram-and-speed.md](vram-and-speed.md) |
 | `--moe-cpu-threads` | physical cores | CPU worker threads for the cpu/hybrid executor |
 | `--moe-cpu-layers` | all on GPU | With `offload`: which MoE layers decode on CPU (`3,7,11`, a count, or a fraction) |
 | `--moe-hybrid-max-fetch` | auto | With `hybrid`: max experts fetched over PCIe per layer per step; rest computed on CPU |

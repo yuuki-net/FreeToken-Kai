@@ -34,7 +34,9 @@ The fork adds seven things upstream does not have:
    one -- measured on that card, `q4_0` costs about a third of the decode rate once the
    context reaches ~30k. Plain paged-attention models on the Triton backend only; gpt-oss
    (sliding window) and Qwen3.8-Flash-Next (sparse index tiers) are refused at startup. See
-   [kv-cache-quant.md](kv-cache-quant.md).
+   [kv-cache-quant.md](kv-cache-quant.md), and [vram-and-speed.md](vram-and-speed.md) for why
+   the VRAM it frees did not make this machine faster -- and how to tell whether it would
+   make yours faster.
 
 Everything else is upstream FreeToken. The feature sets are independent: image input, the MTP
 head, the host embedding, the layer split and the bank mapping also apply to a plain upstream
