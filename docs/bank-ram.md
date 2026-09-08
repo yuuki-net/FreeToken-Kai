@@ -10,6 +10,12 @@ On two RTX 3060 12 GB with 64 GB of RAM, Qwen3.8-Flash-Next decodes at 14-15 tok
 gpt-oss-120b decodes at 15 tok/s -- that model puts 98% of its parameters in experts, so
 almost nothing has to live on the card and the layer split is not needed at all.
 
+Read "64 GB" in this document as **a 128 GB host held down to 64 GB with a locked balloon**, on the
+machine described in [kai.md](kai.md); no real 64 GB host has run this. That cuts in the direction
+you may not expect: 128 GB is four DDR5 DIMMs at 4000 MT/s where two would run 4800, and the
+CPU-side memory rate is what caps decode here, so an actual two-DIMM 64 GB machine has *faster*
+memory than the one these numbers came from.
+
 What it does not buy you: it does not make prefill faster (it makes it slower), it does not
 reduce disk space (it adds a copy of the banks), and it is not a way to run a model your GPUs
 could not otherwise hold. The GPU-side requirements are unchanged.

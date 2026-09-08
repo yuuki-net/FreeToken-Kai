@@ -39,12 +39,23 @@ cost where acceptance runs long. [docs/kai.md](docs/kai.md) has the per-step tim
 | 1× RTX 2060 6 GB | 32 GB | `openai/gpt-oss-20b` (21B MoE, MXFP4) | not recorded | 13–14 tok/s |
 | 1× RTX 2060 6 GB | 32 GB | `ornith-ai/Ornith-1.5-35B-A3B-NVFP4` (35B-A3B, vision) | **64k** | **25–39 tok/s** |
 | 2× RTX 3060 12 GB, one card used | 128 GB | `ornith-ai/Ornith-1.5-35B-A3B-NVFP4` (35B-A3B, vision) | **256k** | **39–47 tok/s** near the start, **25** at 250k |
-| 1× RTX 3060 12 GB | 64 GB | `openai/gpt-oss-120b` (117B MoE, MXFP4) | 32k | **15 tok/s** (`--moe-bank-ram 48G`) |
+| 2× RTX 3060 12 GB, one card used | 64 GB* | `openai/gpt-oss-120b` (117B MoE, MXFP4) | 32k | **15 tok/s** (`--moe-bank-ram 48G`) |
 | 2× RTX 3060 12 GB | 128 GB | `RadixArk/Qwen3.8-Flash-Next-NVFP4` (125B MoE, vision) | **128k** | **18–20 tok/s** (`--pp-size 2`) |
-| 2× RTX 3060 12 GB | 64 GB | same model, `--moe-bank-ram 48G` | 128k | 14–15 tok/s |
+| 2× RTX 3060 12 GB | 64 GB* | same model, `--moe-bank-ram 48G` | 128k | 14–15 tok/s |
 
 Qwen3.8-Flash-Next does not fit one 12 GB card at all; the two-card rows are what make it run.
 gpt-oss-120b puts 98% of its parameters in experts, which is why a single 12 GB card can serve it.
+
+**Both one-card rows are one card of the two-card machine** (`--gpu 0`), not a machine with one card
+in it. The host is the same either way — an i5-12600KF with 128 GB — so what the second, idle card
+changes is nothing except that nobody has confirmed these numbers on a genuinely single-GPU build.
+
+**\*The 64 GB rows are a 128 GB host held down to 64 GB with a locked balloon**, not a 64 GB
+machine. That is not a smaller claim than it sounds — it may be a larger one. 128 GB means four
+DDR5 DIMMs, which run at 4000 MT/s where two would run 4800, and the CPU-side memory rate is what
+caps decode in every offloaded row here. A real two-DIMM 64 GB host has faster memory than the
+machine these numbers came from, so it may beat them rather than fall short. Nobody has run it; see
+[docs/kai.md](docs/kai.md).
 
 ### 250k of context on one 12 GB card
 
