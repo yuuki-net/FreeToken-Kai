@@ -4,7 +4,7 @@ An unofficial fork of [FlashML-org/FreeToken](https://github.com/FlashML-org/Fre
 based on upstream `main` at commit `af71ba4` (2026-09-03). It is not affiliated with, endorsed
 by, or supported by FlashML. The license is unchanged (Apache-2.0).
 
-The fork adds six things upstream does not have:
+The fork adds seven things upstream does not have:
 
 1. **Image input over the OpenAI API** for checkpoints that ship a vision tower but were served
    text-only: Qwen3.8-Flash-Next and the Qwen3.5-MoE family (Qwen3.6-35B-A3B, Ornith-1.5-35B-A3B).
@@ -29,6 +29,12 @@ The fork adds six things upstream does not have:
    alone will not do for you: one profiling run to learn which experts to keep resident
    (`--moe-stats-out`), and one `read_ahead_kb` setting that is worth 2.5x by itself. See
    [bank-ram.md](bank-ram.md).
+7. **A quantized KV cache** (`--kv-cache-dtype q8_0` / `q4_0`), which is 1.88x / 3.56x smaller
+   than 16-bit. On a small card the KV and the MoE expert cache share the same VRAM, so the
+   bytes the KV gives back become expert slots -- 358 to 902 of them at 64k on a 6 GB 2060.
+   Plain paged-attention models on the Triton backend only; gpt-oss (sliding window) and
+   Qwen3.8-Flash-Next (sparse index tiers) are refused at startup. See
+   [kv-cache-quant.md](kv-cache-quant.md).
 
 Everything else is upstream FreeToken. The feature sets are independent: image input, the MTP
 head, the host embedding, the layer split and the bank mapping also apply to a plain upstream
@@ -313,6 +319,11 @@ vocabularies only (Ornith's is untied); Qwen3.5-MoE family.
   planner leaves ~0.5 GiB for them.
 - The Triton attention backend is used on Turing; flashinfer's JIT attention fails there at
   head_dim 256.
+- `--kv-cache-dtype` covers the plain paged KV pool only, and only on the Triton attention
+  backend (`auto` picks flashinfer on sm_80+, so ask for Triton explicitly there). The SWA
+  window pool, the QSA/DSA index tiers and MLA latents are still 16-bit, so gpt-oss,
+  Qwen3.8-Flash-Next, GLM-5.3-Flash, DeepSeek-V4-Flash, MiniMax-M3 and MLA checkpoints are
+  refused. `q4_0` has not been measured on a benchmark suite.
 - DeepStack vision checkpoints (Qwen3-VL proper) are refused; only checkpoints with an empty
   `deepstack_visual_indexes` are supported.
 
