@@ -18,12 +18,12 @@ On a small card the paged KV and the MoE expert slot cache come out of the same 
 `--moe-cache-auto` hands whatever the KV does not take to the experts. So the flag has two
 quite different uses, and the second one is usually the interesting one:
 
-- **more context in the same VRAM** — an RTX 2060 6 GB serves Ornith-1.5-35B-A3B at
-  **262,144 tokens** with `q4_0` (1.41 GiB of KV). The same card at 16-bit tops out at 64k,
-  which already costs 1.25 GiB.
-- **a deeper expert cache at the same context** — at 64k on that card the expert slots go
-  from 358 (16-bit) to 713 (`q8_0`) to 902 (`q4_0`), and the measured VRAM hit rate from
-  42.2% to 49.4% to 50.7%.
+- **a deeper expert cache at the same context** — at 64k on an RTX 2060 6 GB serving
+  Ornith-1.5-35B-A3B, the expert slots go from 358 (16-bit) to 713 (`q8_0`) to 902
+  (`q4_0`), and the measured VRAM hit rate from 42.2% to 49.4% to 50.7%.
+- **more context in the same VRAM** — 262,144 tokens of KV allocate on that card (1.41 GiB,
+  against 1.25 GiB for 64k at 16-bit). Read the next section before you set that, though:
+  allocating the KV is not the same as being able to use it.
 
 Be aware that on a machine whose host RAM cannot pin the whole expert bank, most of the CPU
 expert work comes from layers that are locked to the CPU at startup (`--moe-cpu-layers auto`
@@ -31,6 +31,55 @@ says so in the log) and never consult the VRAM cache at all. A deeper cache does
 those layers. On the 2060 above, 21 of 40 MoE layers are locked that way, and the decode
 gain from doubling the cache was about 2%. Check that line in your startup log before
 expecting a speedup.
+
+## Long prompts: read this before raising the context
+
+Making the KV fit is the easy half. What a long context costs on a small card is prefill,
+and prefill is where this configuration breaks.
+
+Measured on the 2060 (Ornith, `q4_0`, one 30,448-token prompt, `tools/longctx.py`):
+
+| `--max-prefill-length` | prompt | result |
+|---|---|---|
+| 8192 (default) | 30,448 tokens | 1081 s (~28 tok/s prefill) |
+| 4096 | 30,448 tokens | **232 s (~134 tok/s)** |
+
+Same work, 4.7x apart. The prefill chunk is the unit of transient memory: the GDN kernels
+allocate buffers proportional to it (about 0.4 GiB at 8192 for this model, half that at
+4096), per chunk, freed after each. When that transient is the same size as the free VRAM,
+the run gets slow — and sometimes dies. On the same machine a 30k prompt at 262,144 context
+killed the server outright in the GDN prefill kernel ("CUDA driver error: device not ready",
+this machine's symptom of running out of VRAM), because only ~0.6 GiB was left for it.
+
+It is not deterministic: the identical configuration passed the same prompt on a later run
+when the desktop happened to be using 150 MB less VRAM. **On a machine you also use for
+other things, a configuration that leaves half a gigabyte free will work some days and not
+others.**
+
+So, if you raise the context:
+
+- pass `--max-prefill-length 4096` (or lower). On this card it is both faster and safer than
+  the 8192 default, and there is no reason to think 4096 is optimal -- it is the value that
+  worked, not a measured optimum.
+- leave real headroom. `--moe-cache-auto` hands the VRAM the KV gives back to the expert
+  cache, right up to a small margin; on a desktop machine, set `--moe-cache-size` explicitly
+  or lower `--memory-ratio` instead of letting it fill.
+- watch decode, not just capacity. At ~30k of context this model decoded at 11-13 tok/s on
+  `q4_0` against 15.8 on 16-bit KV in the same test -- the dequantization cost grows with
+  the context it has to walk. At 8k the ordering was the other way round. Few samples, but
+  do not assume the 64k numbers hold at 256k.
+
+## Platform note
+
+Every number here was measured under **WSL2 on Windows**. Two things behave differently on
+native Linux, both of which affect this feature:
+
+- Windows can back a GPU allocation that does not fit with system RAM (it shows up as
+  "shared GPU memory"), so an over-subscribed run gets slow rather than failing. Native
+  Linux fails the allocation instead.
+- FreeToken caps host pinning at 40% of RAM on WSL and does not cap it at all on native
+  Linux, so the CPU/GPU split of the MoE layers -- and therefore decode speed -- can differ
+  on the same hardware.
 
 ## Where it applies
 
@@ -83,19 +132,27 @@ KV cache dies with the process — so byte compatibility would have bought nothi
 
 ## Example
 
-Ornith-1.5-35B-A3B on an RTX 2060 6 GB (WSL2), 256k of context:
+Ornith-1.5-35B-A3B on an RTX 2060 6 GB (WSL2). This is the configuration actually in daily
+use on that card -- 64k of context, the VRAM the KV gives back spent on expert slots:
 
 ```bash
 ft serve --model ~/models/Ornith-1.5-35B-A3B-NVFP4 --dtype float16 \
   --moe-backend hybrid --disable-moe-prefill-overlap --max-running-req 1 \
   --host-embedding --kv-cache-dtype q4_0 \
-  --kv-reserve-tokens 262144 --max-seq-len-override 262144 \
+  --kv-reserve-tokens 65536 --max-seq-len-override 65536 \
   --memory-ratio 0.82 --moe-cpu-threads 6
 ```
 
 The startup log tells you what it bought:
 
 ```
---moe-cache-auto resolved moe_cache_size=264 num_pages=262245
-Allocating 262245 tokens for KV cache, K + V = 1.41 GiB
+--moe-cache-auto resolved moe_cache_size=902 num_pages=65571
+Allocating 65571 tokens for KV cache, K + V = 0.35 GiB
 ```
+
+902 expert slots against 358 at 16-bit, for the same context.
+
+Raising both token counts to 262144 does allocate (1.41 GiB of KV, 264 slots), but see
+"Long prompts" above before you do: that setting killed the server on a 30k prompt on this
+card, and it needs `--max-prefill-length 4096` at minimum. It is not a configuration this
+fork can recommend yet.
