@@ -29,11 +29,11 @@ The fork adds seven things upstream does not have:
    alone will not do for you: one profiling run to learn which experts to keep resident
    (`--moe-stats-out`), and one `read_ahead_kb` setting that is worth 2.5x by itself. See
    [bank-ram.md](bank-ram.md).
-7. **A quantized KV cache** (`--kv-cache-dtype q8_0` / `q4_0`), which is 1.88x / 3.56x smaller
-   than 16-bit. On a small card the KV and the MoE expert cache share the same VRAM, so the
-   bytes the KV gives back become expert slots -- 358 to 902 of them at 64k on a 6 GB 2060.
-   Plain paged-attention models on the Triton backend only; gpt-oss (sliding window) and
-   Qwen3.8-Flash-Next (sparse index tiers) are refused at startup. See
+7. **A quantized KV cache** (`--kv-cache-dtype q8_0` / `q4_0`), 1.88x / 3.56x smaller than
+   16-bit: 1.25 GiB down to 0.35 GiB at 64k on a 6 GB 2060. It is a VRAM trade, not a speed
+   one -- measured on that card, `q4_0` costs about a third of the decode rate once the
+   context reaches ~30k. Plain paged-attention models on the Triton backend only; gpt-oss
+   (sliding window) and Qwen3.8-Flash-Next (sparse index tiers) are refused at startup. See
    [kv-cache-quant.md](kv-cache-quant.md).
 
 Everything else is upstream FreeToken. The feature sets are independent: image input, the MTP

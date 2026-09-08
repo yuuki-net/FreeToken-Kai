@@ -26,7 +26,7 @@ This fork adds seven things on top of it. They are independent — take one, ign
 | 4 | **Image input over the OpenAI API** for checkpoints that ship a vision tower but were served text-only. The vision tower runs on the CPU, so it costs no VRAM. | send `image_url` parts |
 | 5 | **Speculative decoding with the checkpoint's own MTP head.** Verify window and draft head captured as CUDA graphs. Correctness-verified. It pays off only where a multi-row verify costs about what a single row costs: with the experts in host RAM that means long acceptance, so it wins on code and tool calls on two cards and loses on free prose and on one card. | `--spec-mtp 5` |
 | 6 | **64k of context on a 6 GB card.** The input embedding table lives in host memory and the GPU reads rows from it directly. | `--host-embedding` |
-| 7 | **A KV cache 1.9x or 3.6x smaller**, stored as block-quantized codes. On a small card the KV and the MoE expert cache share the same VRAM, so the bytes it gives back become expert slots — 358 to 902 of them at 64k on a 6 GB card. Plain paged-attention models on the Triton backend only. | `--kv-cache-dtype q4_0` |
+| 7 | **A KV cache 1.9x or 3.6x smaller**, stored as block-quantized codes: 1.25 GiB down to 0.35 GiB at 64k on a 6 GB card. It buys VRAM, not speed — past a few thousand tokens of context it costs about a third of the decode rate. Plain paged-attention models on the Triton backend only. | `--kv-cache-dtype q4_0` |
 
 Everything else is upstream FreeToken.
 
