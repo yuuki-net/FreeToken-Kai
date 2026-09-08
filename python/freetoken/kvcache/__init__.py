@@ -109,6 +109,8 @@ def create_kv_pool(config, num_pages: int, device: torch.device, dtype: torch.dt
             if config.cache_type == "swa_radix"
             else _naive_swa_num_tokens(config)
         )
+    from .kv_quant import resolve as _resolve_kv_quant
+
     return create_kvcache_pool(
         model_config=model_config,
         num_pages=num_pages + 1,  # +1 for dummy page
@@ -117,6 +119,7 @@ def create_kv_pool(config, num_pages: int, device: torch.device, dtype: torch.dt
         device=device,
         dtype=dtype,
         num_req_slots=config.max_running_req + 1,  # + 1 for the dummy request row
+        kv_quant=_resolve_kv_quant(getattr(config, "kv_cache_dtype", None)),
     )
 
 
@@ -128,7 +131,22 @@ def create_kvcache_pool(
     device: torch.device,
     num_swa_tokens: int | None = None,
     num_req_slots: int | None = None,
+    kv_quant=None,
 ) -> BaseKVCachePool:
+    if kv_quant is not None:
+        # Refuse at startup rather than serve a pool whose secondary tiers (SWA window,
+        # sparse index slabs, MLA latents) are still 16-bit while the paged slab is not:
+        # every one of those is read by a kernel that has not been taught the layout, and
+        # the failure mode is wrong numbers, not an exception.
+        from .mha_pool import MHAKVCache as _MHA
+
+        family = resolve_pool_class(model_config)
+        if family is not _MHA:
+            raise ValueError(
+                f"--kv-cache-dtype {kv_quant.name} is only implemented for the plain paged "
+                f"pool; this model resolves to {family.__name__}. Serve it without the flag."
+            )
+
     # the pools validate global layer ids against the model depth; the MTP draft head (spec
     # decoding) is one more full-attention layer numbered num_layers
     num_layers = model_config.num_layers
@@ -252,15 +270,21 @@ def create_kvcache_pool(
         )
 
     spec = kv_specs[0] if len(kv_specs) == 1 else None
+    head_dim = spec.head_dim if spec is not None else model_config.head_dim
+    if kv_quant is not None:
+        # code_bytes_per_row raises with the head_dim in the message when the block does not
+        # divide it, which is the only geometry this layout cannot express.
+        kv_quant.code_bytes_per_row(head_dim)
     return MHAKVCache(
         num_kv_heads=spec.num_kv_heads if spec is not None else model_config.num_kv_heads,
         num_pages=num_pages,
         page_size=page_size,
         num_layers=num_layers,
-        head_dim=spec.head_dim if spec is not None else model_config.head_dim,
+        head_dim=head_dim,
         device=device,
         dtype=dtype,
         layer_ids=layer_ids,
+        kv_quant=kv_quant,
     )
 
 

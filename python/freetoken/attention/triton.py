@@ -151,10 +151,20 @@ class TritonAttentionBackend(BaseAttnBackend):
 
         k_raw = self.kvcache.k_cache(layer_id)
         v_raw = self.kvcache.v_cache(layer_id)
-        kv_heads, head_dim = k_raw.shape[-2], k_raw.shape[-1]
+        kv_heads, width = k_raw.shape[-2], k_raw.shape[-1]
+        # With --kv-cache-dtype the slab's last axis is code BYTES, not head_dim; the query
+        # is the only thing that still knows the real width.
+        kv_quant = getattr(self.kvcache, "kv_quant", None)
+        head_dim = q.shape[-1] if kv_quant is not None else width
         assert head_dim == q.shape[-1]
-        k_cache = k_raw.view(-1, kv_heads, head_dim)
-        v_cache = v_raw.view(-1, kv_heads, head_dim)
+        k_cache = k_raw.view(-1, kv_heads, width)
+        v_cache = v_raw.view(-1, kv_heads, width)
+        if kv_quant is None:
+            k_scales = v_scales = None
+        else:
+            nb = kv_quant.blocks_per_row(head_dim)
+            k_scales = self.kvcache.k_scales(layer_id).view(-1, kv_heads, nb)
+            v_scales = self.kvcache.v_scales(layer_id).view(-1, kv_heads, nb)
 
         spec = attn_spec or AttentionSpec()
         indices = metadata.indices
@@ -181,6 +191,9 @@ class TritonAttentionBackend(BaseAttnBackend):
                 sm_scale=scale,
                 sliding_window=spec.sliding_window,
                 sinks=spec.sinks,
+                k_scales=k_scales,
+                v_scales=v_scales,
+                kv_quant=kv_quant,
             )
         if (
             (not metadata.is_decode)
@@ -201,6 +214,9 @@ class TritonAttentionBackend(BaseAttnBackend):
                 sinks=spec.sinks,
                 k_extend=k.view(q.shape[0], kv_heads, head_dim),
                 v_extend=v.view(q.shape[0], kv_heads, head_dim),
+                k_scales=k_scales,
+                v_scales=v_scales,
+                kv_quant=kv_quant,
             )
         return paged_attention(
             q=q,
@@ -213,6 +229,9 @@ class TritonAttentionBackend(BaseAttnBackend):
             sm_scale=scale,
             sliding_window=spec.sliding_window,
             sinks=spec.sinks,
+            k_scales=k_scales,
+            v_scales=v_scales,
+            kv_quant=kv_quant,
         )
 
     def prepare_metadata(self, batch: Batch) -> None:

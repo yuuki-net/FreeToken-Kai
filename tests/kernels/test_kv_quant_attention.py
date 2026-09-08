@@ -131,6 +131,98 @@ def test_quantization_error_stays_within_what_the_width_implies(spec):
     assert cos > floor, f"{spec.name}: cosine {cos:.6f} against unquantized attention"
 
 
+def _prefix_case(spec, dev, dtype, head_dim, num_kv_heads, prefix, new):
+    """A prefill continuing a cached prefix: the prefix is quantized, this step's K/V is not."""
+    total = prefix + new
+    k = torch.randn(total, num_kv_heads, head_dim, device=dev, dtype=dtype)
+    v = torch.randn(total, num_kv_heads, head_dim, device=dev, dtype=dtype)
+    kc, ks = quantize_rows(k.float(), spec)
+    vc, vs = quantize_rows(v.float(), spec)
+    kc, ks, vc, vs = kc.to(dev), ks.to(dev), vc.to(dev), vs.to(dev)
+    k_oracle = dequantize_rows(kc.cpu(), ks.cpu(), spec, dtype).to(dev)
+    v_oracle = dequantize_rows(vc.cpu(), vs.cpu(), spec, dtype).to(dev)
+    return (kc, ks, vc, vs), (k_oracle, v_oracle)
+
+
+@pytest.mark.parametrize("spec", [Q8_0, Q4_0], ids=lambda s: s.name)
+@pytest.mark.parametrize("split", [False, True], ids=["fused", "split-extend"])
+def test_extend_reads_back_what_the_slab_holds(spec, split):
+    from freetoken.kernel.triton.attention import extend_paged_attention
+
+    torch.manual_seed(6)
+    dev = torch.device("cuda")
+    dtype = torch.float16
+    head_dim, num_kv_heads, num_q_heads = 256, 2, 16
+    prefix, new = 48, 16
+    total = prefix + new
+
+    q = torch.randn(new, num_q_heads, head_dim, device=dev, dtype=dtype)
+    (kc, ks, vc, vs), (k_oracle, v_oracle) = _prefix_case(
+        spec, dev, dtype, head_dim, num_kv_heads, prefix, new
+    )
+    qo_indptr = torch.tensor([0, new], dtype=torch.int32, device=dev)
+    kv_indptr = torch.tensor([0, total], dtype=torch.int32, device=dev)
+    kv_indices = torch.arange(total, dtype=torch.int32, device=dev)
+    prefix_lens = torch.tensor([prefix], dtype=torch.int32, device=dev)
+
+    extra = {}
+    if split:
+        # the split kernel takes this step's K/V unquantized alongside the cached prefix
+        extra = dict(k_extend=k_oracle[prefix:].contiguous(), v_extend=v_oracle[prefix:].contiguous())
+
+    common = dict(
+        q=q,
+        qo_indptr=qo_indptr,
+        kv_indptr=kv_indptr,
+        kv_indices=kv_indices,
+        prefix_lens=prefix_lens,
+        max_q_len=new,
+        sm_scale=head_dim**-0.5,
+    )
+    want = extend_paged_attention(k_cache=k_oracle, v_cache=v_oracle, **common, **extra)
+    got = extend_paged_attention(
+        k_cache=kc, v_cache=vc, k_scales=ks, v_scales=vs, kv_quant=spec, **common, **extra
+    )
+
+    assert torch.isfinite(got).all()
+    torch.testing.assert_close(got, want, atol=2e-3, rtol=2e-3)
+
+
+@pytest.mark.parametrize("spec", [Q8_0, Q4_0], ids=lambda s: s.name)
+def test_the_paged_fallback_reads_back_what_the_slab_holds(spec):
+    from freetoken.kernel.triton.attention import paged_attention
+
+    torch.manual_seed(7)
+    dev = torch.device("cuda")
+    dtype = torch.float16
+    head_dim, num_kv_heads, num_q_heads = 128, 2, 8
+    total = 33
+
+    q = torch.randn(total, num_q_heads, head_dim, device=dev, dtype=dtype)
+    (kc, ks, vc, vs), (k_oracle, v_oracle) = _prefix_case(
+        spec, dev, dtype, head_dim, num_kv_heads, total, 0
+    )
+    indptr = torch.tensor([0, total], dtype=torch.int32, device=dev)
+    indices = torch.arange(total, dtype=torch.int32, device=dev)
+    q_to_req = torch.zeros(total, dtype=torch.int32, device=dev)
+    q_positions = torch.arange(total, dtype=torch.int64, device=dev)
+
+    common = dict(
+        q=q,
+        indptr=indptr,
+        indices=indices,
+        q_to_req=q_to_req,
+        q_positions=q_positions,
+        sm_scale=head_dim**-0.5,
+    )
+    want = paged_attention(k_cache=k_oracle, v_cache=v_oracle, **common)
+    got = paged_attention(
+        k_cache=kc, v_cache=vc, k_scales=ks, v_scales=vs, kv_quant=spec, **common
+    )
+    assert torch.isfinite(got).all()
+    torch.testing.assert_close(got, want, atol=2e-3, rtol=2e-3)
+
+
 def test_unquantized_path_is_untouched():
     """QBITS == 0 has to keep producing exactly what it did before the branch existed."""
     torch.manual_seed(5)

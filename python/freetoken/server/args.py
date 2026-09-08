@@ -629,6 +629,19 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--kv-cache-dtype",
+        default=ServerArgs.kv_cache_dtype,
+        choices=["auto", "q8_0", "q4_0"],
+        help=(
+            "Store the paged KV cache as block-quantized codes instead of 16-bit: q8_0 is "
+            "1.88x smaller, q4_0 3.56x. The point on a small card is not context length but "
+            "the expert cache -- --moe-cache-auto hands the freed VRAM to MoE slots, and a "
+            "deeper expert cache is what decode time is made of. Plain paged-attention "
+            "models only (refused at startup otherwise); q4_0 costs measurable accuracy."
+        ),
+    )
+
+    parser.add_argument(
         "--moe-bank-ram",
         default=ServerArgs.moe_bank_ram,
         help=(

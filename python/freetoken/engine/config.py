@@ -34,6 +34,9 @@ class EngineConfig:
     moe_cache_rate: float | None = None
     moe_cache_auto: bool = False
     kv_reserve_tokens: int = 8192  # KV floor for --moe-cache-auto; small by design (MoE-priority)
+    # --kv-cache-dtype: "auto" (16-bit), "q8_0" or "q4_0". Narrows the paged KV slab so
+    # --moe-cache-auto can hand the difference to the expert cache (see kvcache/kv_quant.py).
+    kv_cache_dtype: str | None = None
     moe_cache_policy: str = "lru"
     moe_prefill_overlap: bool = True
     # Prefill hit/miss split: serve cache-resident experts D2D during prefill
