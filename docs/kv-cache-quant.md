@@ -12,18 +12,32 @@ Stores the paged KV cache as block-quantized codes instead of 16-bit floats.
 | `q8_0` | 1.0625 | 1.88x smaller |
 | `q4_0` | 0.5625 | 3.56x smaller |
 
-## What it is actually for
+## What it buys, and what it costs
 
-On a small card the paged KV and the MoE expert slot cache come out of the same VRAM, and
-`--moe-cache-auto` hands whatever the KV does not take to the experts. So the flag has two
-quite different uses, and the second one is usually the interesting one:
+It buys VRAM. On an RTX 2060 6 GB serving Ornith-1.5-35B-A3B at 64k, the KV goes from
+1.25 GiB to 0.35 GiB, and `--moe-cache-auto` turns that into expert slots: 358 to 902.
 
-- **a deeper expert cache at the same context** — at 64k on an RTX 2060 6 GB serving
-  Ornith-1.5-35B-A3B, the expert slots go from 358 (16-bit) to 713 (`q8_0`) to 902
-  (`q4_0`), and the measured VRAM hit rate from 42.2% to 49.4% to 50.7%.
-- **more context in the same VRAM** — 262,144 tokens of KV allocate on that card (1.41 GiB,
-  against 1.25 GiB for 64k at 16-bit). Read the next section before you set that, though:
-  allocating the KV is not the same as being able to use it.
+**It does not buy speed, and past a few thousand tokens of context it costs speed.** Measured
+on that card with `tools/longctx.py`, four configurations, two runs each:
+
+| context | 16-bit KV | `q4_0` |
+|---|---|---|
+| ~2k | 31.5 tok/s | 32.0 tok/s |
+| ~30k | **20.2 / 20.3 tok/s** | **13.6 / 13.5 tok/s** |
+
+Decode reads the whole KV every step, so at 30k it dequantizes 30k tokens of codes per step
+across every full-attention layer. Prefill pays too: 210 s against 242 s for the same 30k
+prompt. Both results reproduced on every run.
+
+The deeper expert cache is real -- the VRAM hit rate went from 42.2% to 50.7% on a warm cache
+-- but on that machine it moved decode by about 2%, because most of the CPU expert work comes
+from layers pinned to the CPU at startup, which never touch the slot cache at all
+(`--moe-cpu-layers auto` says how many in the log). Raising the pin budget so fewer layers are
+locked did not help either: the same slots then spread across more layers.
+
+So: **use this when you need the VRAM** -- for context you could not otherwise fit, or to leave
+room for something else. Do not use it expecting a speed-up, and do not use it at long context
+unless the capacity is worth a third of your decode rate.
 
 Be aware that on a machine whose host RAM cannot pin the whole expert bank, most of the CPU
 expert work comes from layers that are locked to the CPU at startup (`--moe-cpu-layers auto`
@@ -64,10 +78,8 @@ So, if you raise the context:
 - leave real headroom. `--moe-cache-auto` hands the VRAM the KV gives back to the expert
   cache, right up to a small margin; on a desktop machine, set `--moe-cache-size` explicitly
   or lower `--memory-ratio` instead of letting it fill.
-- watch decode, not just capacity. At ~30k of context this model decoded at 11-13 tok/s on
-  `q4_0` against 15.8 on 16-bit KV in the same test -- the dequantization cost grows with
-  the context it has to walk. At 8k the ordering was the other way round. Few samples, but
-  do not assume the 64k numbers hold at 256k.
+- watch decode, not just capacity. See the table above: at ~30k this costs a third of the
+  decode rate, reproducibly. It gets worse as the context grows, not better.
 
 ## Platform note
 
