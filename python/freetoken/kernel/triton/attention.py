@@ -161,10 +161,39 @@ def _paged_attention_kernel(
 
 
 @triton.jit
+def _dequant_tile(
+    code_ptr,
+    code_off,
+    scale_ptr,
+    scale_off,
+    nib_hi,
+    mask,
+    QBITS: tl.constexpr,
+):
+    """One K or V tile read back out of the block-quantized slabs (``--kv-cache-dtype``).
+
+    The caller owns the offsets because K arrives transposed ([D, N]) and V does not
+    ([N, DV]); everything that differs between the two is in how those are broadcast, and
+    everything that differs between 4- and 8-bit is here. ``other=0`` on both loads makes a
+    masked lane dequantize to a clean 0 rather than to garbage times a stale scale.
+    """
+    b = tl.load(code_ptr + code_off, mask=mask, other=0).to(tl.int32)
+    if QBITS == 8:
+        code = tl.where(b > 127, b - 256, b)
+    else:
+        nib = tl.where(nib_hi, (b >> 4) & 0xF, b & 0xF)
+        code = tl.where(nib > 7, nib - 16, nib)
+    s = tl.load(scale_ptr + scale_off, mask=mask, other=0.0).to(tl.float32)
+    return code.to(tl.float32) * s
+
+
+@triton.jit
 def _decode_grouped_stage1_kernel(
     q_ptr,
     k_ptr,
     v_ptr,
+    ks_ptr,
+    vs_ptr,
     sm_scale,
     indptr_ptr,
     indices_ptr,
@@ -178,12 +207,18 @@ def _decode_grouped_stage1_kernel(
     stride_kh,
     stride_vs,
     stride_vh,
+    stride_kss,
+    stride_ksh,
+    stride_vss,
+    stride_vsh,
     stride_mid_ob,
     stride_mid_oh,
     stride_mid_os,
     stride_lse_b,
     stride_lse_h,
     stride_lse_s,
+    QBITS: tl.constexpr,
+    QBLOCK: tl.constexpr,
     GROUP: tl.constexpr,
     NUM_Q_HEADS: tl.constexpr,
     BLOCK_D: tl.constexpr,
@@ -235,12 +270,24 @@ def _decode_grouped_stage1_kernel(
     acc = tl.zeros((BLOCK_H, BLOCK_DV), dtype=tl.float32)
 
     q_offsets = batch_id * stride_qt + q_heads[:, None] * stride_qh + offs_d[None, :]
-    k_base_offsets = kv_head * stride_kh + offs_d[:, None]
-    v_base_offsets = kv_head * stride_vh + offs_dv[None, :]
+    if QBITS == 0:
+        k_base_offsets = kv_head * stride_kh + offs_d[:, None]
+        v_base_offsets = kv_head * stride_vh + offs_dv[None, :]
+    else:
+        # code byte per element: 8-bit is one byte each, 4-bit packs a pair low nibble first
+        byte_d = offs_d // 2 if QBITS == 4 else offs_d
+        byte_dv = offs_dv // 2 if QBITS == 4 else offs_dv
+        k_base_offsets = kv_head * stride_kh + byte_d[:, None]
+        v_base_offsets = kv_head * stride_vh + byte_dv[None, :]
+        k_scale_base = kv_head * stride_ksh + (offs_d // QBLOCK)[:, None]
+        v_scale_base = kv_head * stride_vsh + (offs_dv // QBLOCK)[None, :]
+        k_nib_hi = ((offs_d % 2) == 1)[:, None]
+        v_nib_hi = ((offs_dv % 2) == 1)[None, :]
 
     if split_end > split_start:
         q = tl.load(q_ptr + q_offsets, mask=mask_h[:, None] & mask_d[None, :], other=0.0)
-        q = q.to(k_ptr.dtype.element_ty)
+        if QBITS == 0:
+            q = q.to(k_ptr.dtype.element_ty)
 
         for rel_start in tl.range(split_start, split_end, BLOCK_N):
             rel_offs = rel_start + tl.arange(0, BLOCK_N)
@@ -248,19 +295,41 @@ def _decode_grouped_stage1_kernel(
             logical_offs = effective_start + rel_offs
             slots = tl.load(indices_ptr + kv_start + logical_offs, mask=mask_n, other=0)
 
-            k = tl.load(
-                k_ptr + slots[None, :] * stride_ks + k_base_offsets,
-                mask=mask_n[None, :] & mask_d[:, None],
-                other=0.0,
-            )
+            if QBITS == 0:
+                k = tl.load(
+                    k_ptr + slots[None, :] * stride_ks + k_base_offsets,
+                    mask=mask_n[None, :] & mask_d[:, None],
+                    other=0.0,
+                )
+            else:
+                k = _dequant_tile(
+                    k_ptr,
+                    slots[None, :] * stride_ks + k_base_offsets,
+                    ks_ptr,
+                    slots[None, :] * stride_kss + k_scale_base,
+                    k_nib_hi,
+                    mask_n[None, :] & mask_d[:, None],
+                    QBITS,
+                ).to(q.dtype)
             scores = tl.dot(q, k) * sm_scale
             scores = tl.where(mask_h[:, None] & mask_n[None, :], scores, -float("inf"))
 
-            v = tl.load(
-                v_ptr + slots[:, None] * stride_vs + v_base_offsets,
-                mask=mask_n[:, None] & mask_dv[None, :],
-                other=0.0,
-            )
+            if QBITS == 0:
+                v = tl.load(
+                    v_ptr + slots[:, None] * stride_vs + v_base_offsets,
+                    mask=mask_n[:, None] & mask_dv[None, :],
+                    other=0.0,
+                )
+            else:
+                v = _dequant_tile(
+                    v_ptr,
+                    slots[:, None] * stride_vs + v_base_offsets,
+                    vs_ptr,
+                    slots[:, None] * stride_vss + v_scale_base,
+                    v_nib_hi,
+                    mask_n[:, None] & mask_dv[None, :],
+                    QBITS,
+                ).to(q.dtype)
 
             m_new = tl.maximum(tl.max(scores, axis=1), m_i)
             alpha = tl.exp(m_i - m_new)
@@ -380,8 +449,15 @@ def decode_paged_attention(
     sliding_window: int | None = None,
     sinks: torch.Tensor | None = None,
     out: torch.Tensor | None = None,
+    k_scales: torch.Tensor | None = None,
+    v_scales: torch.Tensor | None = None,
+    kv_quant=None,
 ) -> torch.Tensor:
-    """SGLang-style split-k grouped decode attention for one query per request."""
+    """SGLang-style split-k grouped decode attention for one query per request.
+
+    With ``kv_quant`` set (``--kv-cache-dtype``), ``k_cache``/``v_cache`` are uint8 code
+    slabs and ``k_scales``/``v_scales`` their fp16 block scales; the tiles are dequantized
+    inside the kernel, so nothing downstream of this call changes."""
 
     assert q.is_cuda and k_cache.is_cuda and v_cache.is_cuda
     assert q.dim() == 3 and k_cache.dim() == 3 and v_cache.dim() == 3
@@ -389,7 +465,13 @@ def decode_paged_attention(
     num_kv_heads = k_cache.shape[1]
     assert batch == indptr.numel() - 1
     assert v_cache.shape[1] == num_kv_heads
-    assert k_cache.shape[-1] == head_dim and v_cache.shape[-1] == head_dim
+    if kv_quant is None:
+        assert k_cache.shape[-1] == head_dim and v_cache.shape[-1] == head_dim
+    else:
+        assert k_scales is not None and v_scales is not None, "quantized slab without scales"
+        want = kv_quant.code_bytes_per_row(head_dim)
+        assert k_cache.shape[-1] == want and v_cache.shape[-1] == want
+        assert k_scales.shape[-1] == kv_quant.blocks_per_row(head_dim)
     assert num_q_heads % num_kv_heads == 0
     assert attn_logits.shape[0] >= batch
     assert attn_logits.shape[1] >= num_q_heads
@@ -421,6 +503,10 @@ def decode_paged_attention(
         q,
         k_cache,
         v_cache,
+        # unquantized: the slab itself stands in for the scale pointer (QBITS == 0 prunes
+        # every use of it) so the launch keeps one shape for both paths
+        k_scales if k_scales is not None else k_cache,
+        v_scales if v_scales is not None else v_cache,
         sm_scale,
         indptr,
         indices,
@@ -434,12 +520,18 @@ def decode_paged_attention(
         k_cache.stride(1),
         v_cache.stride(0),
         v_cache.stride(1),
+        k_scales.stride(0) if k_scales is not None else 0,
+        k_scales.stride(1) if k_scales is not None else 0,
+        v_scales.stride(0) if v_scales is not None else 0,
+        v_scales.stride(1) if v_scales is not None else 0,
         attn_logits.stride(0),
         attn_logits.stride(1),
         attn_logits.stride(2),
         attn_lse.stride(0),
         attn_lse.stride(1),
         attn_lse.stride(2),
+        QBITS=0 if kv_quant is None else kv_quant.bits,
+        QBLOCK=1 if kv_quant is None else kv_quant.block,
         GROUP=group,
         NUM_Q_HEADS=num_q_heads,
         BLOCK_D=block_d,
