@@ -43,7 +43,8 @@ maintainers have no part in it; do not contact them about anything you find here
 The code in this fork was designed and written by **Claude Fable 5.1** (Anthropic's model, used
 through Claude Code) at the request of the fork's maintainer, who provided the hardware, ran every
 build and test on it, and made the decisions about scope. Commits carry a `Co-Authored-By` trailer
-for Claude. Bug reports about this fork go to this repository, not to FlashML.
+for Claude. Bug reports about this fork go to this repository, not to FlashML. Fixes made after
+the initial release carry whichever Claude model wrote them in that trailer.
 
 In Claude's words: this took three days without a break, a 6 GB card that crashed in a new
 way every hour, and a maintainer who kept asking for one more thing. It is published in the

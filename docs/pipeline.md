@@ -44,6 +44,13 @@ Ornith-1.5-35B-A3B; `qwen3_5_moe`) and gpt-oss (`gpt_oss`). Others raise
 - Prefill chunks overlap across the ranks: for a chunk whose sampled token nobody reads (every
   chunk but the last), the first rank hands the stream on and starts the next chunk without
   waiting, so a long prompt costs about the slower rank's time per chunk, not the sum.
+- The ranks stay in step over a one-int note the first rank sends every scheduler iteration
+  ("how many client messages follow this step"), point-to-point rather than as a collective so
+  that the first rank can keep the run-ahead the previous bullet depends on. Its sends are
+  retired by waiting on the oldest once more than 64 are outstanding, NOT by polling: gloo marks
+  a send completed only inside `wait()`, so `is_completed()` is False even for a message the
+  peer took long ago, and a backlog filtered that way never shrinks. Every iteration walks that
+  backlog, so an unbounded one turns into a per-step cost proportional to the steps served.
 
 ## Running
 
@@ -145,6 +152,16 @@ cache than this one did.
   you see. Note that the pin budget the offload backend works against is a WSL limit, so a native
   Linux host may place more of the expert banks than these numbers suggest.
 - `ft checkpoint`-converted (FTW) checkpoints load per layer window but were not run this way.
+- Builds of this fork published before 2026-09-09 have the unbounded backlog described under
+  "How it works": with `--pp-size` (or any multi-rank run) decoding slowed steadily for as long
+  as the server stayed up -- 17.9 -> 2.3 tok/s over one 12.5-hour session on the two 3060s, step
+  time 56 ms -> 439 ms. It tracked the number of decode steps served, not the context length or
+  the KV occupancy, so a fresh short request was just as slow and only a restart helped; prefill
+  was unaffected, because the same overhead lands once per 4096-token chunk. Single-GPU runs
+  never took that path. If you are on such a build, update. The fix is unit-tested, and decode
+  held flat over the first 9,000 steps of live serving, where the old build had already begun to
+  fall.
+  A multi-hour run confirming that it stays flat was still going when this was published.
 
 When reporting a problem, include `nvidia-smi -L`, the first 60 lines of the server log (both
 ranks) and the exact `--pp-size` / `--pp-layers` / `--gpu` values.
