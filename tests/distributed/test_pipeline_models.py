@@ -193,6 +193,29 @@ def test_bank_pieces_are_filtered_to_this_ranks_layers(monkeypatch):
     ]
 
 
+def test_nvfp4_reader_leaves_bank_ids_global(monkeypatch):
+    """The reader skips the layers another rank serves, but the id it yields stays global:
+    _local_pieces is the one place that re-bases it. Windowing in both left every rank past
+    the first with empty banks (12288 rows missing on rank 1 of a 48-layer Flash-Next)."""
+    pytest.importorskip("freetoken.models.qwen4_exp.weight")
+    from freetoken.models.nvfp4_banks import _bank_layer
+    from freetoken.models.qwen4_exp.weight import nvfp4_expert_spec
+    from freetoken.moe.expert_banks import _local_pieces
+
+    cfg = SimpleNamespace(num_layers=48, num_moe_layers=24, first_k_dense_replace=0)
+    spec = nvfp4_expert_spec("", cfg)
+
+    _pp(monkeypatch, 1, 2, 24, 48, 48)
+    assert _bank_layer(spec, 24, cfg) == 24  # global, not re-based here
+    assert _bank_layer(spec, 47, cfg) == 47
+    assert _bank_layer(spec, 23, cfg) is None  # rank 0 serves it; this rank never reads it
+    pieces = [(_bank_layer(spec, layer, cfg), 0, 1, {}) for layer in (24, 25, 47)]
+    assert [p[0] for p in _local_pieces(cfg, iter(pieces))] == [0, 1, 23]
+
+    _pp(monkeypatch, 0, 1, 0, 48, 48)
+    assert _bank_layer(spec, 24, SimpleNamespace(num_layers=48, num_moe_layers=48, first_k_dense_replace=0)) == 24
+
+
 def test_gpt_oss_swa_pool_maps_only_local_layers(monkeypatch):
     """The hybrid SWA pool of a pipeline rank backs its own layers (global ids) and leaves the
     other ranks' layers unmapped; a single process still rejects a missing layer."""
