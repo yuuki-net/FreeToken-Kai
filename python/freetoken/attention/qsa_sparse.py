@@ -287,6 +287,9 @@ class QSASparseAttnBackend(BaseAttnBackend):
 
         self._update_index_cache(index, md, slot)
         indices = self._select(index, md, slot)
+        # --kv-cache-dtype: the paged K/V is codes, read through the fp16 block scales. The
+        # index tiers this method already used above stay 16-bit and are untouched.
+        kv_quant = getattr(self.kvcache, "kv_quant", None)
         return qsa_sparse_paged_attention(
             q,
             self.kvcache.k_cache(layer_id),
@@ -295,6 +298,9 @@ class QSASparseAttnBackend(BaseAttnBackend):
             md.block_table,
             md.token_to_req,
             torch.empty_like(q),
+            k_scales=None if kv_quant is None else self.kvcache.k_scales(layer_id),
+            v_scales=None if kv_quant is None else self.kvcache.v_scales(layer_id),
+            kv_quant=kv_quant,
         )
 
     def _plan_index_writes(self, md: QSASparseMetadata, batch: Batch) -> None:

@@ -9,12 +9,16 @@ import torch
 import triton
 import triton.language as tl
 
+from freetoken.kernel.triton.attention import _dequant_tile
+
 
 @triton.jit
 def _qsa_sparse_paged_gqa_splitk_kernel(
     q_ptr,
     k_cache_ptr,
     v_cache_ptr,
+    ks_cache_ptr,
+    vs_cache_ptr,
     indices_ptr,
     block_table_ptr,
     token_to_req_ptr,
@@ -29,6 +33,12 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
     stride_v_block,
     stride_v_token,
     stride_v_head,
+    stride_ks_block,
+    stride_ks_token,
+    stride_ks_head,
+    stride_vs_block,
+    stride_vs_token,
+    stride_vs_head,
     stride_indices_row,
     stride_table_req,
     stride_output_row,
@@ -36,6 +46,8 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
     num_rows,
     num_cache_blocks,
     num_requests,
+    QBITS: tl.constexpr,
+    QBLOCK: tl.constexpr,
     TOPK: tl.constexpr,
     PAGE_SIZE: tl.constexpr,
     PAGE_TABLE_WIDTH: tl.constexpr,
@@ -101,24 +113,68 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
         valid &= (physical_page >= 0) & (physical_page < num_cache_blocks)
         # physical_page * block stride can overflow int32 for large caches.
         safe_page = tl.maximum(physical_page, 0).to(tl.int64)
-        keys = tl.load(
-            k_cache_ptr
-            + safe_page[None, :] * stride_k_block
-            + page_offset[None, :] * stride_k_token
-            + kv_head * stride_k_head
-            + dim_offsets[:, None],
-            mask=valid[None, :],
-            other=0.0,
-        )
-        values = tl.load(
-            v_cache_ptr
-            + safe_page[:, None] * stride_v_block
-            + page_offset[:, None] * stride_v_token
-            + kv_head * stride_v_head
-            + dim_offsets[None, :],
-            mask=valid[:, None],
-            other=0.0,
-        )
+        if QBITS == 0:
+            keys = tl.load(
+                k_cache_ptr
+                + safe_page[None, :] * stride_k_block
+                + page_offset[None, :] * stride_k_token
+                + kv_head * stride_k_head
+                + dim_offsets[:, None],
+                mask=valid[None, :],
+                other=0.0,
+            )
+            values = tl.load(
+                v_cache_ptr
+                + safe_page[:, None] * stride_v_block
+                + page_offset[:, None] * stride_v_token
+                + kv_head * stride_v_head
+                + dim_offsets[None, :],
+                mask=valid[:, None],
+                other=0.0,
+            )
+        else:
+            # Code bytes: 8-bit is one per element, 4-bit packs a pair low nibble first.
+            byte_off = dim_offsets // 2 if QBITS == 4 else dim_offsets
+            scale_off = dim_offsets // QBLOCK
+            nib_hi = (dim_offsets % 2) == 1
+            row_k = (
+                safe_page[None, :] * stride_k_block
+                + page_offset[None, :] * stride_k_token
+                + kv_head * stride_k_head
+            )
+            row_ks = (
+                safe_page[None, :] * stride_ks_block
+                + page_offset[None, :] * stride_ks_token
+                + kv_head * stride_ks_head
+            )
+            keys = _dequant_tile(
+                k_cache_ptr,
+                row_k + byte_off[:, None],
+                ks_cache_ptr,
+                row_ks + scale_off[:, None],
+                nib_hi[:, None],
+                valid[None, :],
+                QBITS,
+            ).to(query.dtype)
+            row_v = (
+                safe_page[:, None] * stride_v_block
+                + page_offset[:, None] * stride_v_token
+                + kv_head * stride_v_head
+            )
+            row_vs = (
+                safe_page[:, None] * stride_vs_block
+                + page_offset[:, None] * stride_vs_token
+                + kv_head * stride_vs_head
+            )
+            values = _dequant_tile(
+                v_cache_ptr,
+                row_v + byte_off[None, :],
+                vs_cache_ptr,
+                row_vs + scale_off[None, :],
+                nib_hi[None, :],
+                valid[:, None],
+                QBITS,
+            ).to(query.dtype)
         scores = tl.dot(query, keys)
         # Scaling scores avoids re-quantizing a scaled query to BF16.
         scores *= softmax_scale_log2
@@ -232,8 +288,18 @@ def qsa_sparse_paged_attention(
     block_table: torch.Tensor,
     token_to_req: torch.Tensor,
     out: torch.Tensor | None = None,
+    k_scales: torch.Tensor | None = None,
+    v_scales: torch.Tensor | None = None,
+    kv_quant=None,
 ) -> torch.Tensor:
-    """Run sparse GQA directly over paged BF16 K/V caches."""
+    """Run sparse GQA directly over paged K/V caches.
+
+    With ``kv_quant`` (``--kv-cache-dtype``) the caches hold block-quantized codes and
+    ``k_scales``/``v_scales`` their fp16 block scales; the tiles are dequantized inside the
+    kernel. Only the paged K/V is quantized -- the compressed index slab, the pending ring
+    and the scratch rows stay 16-bit, because they decide *which* blocks get read and an
+    error there changes the selection rather than blurring a value.
+    """
 
     if q.ndim != 3 or k_cache.ndim != 4 or v_cache.shape != k_cache.shape:
         raise ValueError("QSA sparse attention received invalid Q/K/V shapes")
@@ -243,14 +309,22 @@ def qsa_sparse_paged_attention(
         raise ValueError("QSA sparse attention metadata has invalid shapes")
     if logical_indices.shape[1] <= 0:
         raise ValueError("QSA sparse attention requires a positive selection width")
-    if q.shape[2] != k_cache.shape[3] or q.shape[1] % k_cache.shape[2]:
-        raise ValueError("QSA sparse attention requires valid grouped-query heads")
     head_dim = q.shape[2]
+    if kv_quant is None:
+        if q.shape[2] != k_cache.shape[3] or q.shape[1] % k_cache.shape[2]:
+            raise ValueError("QSA sparse attention requires valid grouped-query heads")
+        assert q.dtype == k_cache.dtype == v_cache.dtype
+    else:
+        if k_scales is None or v_scales is None:
+            raise ValueError("QSA sparse attention got a quantized slab without scales")
+        if k_cache.shape[3] != kv_quant.code_bytes_per_row(head_dim):
+            raise ValueError("QSA code slab does not match the head_dim it claims")
+        if q.shape[1] % k_cache.shape[2]:
+            raise ValueError("QSA sparse attention requires valid grouped-query heads")
     assert head_dim >= 16 and (head_dim & (head_dim - 1)) == 0
-    assert q.dtype == k_cache.dtype == v_cache.dtype
     assert logical_indices.dtype == block_table.dtype == torch.int32
     assert token_to_req.dtype == torch.int32
-    assert q.stride(2) == k_cache.stride(3) == v_cache.stride(3) == 1
+    assert q.stride(2) == 1 and k_cache.stride(3) == v_cache.stride(3) == 1
     assert logical_indices.stride(1) == block_table.stride(1) == 1
     assert token_to_req.stride(0) == 1
     if out is None:
@@ -303,6 +377,9 @@ def qsa_sparse_paged_attention(
         q,
         k_cache,
         v_cache,
+        # unquantized: the slab stands in for the scale pointer (QBITS == 0 prunes every use)
+        k_scales if k_scales is not None else k_cache,
+        v_scales if v_scales is not None else v_cache,
         logical_indices,
         block_table,
         token_to_req,
@@ -317,6 +394,12 @@ def qsa_sparse_paged_attention(
         v_cache.stride(0),
         v_cache.stride(1),
         v_cache.stride(2),
+        k_scales.stride(0) if k_scales is not None else 0,
+        k_scales.stride(1) if k_scales is not None else 0,
+        k_scales.stride(2) if k_scales is not None else 0,
+        v_scales.stride(0) if v_scales is not None else 0,
+        v_scales.stride(1) if v_scales is not None else 0,
+        v_scales.stride(2) if v_scales is not None else 0,
         logical_indices.stride(0),
         block_table.stride(0),
         out.stride(0),
@@ -324,6 +407,8 @@ def qsa_sparse_paged_attention(
         q.shape[0],
         k_cache.shape[0],
         block_table.shape[0],
+        QBITS=0 if kv_quant is None else kv_quant.bits,
+        QBLOCK=1 if kv_quant is None else kv_quant.block,
         TOPK=logical_indices.shape[1],
         PAGE_SIZE=k_cache.shape[1],
         PAGE_TABLE_WIDTH=block_table.shape[1],

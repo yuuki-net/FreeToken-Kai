@@ -139,9 +139,13 @@ def create_kvcache_pool(
         # every one of those is read by a kernel that has not been taught the layout, and
         # the failure mode is wrong numbers, not an exception.
         from .mha_pool import MHAKVCache as _MHA
+        from .qsa_pool import QSAKVCache as _QSA
 
         family = resolve_pool_class(model_config)
-        if family is not _MHA:
+        # QSA quantizes its paged K/V only; the compressed index slab, the pending ring and
+        # the scratch rows stay 16-bit (they choose which blocks get read, and an error there
+        # changes the selection rather than blurring a value).
+        if family not in (_MHA, _QSA):
             raise ValueError(
                 f"--kv-cache-dtype {kv_quant.name} is only implemented for the plain paged "
                 f"pool; this model resolves to {family.__name__}. Serve it without the flag."
@@ -228,6 +232,7 @@ def create_kvcache_pool(
             index_ratio=spec.index_ratio,
             num_req_slots=num_req_slots,
             layer_ids=spec.layer_ids,
+            kv_quant=kv_quant,
         )
 
     if len(kv_specs) == 1 and kv_specs[0].mla:

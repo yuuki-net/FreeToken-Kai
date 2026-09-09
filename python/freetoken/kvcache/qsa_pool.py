@@ -68,6 +68,7 @@ class QSAKVCache(MHAKVCache):
         num_req_slots: int,
         ring_capacity: int | None = None,
         layer_ids: Sequence[int] | None = None,
+        kv_quant=None,
     ) -> None:
         if index_ratio < 1 or page_size % index_ratio != 0:
             # slot // index_ratio only names one group when a group never straddles a page.
@@ -86,6 +87,8 @@ class QSAKVCache(MHAKVCache):
         # Index keys ride the compute dtype (the model's index_k is engine-dtype). The KV cost
         # model budgets 2 bytes per token per index layer for the slab
         # (base.spec_kv_bytes_per_token); keep the two in lockstep.
+        # --kv-cache-dtype does not touch these: they pick which blocks are read, so an error
+        # here changes the selection instead of blurring a value. Only the paged K/V narrows.
         assert dtype.itemsize == _INDEX_DTYPE_BYTES, (
             f"QSA index slab budgets 2 bytes/token (spec_kv_bytes_per_token); got {dtype}"
         )
@@ -105,6 +108,7 @@ class QSAKVCache(MHAKVCache):
             dtype=dtype,
             device=device,
             layer_ids=layer_ids,
+            kv_quant=kv_quant,
         )
         self._zero_kv_slabs()
         self._alloc_index_tiers(num_pages)
