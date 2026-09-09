@@ -946,6 +946,7 @@ class Engine:
         tensors -- right after the dense weights, so the bf16 copy (1.6 GB for 256 x 512) is gone
         before the expert banks load. ``_append_mtp_bank`` hands the result to the cache."""
         from freetoken.kernel.triton.nvfp4_quant import nvfp4_expert_bank_specs, quantize_nvfp4_experts
+        from freetoken.moe.legacy_format import canonical_role
 
         raw = self._mtp_raw
         assert set(raw) == {"gate_up_proj", "down_proj"}, (
@@ -960,6 +961,9 @@ class Engine:
             for n, (shape, dt) in nvfp4_expert_bank_specs(e, h, two_i // 2).items()
         }
         quantize_nvfp4_experts(gate_up, down, chunk=8, device=self.device, out=host)
+        # the quantizer names its outputs the way the FTW files do; the cache keys its banks
+        # by the expert kernel's canonical roles (gate_up_packed -> gate_up, down_packed -> down)
+        host = {canonical_role(name): tensor for name, tensor in host.items()}
         del gate_up, down
         self._mtp_raw = {}
         self._mtp_bank_host = host
@@ -982,6 +986,11 @@ class Engine:
         assert banks.quant_format == "nvfp4", (
             f"the MTP expert bank is written in the native nvfp4 layout; this run uses "
             f"{banks.quant_format!r} (use --moe-strategy hybrid/cpu, or --quant-backend moe.nvfp4=triton)"
+        )
+        missing = sorted(set(banks.sources) - set(host))
+        assert not missing, (
+            f"the MTP expert bank has no {missing} to append; the model's banks carry "
+            f"{sorted(banks.sources)} and the head's {sorted(host)}"
         )
         for name, per_layer in banks.sources.items():
             t = host[name]

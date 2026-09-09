@@ -365,3 +365,33 @@ def test_the_draft_head_binds_the_targets_expert_method(monkeypatch):
     method = shared_offload_method(model)  # raises when the head disagrees
     assert method.kind is QuantKind.NVFP4
     assert model.mtp.layers.op_list[0].mlp.experts.quant_method.kind is QuantKind.NVFP4
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="the quantizer runs on the GPU")
+def test_the_head_bank_is_keyed_by_the_kernels_roles():
+    """The head's bank is appended to the model's, so it has to be keyed the way the expert
+    kernel keys its layout. The quantizer names its outputs the way FTW files do
+    (``gate_up_packed``), and appending those raised KeyError('gate_up') on both machines."""
+    from types import SimpleNamespace
+
+    from freetoken.engine.engine import Engine
+    from freetoken.layers.quantization import LayerKind, QuantKind, method_class
+    from freetoken.layers.quantization.moe import MoEConfig
+    from freetoken.layers.quantization.scheme import nvfp4_scheme
+
+    e, h, i = 4, 32, 16
+    head = SimpleNamespace(
+        _mtp_raw={
+            "gate_up_proj": torch.randn(e, 2 * i, h, dtype=torch.bfloat16),
+            "down_proj": torch.randn(e, h, i, dtype=torch.bfloat16),
+        },
+        device=torch.device("cuda"),
+        _mtp_bank_host=None,
+        _mtp_bank_bytes=0,
+    )
+    Engine._quantize_mtp_experts(head)
+
+    cfg = MoEConfig(num_experts=e, hidden=h, intermediate=i, top_k=2,
+                    scheme=nvfp4_scheme(input_scale=False), strategy="offload")
+    method = method_class(QuantKind.NVFP4, LayerKind.MOE)(cfg, "triton")
+    assert set(head._mtp_bank_host) == set(method.layout())
