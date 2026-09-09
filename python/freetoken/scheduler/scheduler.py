@@ -927,7 +927,14 @@ class Scheduler(SchedulerIOMixin):
 
     def _schedule_next_batch(self) -> ForwardInput | None:
         # TODO: support other policies: e.g. DECODE first
-        batch = self.prefill_manager.schedule_next_batch(self.prefill_budget)
+        # Re-solve the chunk against the VRAM free right now, not the VRAM that was free at
+        # boot: on a machine that is also a desktop, those differ by hundreds of MB within
+        # minutes. Only when there is something to prefill -- the query is cheap but not free,
+        # and this runs on every scheduling turn.
+        budget = self.prefill_budget
+        if self.prefill_manager.pending_list:
+            budget = self.engine.prefill_chunk_now(budget)
+        batch = self.prefill_manager.schedule_next_batch(budget)
         if batch is None and _spec_k(self) > 0:
             batch = self._schedule_spec_batch()
         if batch is None:
