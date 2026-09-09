@@ -521,3 +521,40 @@ def test_scheme_for_agrees_with_the_stored_tensors(ckpt: Path):
             mismatches.append(f"{module}: config says {kind}, tensors {sorted(suffixes)} say {sorted(k.value for k in expected)}")
     assert checked > 0
     assert not mismatches, f"{len(mismatches)}/{checked} modules disagree:\n  " + "\n  ".join(mismatches[:40])
+
+
+def test_kernel_selection_is_reported_once_per_outcome(caplog):
+    """The selector runs per quantized layer and answers the same for every layer of a kind;
+    Flash-Next repeated one sentence 400+ times per rank at boot. A different outcome still speaks."""
+    import logging
+
+    from freetoken.layers.quantization import method as method_mod
+
+    class _Unusable:
+        name = "unusable"
+
+        def unusable_reason(self, cfg):
+            return "not here"
+
+    class _Picked:
+        name = "picked"
+
+        def unusable_reason(self, cfg):
+            return None
+
+        def worth_it(self, cfg):
+            return True
+
+    class _Other(_Picked):
+        name = "other"
+
+    method_mod._reported.clear()
+    with caplog.at_level(logging.INFO, logger=method_mod.logger.name):
+        for _ in range(5):
+            method_mod.select_kernel((_Unusable, _Picked), "auto", None)
+        method_mod.select_kernel((_Unusable, _Other), "auto", None)
+
+    lines = [r.getMessage() for r in caplog.records if "selected; skipped" in r.getMessage()]
+    assert len(lines) == 2, lines
+    assert "kernel picked selected; skipped unusable: not here" in lines[0]
+    assert "kernel other selected" in lines[1]

@@ -12,6 +12,11 @@ from .scheme import QuantKind
 
 logger = init_logger(__name__)
 
+# Selection runs once per quantized layer, and the answer is the same for every layer of a
+# kind: Qwen3.8-Flash-Next reported the identical sentence 400+ times per rank at boot and
+# buried the lines that differ. Keyed by the message, so a second, different outcome still speaks.
+_reported: set[str] = set()
+
 
 class KernelSelectionError(RuntimeError):
     pass
@@ -38,7 +43,10 @@ def select_kernel(candidates: Sequence[type], requested: str, cfg: Any):
             continue
         if kernel.worth_it(cfg):
             if skipped:
-                logger.info("kernel %s selected; skipped %s", kernel.name, "; ".join(skipped))
+                message = f"kernel {kernel.name} selected; skipped {'; '.join(skipped)}"
+                if message not in _reported:
+                    _reported.add(message)
+                    logger.info(message)
             return kernel
         if fallback is None:
             fallback = kernel
