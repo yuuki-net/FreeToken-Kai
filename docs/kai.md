@@ -4,7 +4,7 @@ An unofficial fork of [FlashML-org/FreeToken](https://github.com/FlashML-org/Fre
 based on upstream `main` at commit `af71ba4` (2026-09-03). It is not affiliated with, endorsed
 by, or supported by FlashML. The license is unchanged (Apache-2.0).
 
-The fork adds seven things upstream does not have:
+The fork adds eight things upstream does not have:
 
 1. **Image input over the OpenAI API** for checkpoints that ship a vision tower but were served
    text-only: Qwen3.8-Flash-Next and the Qwen3.5-MoE family (Qwen3.6-35B-A3B, Ornith-1.5-35B-A3B).
@@ -32,11 +32,21 @@ The fork adds seven things upstream does not have:
 7. **A quantized KV cache** (`--kv-cache-dtype q8_0` / `q4_0`), 1.88x / 3.56x smaller than
    16-bit: 1.25 GiB down to 0.35 GiB at 64k on a 6 GB 2060. It is a VRAM trade, not a speed
    one -- measured on that card, `q4_0` costs about a third of the decode rate once the
-   context reaches ~30k. Plain paged-attention models on the Triton backend only; gpt-oss
-   (sliding window) and Qwen3.8-Flash-Next (sparse index tiers) are refused at startup. See
+   context reaches ~30k. **Not on Flash-Next**, whose attention reads a fixed token budget
+   regardless of context: measured on two RTX 3060s, `q4_0` decode runs 18.47 tok/s at 8k and
+   18.21 at 125k (−1.4%) while the KV drops 1.55 GiB to 0.47 GiB per rank and the expert
+   slots go 1180 to 1598. Plain paged-attention models on the Triton backend and Flash-Next
+   on `qsa_sparse`; gpt-oss (sliding window), GLM-5.3-Flash, DeepSeek-V4-Flash, MiniMax-M3
+   and MLA checkpoints are refused at startup. See
    [kv-cache-quant.md](kv-cache-quant.md), and [vram-and-speed.md](vram-and-speed.md) for why
    the VRAM it frees did not make this machine faster -- and how to tell whether it would
    make yours faster.
+8. **A prefill chunk sized to the VRAM that is actually free** (`--prefill-chunk-budget`).
+   The chunk is what the linear-attention kernels size their per-forward buffers from, and
+   upstream's fixed 8192 needs 0.97 GiB on a 35B MoE -- more than a 6 GB card has spare, so
+   long prompts crawled and sometimes died. The engine measures the cost per token at startup
+   and re-solves the chunk before every prefill, so a desktop that grabs 300 MB mid-request
+   shrinks the chunk instead of breaking the run. See [prefill-chunk.md](prefill-chunk.md).
 
 Everything else is upstream FreeToken. The feature sets are independent: image input, the MTP
 head, the host embedding, the layer split and the bank mapping also apply to a plain upstream
@@ -321,11 +331,13 @@ vocabularies only (Ornith's is untied); Qwen3.5-MoE family.
   planner leaves ~0.5 GiB for them.
 - The Triton attention backend is used on Turing; flashinfer's JIT attention fails there at
   head_dim 256.
-- `--kv-cache-dtype` covers the plain paged KV pool only, and only on the Triton attention
-  backend (`auto` picks flashinfer on sm_80+, so ask for Triton explicitly there). The SWA
-  window pool, the QSA/DSA index tiers and MLA latents are still 16-bit, so gpt-oss,
-  Qwen3.8-Flash-Next, GLM-5.3-Flash, DeepSeek-V4-Flash, MiniMax-M3 and MLA checkpoints are
-  refused. `q4_0` has not been measured on a benchmark suite.
+- `--kv-cache-dtype` covers the plain paged KV pool (Triton backend; `auto` picks flashinfer
+  on sm_80+, so ask for Triton explicitly there) and Flash-Next's `QSAKVCache` (its own
+  `qsa_sparse` backend, which resolves by itself and cannot be swapped for Triton). The SWA
+  window pool, the DSA index tiers and MLA latents are still 16-bit, so gpt-oss,
+  GLM-5.3-Flash, DeepSeek-V4-Flash, MiniMax-M3 and MLA checkpoints are refused. Flash-Next's
+  own index tiers stay 16-bit too, but only its paged K/V is quantized, so it is supported.
+  `q4_0` has not been measured on a benchmark suite.
 - DeepStack vision checkpoints (Qwen3-VL proper) are refused; only checkpoints with an empty
   `deepstack_visual_indexes` are supported.
 
