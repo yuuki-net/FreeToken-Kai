@@ -205,6 +205,7 @@ def test_engine_config_spec_mtp_adds_head_layer(monkeypatch):
     monkeypatch.setattr(cfg_mod, "get_model_spec", lambda arch: SimpleNamespace(module="m", parse_config="p"))
     monkeypatch.setattr(cfg_mod, "_load_attr", lambda module, name: (lambda hf: _parsed(4)))
     monkeypatch.setattr(cfg_mod, "cached_load_hf_config", lambda path: _toy_hf_config(4))
+    monkeypatch.setattr(cfg_mod, "checkpoint_quant_config", lambda *a, **k: None)
     kw = dict(model_path="x", dtype=torch.bfloat16, tp_info=DistributedInfo(0, 1))
     assert EngineConfig(spec_mtp=0, **kw).model_config.mtp_layer_id is None
     spec = EngineConfig(spec_mtp=2, **kw).model_config
@@ -292,7 +293,12 @@ def test_mtp_head_matches_checkpoint_keys(monkeypatch):
 
     monkeypatch.setattr(info_mod, "_TP_INFO", None)
     info_mod.set_tp_info(0, 1)
-    cfg = with_mtp_layer(replace(_parsed(4), moe_backend="offload"), 4)
+    from freetoken.layers.quantization import LoadTimeFp8Config
+
+    # --dense-quant fp8: the decoder's projections are quantized at load, the draft head's are not
+    cfg = with_mtp_layer(
+        replace(_parsed(4), moe_strategy="offload", quant=LoadTimeFp8Config(None)), 4
+    )
     model = _build(cfg)
     assert model.mtp is not None and model.mtp.layer_id == 4
     keys = model.state_dict()
@@ -317,6 +323,6 @@ def test_mtp_head_absent_without_spec(monkeypatch):
 
     monkeypatch.setattr(info_mod, "_TP_INFO", None)
     info_mod.set_tp_info(0, 1)
-    model = _build(replace(_parsed(4), moe_backend="offload"))
+    model = _build(replace(_parsed(4), moe_strategy="offload"))
     assert model.mtp is None
     assert not any(k.startswith("mtp.") for k in model.state_dict())

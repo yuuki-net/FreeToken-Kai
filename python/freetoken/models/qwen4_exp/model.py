@@ -22,9 +22,9 @@ from freetoken.core import get_global_ctx
 from freetoken.distributed import try_get_pp_info
 from freetoken.layers import (
     BaseOP,
-    Fp8ParallelLMHead,
     Fp8VocabParallelEmbedding,
     HostEmbedding,
+    LinearReplicated,
     OPList,
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -43,7 +43,7 @@ if TYPE_CHECKING:
     from freetoken.models.config import ModelConfig
 
 
-def build_linear_mixer(config: ModelConfig, layer_id: int) -> BaseOP:
+def build_linear_mixer(config: ModelConfig, layer_id: int, prefix: str) -> BaseOP:
     """GDN mixer of a linear_attention layer (Qwen3.5's GDN with a configurable output gate)."""
     from .gdn import Qwen4ExpGatedDeltaNet
 
@@ -58,29 +58,29 @@ def build_linear_mixer(config: ModelConfig, layer_id: int) -> BaseOP:
         rms_norm_eps=config.rms_norm_eps,
         layer_id=layer_id,
         output_gate=g.output_gate,
-        # Qwen3.8's block-fp8 checkpoint keeps the GDN projections bf16 (only the routed
-        # experts are quantized), so do not let expert_quant flip them to Fp8Block.
-        expert_quant="none" if config.expert_quant == "fp8_block" else config.expert_quant,
-        attn_quant=config.attn_quant,
+        quant_config=config.quant,
+        prefix=prefix,
     )
 
 
 class Qwen4ExpDecoderLayer(BaseOP):
     """One decoder layer over the hyper-connection streams (see the module docstring for the flow)."""
 
-    def __init__(self, config: ModelConfig, layer_id: int, moe_layer_offset: int = 0) -> None:
+    def __init__(
+        self, config: ModelConfig, layer_id: int, moe_layer_offset: int = 0, *, prefix: str = ""
+    ) -> None:
         self._layer_id = layer_id
         self._is_linear = config.is_linear_layer(layer_id)
         if self._is_linear:
-            self.linear_attn = build_linear_mixer(config, layer_id)
+            self.linear_attn = build_linear_mixer(config, layer_id, f"{prefix}.linear_attn")
         else:
-            self.self_attn = Qwen4ExpAttention(config, layer_id)
+            self.self_attn = Qwen4ExpAttention(config, layer_id, prefix=f"{prefix}.self_attn")
         # the offload cache indexes MoE layers rank-locally under the pipeline engine
-        self.mlp = Qwen4ExpMoE(config, layer_id - moe_layer_offset)
-        self.attn_hyper_connection = GatedResidual(config)
-        self.mlp_hyper_connection = GatedResidual(config)
+        self.mlp = Qwen4ExpMoE(config, layer_id - moe_layer_offset, prefix=f"{prefix}.mlp")
+        self.attn_hyper_connection = GatedResidual(config, prefix=f"{prefix}.attn_hyper_connection")
+        self.mlp_hyper_connection = GatedResidual(config, prefix=f"{prefix}.mlp_hyper_connection")
         self.ple = (
-            PLELayer(config, layer_id) if layer_id in config.qwen4_args.ple_layer_ids else None
+            PLELayer(config, layer_id, prefix=f"{prefix}.ple") if layer_id in config.qwen4_args.ple_layer_ids else None
         )
 
     @nvtx_annotate("Layer_{}", layer_id_field="_layer_id")
@@ -111,8 +111,6 @@ class Qwen4ExpMTP(BaseOP):
     Multi-step drafting feeds ``R''`` back as the next step's residual."""
 
     def __init__(self, config: ModelConfig, layer_id: int, moe_layer_offset: int, own_embedding: bool) -> None:
-        from freetoken.models.quant_linear import make_replicated
-
         args = config.qwen4_args
         self.hc_count = args.hc_count
         self.hidden_size = config.hidden_size
@@ -121,10 +119,20 @@ class Qwen4ExpMTP(BaseOP):
         self.pre_fc_norm_hidden = GroupedPlusOneRMSNorm(self.hc_count * hidden, config.rms_norm_eps, self.hc_count)
         self.pre_fc_norm_embedding = GroupedPlusOneRMSNorm(hidden, config.rms_norm_eps, 1)
         # bf16, or per-row fp8 under --dense-quant fp8 (quantized at load like every projection)
-        self.fc_hidden = make_replicated(config, hidden, hidden, has_bias=False)
-        self.fc_embedding = make_replicated(config, hidden, hidden, has_bias=False)
-        self.layers = OPList([Qwen4ExpDecoderLayer(config, layer_id, moe_layer_offset=moe_layer_offset)])
-        self.hyper_connection_mixer = GatedResidual(config, use_combine=False)
+        self.fc_hidden = LinearReplicated(
+            hidden, hidden, has_bias=False, quant_config=config.quant, prefix="mtp.fc_hidden"
+        )
+        self.fc_embedding = LinearReplicated(
+            hidden, hidden, has_bias=False, quant_config=config.quant, prefix="mtp.fc_embedding"
+        )
+        self.layers = OPList([
+            Qwen4ExpDecoderLayer(
+                config, layer_id, moe_layer_offset=moe_layer_offset, prefix="mtp.layers.0"
+            )
+        ])
+        self.hyper_connection_mixer = GatedResidual(
+            config, use_combine=False, prefix="mtp.hyper_connection_mixer"
+        )
         # the head shares the target's embedding; a pipeline rank without the embedding table
         # carries its own copy (mtp.embed_tokens, duplicated by the loader) in pinned host
         # memory, gathered by the GPU in place (so the head's graphs can embed too) and the
@@ -160,7 +168,7 @@ class Qwen4ExpModel(BaseOP):
     of it: layers ``[start, end)`` with the embedding on the first rank and the stream mixer
     on the last; the other layers are ``_RemoteLayer`` placeholders."""
 
-    def __init__(self, config: ModelConfig) -> None:
+    def __init__(self, config: ModelConfig, *, prefix: str = "model") -> None:
         self.hc_count = config.qwen4_args.hc_count
         self._image_token_id = config.image_token_id
         pp = try_get_pp_info()
@@ -179,13 +187,22 @@ class Qwen4ExpModel(BaseOP):
         )
         self.layers = OPList(
             [
-                Qwen4ExpDecoderLayer(config, layer_id, moe_layer_offset=start)
+                Qwen4ExpDecoderLayer(
+                    config, layer_id, moe_layer_offset=start,
+                    prefix=f"{prefix}.layers.{layer_id}",
+                )
                 if start <= layer_id < end
                 else _RemoteLayer()
                 for layer_id in range(config.num_layers)
             ]
         )
-        self.hyper_connection_mixer = GatedResidual(config, use_combine=False) if self._pp_last else None
+        self.hyper_connection_mixer = (
+            GatedResidual(
+                config, use_combine=False, prefix=f"{prefix}.hyper_connection_mixer"
+            )
+            if self._pp_last
+            else None
+        )
         # Indices, not layer objects: the offload-cache walk (iter_offload_moe_layers) visits
         # every tuple on the model, so a second reference would attach each MoE layer twice.
         self._local_ids = tuple(range(start, end))
@@ -272,19 +289,6 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
                 self.mtp._embed_ref = self.model.embed_tokens
         if not self.model.pp_last:
             self.lm_head = None
-        elif getattr(config, "lm_head_quant", "none") == "fp8_pertensor":
-            # quantized at load (--dense-quant fp8): W8A16 head
-            assert not config.tie_word_embeddings, "fp8 lm_head assumes untied embeddings"
-            self.lm_head = Fp8ParallelLMHead(
-                num_embeddings=config.vocab_size, embedding_dim=config.hidden_size
-            )
-        elif getattr(config, "lm_head_quant", "none") == "nvfp4":
-            from freetoken.kernel.triton.nvfp4_linear import Nvfp4LMHead
-
-            assert not config.tie_word_embeddings, "NVFP4 lm_head assumes untied embeddings"
-            self.lm_head = Nvfp4LMHead(
-                num_embeddings=config.vocab_size, embedding_dim=config.hidden_size
-            )
         else:
             assert not (config.tie_word_embeddings and self.model.embed_tokens is None), (
                 "tied embeddings need the embedding and the head on the same pipeline rank"
@@ -294,6 +298,8 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
                 embedding_dim=config.hidden_size,
                 tie_word_embeddings=config.tie_word_embeddings,
                 tied_embedding=self.model.embed_tokens if config.tie_word_embeddings else None,
+                quant_config=config.quant,
+                prefix="lm_head",
             )
         super().__init__()
 

@@ -127,7 +127,7 @@ Two things that look like failures but are not:
 - The GDN recurrent state is stored `[num_heads, V, K]` (V-major) by both fla kernels although the
   pool is documented as `[.., K, V]`. A probe that assumes `[K, V]` reports garbage for correct kernels
   (the probe's first version did).
-- Under `--moe-backend hybrid` the CPU MoE executor spins on pinned cores while idle, so one core
+- Under `--moe-strategy hybrid` the CPU MoE executor spins on pinned cores while idle, so one core
   sits at 100 % between requests.
 
 ## Debugging notes

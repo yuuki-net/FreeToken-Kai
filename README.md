@@ -3,8 +3,8 @@
 **gpt-oss-120b on one RTX 3060 12 GB. A 35B MoE at 250k of context on the same card, still 25 tok/s
 at the far end. A 125B MoE on two of them. A 35B MoE on an RTX 2060 6 GB.**
 
-> An unofficial fork of [FlashML-org/FreeToken](https://github.com/FlashML-org/FreeToken), based on
-> upstream `main` at `af71ba4` (2026-09-03). Not affiliated with, endorsed by, or supported by
+> An unofficial fork of [FlashML-org/FreeToken](https://github.com/FlashML-org/FreeToken), merged
+> with upstream `main` at `3d919e9` (2026-09-09). Not affiliated with, endorsed by, or supported by
 > FlashML. The license is unchanged (Apache-2.0).
 >
 > **Please keep questions and bug reports about this fork in this repository.** The FreeToken
@@ -16,7 +16,7 @@ at the far end. A 125B MoE on two of them. A 35B MoE on an RTX 2060 6 GB.**
 > the fix are in [docs/pipeline.md](docs/pipeline.md). Single-GPU runs were never affected.
 
 Upstream FreeToken serves one model on one GPU, on Ampere (RTX 30 series) or newer, text only.
-This fork adds eight things on top of it. They are independent — take one, ignore the rest.
+This fork adds nine things on top of it. They are independent — take one, ignore the rest.
 
 | | What it does | How you ask for it |
 |---|---|---|
@@ -27,7 +27,8 @@ This fork adds eight things on top of it. They are independent — take one, ign
 | 5 | **Speculative decoding with the checkpoint's own MTP head.** Verify window and draft head captured as CUDA graphs. Correctness-verified. It pays off only where a multi-row verify costs about what a single row costs: with the experts in host RAM that means long acceptance, so it wins on code and tool calls on two cards and loses on free prose and on one card. | `--spec-mtp 5` |
 | 6 | **64k of context on a 6 GB card.** The input embedding table lives in host memory and the GPU reads rows from it directly. | `--host-embedding` |
 | 7 | **A KV cache 1.9x or 3.6x smaller**, stored as block-quantized codes: 1.25 GiB down to 0.35 GiB at 64k on a 6 GB card. It buys VRAM, not speed — past a few thousand tokens of context it costs about a third of the decode rate. Plain paged-attention models on the Triton backend, and Qwen3.8-Flash-Next on its own sparse backend — where the cost above does not apply: measured on two RTX 3060s, `q4_0` decode is flat from 8k to 125k of context (−1.4%) while the KV drops 1.55 GiB to 0.47 GiB per rank, because its attention reads a fixed budget of tokens however long the context is. | `--kv-cache-dtype q4_0` |
-| 8 | **A prefill chunk sized to the VRAM that is actually free.** Upstream's fixed 8192 needs 0.97 GiB of transient on a 35B MoE; a 6 GB card does not have it, so long prompts crawled and sometimes died. Measured at startup, re-solved before every prefill. | automatic, `--prefill-chunk-budget` |
+| 8 | **The checkpoint's bf16 dense weights served as fp8.** Attention, GDN, shared expert, lm_head and the embedding are quantized per output row at load and read W8A16; the router, hyper-connection, QSA indexer and GDN gates stay bf16. Qwen3.8-Flash-Next's resident dense weights go from 4.9 GB per card to 2.9 GB, and the freed VRAM goes to the expert cache. | `--dense-quant fp8` |
+| 9 | **A prefill chunk sized to the VRAM that is actually free.** Upstream's fixed 8192 needs 0.97 GiB of transient on a 35B MoE; a 6 GB card does not have it, so long prompts crawled and sometimes died. Measured at startup, re-solved before every prefill. | automatic, `--prefill-chunk-budget` |
 
 Everything else is upstream FreeToken.
 

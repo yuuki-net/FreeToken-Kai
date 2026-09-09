@@ -58,7 +58,7 @@ Flash-Next on two 12 GB cards with 128k of context, fp8 dense weights and the MT
 
 ```bash
 ft serve --model /path/to/Qwen3.8-Flash-Next-NVFP4 --pp-size 2 --gpu 0,1 \
-  --moe-backend hybrid --ple-backend disk --dense-quant fp8 --spec-mtp 5 \
+  --moe-strategy hybrid --ple-backend disk --dense-quant fp8 --spec-mtp 5 \
   --max-running-req 1 --memory-ratio 0.85 --max-prefill-length 4096 \
   --max-seq-len-override 131072 --kv-reserve-tokens 131072 --moe-cpu-threads 7
 ```
@@ -68,7 +68,7 @@ PCIe only):
 
 ```bash
 ft serve --model /path/to/Ornith-1.5-35B-A3B-NVFP4 --pp-size 2 --gpu 0,1 --pp-layers 25 \
-  --moe-backend offload --max-running-req 1 --memory-ratio 0.85 \
+  --moe-strategy offload --max-running-req 1 --memory-ratio 0.85 \
   --max-seq-len-override 65536 --kv-reserve-tokens 65536
 ```
 
@@ -76,7 +76,7 @@ gpt-oss-120b on the same two cards (experts mostly off-card, so the CPU helps):
 
 ```bash
 ft serve --model /path/to/gpt-oss-120b --pp-size 2 --gpu 0,1 --pp-layers 26 \
-  --moe-backend hybrid --max-running-req 1 --memory-ratio 0.85 \
+  --moe-strategy hybrid --max-running-req 1 --memory-ratio 0.85 \
   --max-seq-len-override 65536 --kv-reserve-tokens 65536 --moe-cpu-threads 7
 ```
 
@@ -90,9 +90,9 @@ ft serve --model /path/to/gpt-oss-120b --pp-size 2 --gpu 0,1 --pp-layers 26 \
 - `--dense-quant fp8` quantizes the checkpoint's bf16 dense projections (attention, GDN,
   shared expert, lm_head, embedding) to per-row fp8 at load, W8A16. It halves their VRAM and
   per-token read traffic; the freed VRAM goes to the expert cache. Wired for Flash-Next.
-- `--moe-backend hybrid` works with two ranks, but the two CPU executors share the cores and
+- `--moe-strategy hybrid` works with two ranks, but the two CPU executors share the cores and
   each rank's forward pays the executor's per-layer synchronization; when a rank's experts
-  mostly fit its cache, `--moe-backend offload` is faster for that model (Ornith: 40-44 against
+  mostly fit its cache, `--moe-strategy offload` is faster for that model (Ornith: 40-44 against
   25-30 tok/s). Fewer threads did not help (`--moe-cpu-threads 3`: 20-24 tok/s).
 - Logs and progress bars come from rank 0; rank 1 logs only warnings and errors. Its lines
   carry `rank=1`.
@@ -107,8 +107,8 @@ prompt. Full specs, and why the second slot is x4, are in kai.md.
 | Model | 1 GPU | 2 GPUs | Notes |
 |---|---|---|---|
 | Qwen3.8-Flash-Next-NVFP4 (`--dense-quant fp8`) | does not fit | 18-20 tok/s; 13-27 with `--spec-mtp 5` | 128k of context, image input; the reason the code exists |
-| Ornith-1.5-35B-A3B-NVFP4 | 41-46 tok/s (hybrid, 2,947 slots) | 40-44 tok/s (`--pp-layers 25 --moe-backend offload`, 3,833 slots per card); 25-30 with the even split and hybrid | equal at best |
-| gpt-oss-120b (MXFP4) | 9-12 tok/s (202 slots; 9 layers decode on the CPU because 57 GB of banks exceed the pin budget) | 12-17 tok/s (`--pp-layers 26 --moe-backend hybrid`, 394 slots per card, all banks pinned) | +30-40% |
+| Ornith-1.5-35B-A3B-NVFP4 | 41-46 tok/s (hybrid, 2,947 slots) | 40-44 tok/s (`--pp-layers 25 --moe-strategy offload`, 3,833 slots per card); 25-30 with the even split and hybrid | equal at best |
+| gpt-oss-120b (MXFP4) | 9-12 tok/s (202 slots; 9 layers decode on the CPU because 57 GB of banks exceed the pin budget) | 12-17 tok/s (`--pp-layers 26 --moe-strategy hybrid`, 394 slots per card, all banks pinned) | +30-40% |
 
 ### Prefill
 
@@ -134,7 +134,7 @@ hand-off costs 0.6 ms, and the step is the sum of the two forwards (11-13 ms on 
 machine the expert traffic was never the bottleneck -- the x16 slot moves a miss in a fraction
 of a millisecond -- so a second cache buys nothing, and the x4 rank pays for every miss it
 does have. Hence the recommendations: put fewer layers on the slower slot (`--pp-layers 25`
-leaves rank 1 with 15 layers whose experts all fit its cache), and use `--moe-backend offload`
+leaves rank 1 with 15 layers whose experts all fit its cache), and use `--moe-strategy offload`
 for a model whose experts mostly fit, `hybrid` for one whose experts mostly do not
 (gpt-oss-120b). A machine with a slower bus or fewer cores would see more from the second
 cache than this one did.

@@ -23,10 +23,12 @@ if TYPE_CHECKING:
 
 
 class GptOssDecoderLayer(BaseOP):
-    def __init__(self, config: ModelConfig, layer_id: int, moe_layer_offset: int = 0):
-        self.self_attn = GptOssAttention(config, layer_id)
+    def __init__(
+        self, config: ModelConfig, layer_id: int, moe_layer_offset: int = 0, *, prefix: str = ""
+    ):
+        self.self_attn = GptOssAttention(config, layer_id, prefix=f"{prefix}.self_attn")
         # the offload cache indexes MoE layers rank-locally under the pipeline engine
-        self.mlp = GptOssMLP(config, layer_id - moe_layer_offset)
+        self.mlp = GptOssMLP(config, layer_id - moe_layer_offset, prefix=f"{prefix}.mlp")
         self.input_layernorm = RMSNormFused(
             size=config.hidden_size,
             eps=config.rms_norm_eps,
@@ -53,7 +55,7 @@ class GptOssModel(BaseOP):
     the embedding on the first rank, the final norm on the last; the other layers are
     ``RemoteLayer`` placeholders (see ``models/pipeline.py``)."""
 
-    def __init__(self, config: ModelConfig):
+    def __init__(self, config: ModelConfig, *, prefix: str = "model"):
         win = layer_window(config)
         self._window = win
         self.embed_tokens = (
@@ -63,7 +65,10 @@ class GptOssModel(BaseOP):
         )
         self.layers = OPList(
             [
-                GptOssDecoderLayer(config, layer_id, moe_layer_offset=win.start)
+                GptOssDecoderLayer(
+                    config, layer_id, moe_layer_offset=win.start,
+                    prefix=f"{prefix}.layers.{layer_id}",
+                )
                 if win.owns(layer_id)
                 else RemoteLayer()
                 for layer_id in range(config.num_layers)
@@ -121,6 +126,8 @@ class GptOssForCausalLM(BaseLLMModel):
                 embedding_dim=config.hidden_size,
                 tie_word_embeddings=config.tie_word_embeddings,
                 tied_embedding=self.model.embed_tokens if config.tie_word_embeddings else None,
+                quant_config=config.quant,
+                prefix="lm_head",
             )
         self.config = config
         super().__init__()

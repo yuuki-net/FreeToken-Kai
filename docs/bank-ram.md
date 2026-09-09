@@ -64,7 +64,7 @@ The placement is only as good as the histogram behind it. Run once with the grap
 
 ```bash
 ft serve --model-path /models/Qwen3.8-Flash-Next-NVFP4 --pp-size 2 --gpu 0,1 \
-  --moe-backend hybrid --ple-backend disk --dense-quant fp8 \
+  --moe-strategy hybrid --ple-backend disk --dense-quant fp8 \
   --disable-cuda-graph --moe-stats-out ~/moe-stats.json
 ```
 
@@ -79,7 +79,7 @@ kinds and pass them all; pooling is cheap insurance, not a decisive gain (1-2 po
 
 ```bash
 ft serve --model-path /models/Qwen3.8-Flash-Next-NVFP4 --pp-size 2 --gpu 0,1 \
-  --moe-backend hybrid --ple-backend disk --dense-quant fp8 \
+  --moe-strategy hybrid --ple-backend disk --dense-quant fp8 \
   --moe-bank-ram 48G --moe-bank-stats ~/moe-stats.rank0.json ~/moe-stats2.rank0.json
 ```
 

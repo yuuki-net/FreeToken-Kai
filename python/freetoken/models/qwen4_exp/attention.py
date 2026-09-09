@@ -20,7 +20,6 @@ from typing import TYPE_CHECKING, Protocol
 import torch
 from freetoken.core import get_global_ctx
 from freetoken.layers import BaseOP, GemmaPlusOneRMSNorm, LinearColParallelMerged, LinearReplicated
-from freetoken.models.quant_linear import make_col_merged, make_replicated
 from freetoken.layers.rotary import get_rope
 from freetoken.utils import nvtx_annotate
 
@@ -77,7 +76,7 @@ class QSAAttentionBackend(Protocol):
 class Qwen4ExpIndexer(BaseOP):
     """QSA indexer weights (checkpoint prefix ``self_attn.indexer``); the scoring lives in the backend."""
 
-    def __init__(self, config: ModelConfig, layer_id: int) -> None:
+    def __init__(self, config: ModelConfig, layer_id: int, *, prefix: str = "") -> None:
         args = config.qwen4_args
         self.layer_id = layer_id
         self.num_heads = args.index_n_heads
@@ -85,7 +84,10 @@ class Qwen4ExpIndexer(BaseOP):
         self.head_dim = args.index_head_dim
         self.eps = config.rms_norm_eps
         self._split = [self.num_heads * self.head_dim, self.num_kv_heads * self.head_dim]
-        self.index_qk_proj = LinearReplicated(args.hidden_size, sum(self._split), has_bias=False)
+        self.index_qk_proj = LinearReplicated(
+            args.hidden_size, sum(self._split), has_bias=False,
+            quant_config=config.quant, prefix=f"{prefix}.index_qk_proj",
+        )
         self.q_layernorm = GemmaPlusOneRMSNorm(self.head_dim, eps=self.eps)
         self.k_layernorm = GemmaPlusOneRMSNorm(self.head_dim, eps=self.eps)
 
@@ -114,7 +116,7 @@ class Qwen4ExpAttention(BaseOP):
     (both zero-centered, loaded RAW), ``indexer.*``.
     """
 
-    def __init__(self, config: ModelConfig, layer_id: int) -> None:
+    def __init__(self, config: ModelConfig, layer_id: int, *, prefix: str = "") -> None:
         self.layer_id = layer_id
         self.num_q = config.num_qo_heads
         self.num_kv = config.num_kv_heads
@@ -122,9 +124,14 @@ class Qwen4ExpAttention(BaseOP):
         self.qo_attn_dim = self.num_q * self.head_dim
         self.kv_attn_dim = self.num_kv * self.head_dim
         self._qkv_split = [self.qo_attn_dim * 2, self.kv_attn_dim, self.kv_attn_dim]
-        # bf16, or per-row fp8 (W8A16) under attn_quant == "fp8_pertensor" (--dense-quant fp8)
-        self.qkv_proj = make_col_merged(config, config.hidden_size, self._qkv_split, has_bias=False)
-        self.o_proj = make_replicated(config, self.qo_attn_dim, config.hidden_size, has_bias=False)
+        self.qkv_proj = LinearColParallelMerged(
+            config.hidden_size, self._qkv_split, has_bias=False,
+            quant_config=config.quant, prefix=f"{prefix}.qkv_proj",
+        )
+        self.o_proj = LinearReplicated(
+            self.qo_attn_dim, config.hidden_size, has_bias=False,
+            quant_config=config.quant, prefix=f"{prefix}.o_proj",
+        )
         self.q_norm = GemmaPlusOneRMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.k_norm = GemmaPlusOneRMSNorm(self.head_dim, eps=config.rms_norm_eps)
         rotary = config.rotary_config
@@ -135,7 +142,7 @@ class Qwen4ExpAttention(BaseOP):
             base=rotary.base,
             rope_scaling=tuple(rotary.scaling.items()) if rotary.scaling else None,
         )
-        self.indexer = Qwen4ExpIndexer(config, layer_id)
+        self.indexer = Qwen4ExpIndexer(config, layer_id, prefix=f"{prefix}.indexer")
 
     @nvtx_annotate("QSA")
     def forward(self, x: torch.Tensor, batch: Batch) -> torch.Tensor:

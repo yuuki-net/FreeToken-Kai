@@ -33,6 +33,7 @@ parsers all resolve automatically from the checkpoint and the GPU.
 |---|---|---|
 | `--model-path`, `--model` | required | Local dir, HF repo id, or an FTW dir (auto-detected) |
 | `--served-model-name` | basename of `--model` | Model id reported by `/v1/models` |
+| `--dense-quant` | none | `fp8` serves the checkpoint's bf16 dense (non-expert) weights as per-row fp8-e4m3, quantized at load and read W8A16: attention, GDN, shared expert, lm_head, embedding. Already-quantized projections keep their format; router, hyper-connection, QSA indexer and GDN b/a gates stay bf16. See [pipeline.md](pipeline.md) |
 
 ### Server & runtime
 
@@ -47,6 +48,9 @@ parsers all resolve automatically from the checkpoint and the GPU.
 | `--max-prefill-length` | 8192 | Chunked-prefill chunk size in tokens |
 | `--cuda-graph-max-bs`, `--graph` | = max running requests | Max batch size captured as CUDA graphs |
 | `--decode-log-interval` | 40 | Scheduler status line every N decode steps |
+| `--pp-size` | 1 | Layer-split (pipeline) parallelism across N GPUs, one process per card, the residual stream handed over gloo -- no NCCL and no peer access. List the cards in rank order with `--gpu`. Mutually exclusive with `--tp-size` > 1. See [pipeline.md](pipeline.md) |
+| `--pp-layers` | even split | Layer boundaries of the `--pp-size` split, N-1 comma-separated values: `24` gives rank 0 layers [0,24) and rank 1 [24,48). For cards of different sizes |
+| `--spec-mtp` | 0 | Verify K drafts per step from the checkpoint's own MTP head. Single-request decode (`--max-running-req 1`); Qwen3.5-MoE family and Qwen3.8-Flash-Next NVFP4 checkpoints. See [pipeline.md](pipeline.md) |
 
 ### Choosing a GPU
 
@@ -68,6 +72,7 @@ ft serve --model ... --gpu GPU-9e8d7c6b  # the same card by UUID (a unique prefi
 | Flag | Default | Meaning |
 |---|---|---|
 | `--memory-ratio` | 0.9 | Fraction of free VRAM the engine may use (weights + MoE cache + KV) |
+| `--host-embedding` | off | Keep the input embedding table in pinned host memory and gather its rows over PCIe in place, inside CUDA graphs too. Frees about 1 GB on a 250k-token vocabulary, which becomes KV pages on a small card. Qwen3.5-MoE family |
 | `--num-pages` / `--num-tokens` | auto | KV capacity override in pages / tokens (mutually exclusive; auto sizes from VRAM left after weights and MoE cache) |
 | `--page-size` | 1 | KV page size; DSV4 forces 128, the TRTLLM backend needs 16/32/64, SWA models require 1 |
 | `--cache-type` | radix | `radix` (prefix reuse; SWA/GDN-aware variants picked automatically) or `naive` |
@@ -75,17 +80,19 @@ ft serve --model ... --gpu GPU-9e8d7c6b  # the same card by UUID (a unique prefi
 
 ### MoE offload
 
-See [models.md](models.md#moe-backends) for what each backend does.
+See [models.md](models.md#moe-strategies) for what each strategy does.
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `--moe-backend` | auto | `fused`/`offload`/`cpu`/`hybrid`; auto → offload, or hybrid with a `ft bench bw` profile |
-| `--moe-cache-size` / `--moe-cache-rate` / `--moe-cache-auto` | auto | GPU expert-cache size as slots / fraction of all experts / sized from free VRAM (mutually exclusive; auto is enabled by default for offload-family backends) |
+| `--moe-strategy` | auto | `fused`/`offload`/`cpu`/`hybrid`; auto → offload, or hybrid with a `ft bench bw` profile. `--moe-backend` is the deprecated old spelling |
+| `--quant-backend` | auto | Kernel per quantized layer type, `layer[.kind]=name` entries: `linear=marlin,moe=b12x` or `moe.nvfp4=triton`. A layer-level entry applies to every kind whose table lists the name |
+| `--nvfp4-backend` | — | Deprecated: stands in for `--quant-backend moe.nvfp4=<marlin\|b12x\|triton>` (`flashinfer` means b12x); cannot be combined with `--quant-backend` |
+| `--moe-cache-size` / `--moe-cache-rate` / `--moe-cache-auto` | auto | GPU expert-cache size as slots / fraction of all experts / sized from free VRAM (mutually exclusive; auto is enabled by default for offload-family strategies) |
 | `--kv-reserve-tokens` | 8192 | KV token floor reserved before `--moe-cache-auto` fills experts |
 | `--kv-cache-dtype` | auto | Store the paged KV as block-quantized codes: `q8_0` (1.88x smaller) or `q4_0` (3.56x). Plain paged-attention models on `--attention-backend triton`, or Flash-Next on its own `qsa_sparse` backend; refused at startup otherwise. See [kv-cache-quant.md](kv-cache-quant.md); whether the freed VRAM buys you anything depends on your machine, see [vram-and-speed.md](vram-and-speed.md) |
 | `--prefill-chunk-budget` | 0.55 | Share of free VRAM one prefill chunk's transient may take. The engine measures that cost per token at startup, sizes `--max-prefill-length` to fit, and re-solves before every prefill against the VRAM free right then. 0 disables and the flag is used as given. See [prefill-chunk.md](prefill-chunk.md) |
 | `--moe-cpu-threads` | physical cores | CPU worker threads for the cpu/hybrid executor |
-| `--moe-cpu-layers` | all on GPU | With `offload`: which MoE layers decode on CPU (`3,7,11`, a count, or a fraction) |
+| `--moe-cpu-layers` | all on GPU | With `offload`: which MoE layers decode on CPU (`3,7,11`, a count, a fraction, or `auto`). `auto` is for Windows/WSL only, where CUDA pinned memory is capped; every value needs an expert format the CPU executor serves (bf16, nvfp4, mxfp4), so fp8 experts cannot use it |
 | `--moe-hybrid-max-fetch` | auto | With `hybrid`: max experts fetched over PCIe per layer per step; rest computed on CPU |
 | `--moe-prefill-hit-d2d` | off | Prefill: copy cache-hit experts device-side, stream only misses (CUDA >= 13) |
 | `--disable-moe-prefill-overlap` | overlap on | Disable the two-buffer prefill copy overlap |
@@ -93,6 +100,7 @@ See [models.md](models.md#moe-backends) for what each backend does.
 | `--moe-bank-stats` | — | Routing histograms (from `--moe-stats-out`) that decide which experts stay resident |
 | `--moe-bank-dir` | `~/.cache/freetoken/bankmap` | Where the mapped bank file lives |
 | `--moe-stats-out` | off | Write the per-expert decode routing histogram on shutdown (pass `--disable-cuda-graph`) |
+| `--moe-collect-stats` | off | Accumulate the cache's decode miss-rate counters device-side, captured into the decode graph; `--moe-stats-out` reads them back |
 | `--disable-cuda-graph` | graphs on | Decode eagerly; needed for `--moe-stats-out` to see real routing |
 
 ### API behaviour
@@ -153,7 +161,7 @@ environment so the agent cannot silently fall back to a paid endpoint.
 ## ft checkpoint
 
 ```bash
-ft checkpoint --model <hf_dir> --out <ftw_dir> [--dtype bfloat16] [--moe-backend offload] [--shard-gib 8] [--gpu <uuid-or-index>]
+ft checkpoint --model <hf_dir> --out <ftw_dir> [--dtype bfloat16] [--moe-backend offload] [--quant-backend moe.nvfp4=b12x] [--shard-gib 8] [--gpu <uuid-or-index>]
 ```
 
 Converts an HF safetensors checkpoint to FTW, FreeToken's self-contained
@@ -171,7 +179,7 @@ ft bench bw --gpu 1               # a specific GPU (UUID or nvidia-smi index, as
 ```
 
 Measures host-RAM vs PCIe bandwidth with the real cpu/offload MoE kernels and writes a
-profile that `ft serve --moe-backend auto` and `--moe-hybrid-max-fetch -1` then read.
+profile that `ft serve --moe-strategy auto` and `--moe-hybrid-max-fetch -1` then read.
 
 - One profile per GPU, at `~/.cache/freetoken/benchbw/<gpu-uuid>.json`.
 - Keyed on expert format + GPU, so a profile from other hardware is ignored rather than

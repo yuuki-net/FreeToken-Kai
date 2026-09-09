@@ -175,7 +175,7 @@ def test_mtp_head_matches_checkpoint_keys(monkeypatch):
     monkeypatch.setattr(info_mod, "_PP_INFO", None)
     info_mod.set_tp_info(0, 1)
     info_mod.set_pp_info(rank=1, size=2, start=24, end=48, num_layers=48)
-    full = replace(_parsed_qwen4(), moe_backend="offload")
+    full = replace(_parsed_qwen4(), moe_strategy="offload")
     cfg = window_model_config(full, 24, 48, extra_full_layer=48)
     assert cfg.mtp_layer_id == 48
     full_group = next(g for g in cfg.attention_groups if g.name == "full")
@@ -211,7 +211,7 @@ def test_mtp_head_absent_without_spec(monkeypatch):
     monkeypatch.setattr(info_mod, "_TP_INFO", None)
     monkeypatch.setattr(info_mod, "_PP_INFO", None)
     info_mod.set_tp_info(0, 1)
-    model = _build(replace(_parsed_qwen4(), moe_backend="offload"))
+    model = _build(replace(_parsed_qwen4(), moe_strategy="offload"))
     assert model.mtp is None
     assert not any(k.startswith("mtp.") for k in model.state_dict())
 
@@ -225,6 +225,7 @@ def test_engine_config_spec_mtp_adds_head_layer_on_last_rank(monkeypatch):
     monkeypatch.setattr(cfg_mod, "get_model_spec", lambda arch: SimpleNamespace(module="m", parse_config="p"))
     monkeypatch.setattr(cfg_mod, "_load_attr", lambda module, name: (lambda hf: _parsed_qwen4()))
     monkeypatch.setattr(cfg_mod, "cached_load_hf_config", lambda path: _qwen4_hf_config())
+    monkeypatch.setattr(cfg_mod, "checkpoint_quant_config", lambda *a, **k: None)
     kw = dict(model_path="x", dtype=torch.bfloat16)
     last = EngineConfig(tp_info=DistributedInfo(1, 2), parallel="pp", spec_mtp=3, **kw)
     first = EngineConfig(tp_info=DistributedInfo(0, 2), parallel="pp", spec_mtp=3, **kw)

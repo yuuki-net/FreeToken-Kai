@@ -43,7 +43,7 @@ def _qwen35(num_layers=8):
     pytest.importorskip("freetoken.models.qwen3_5_moe.model")
     from tests.models.qwen3_5_moe.test_spec_mtp import _parsed
 
-    return replace(_parsed(num_layers), moe_backend="offload")
+    return replace(_parsed(num_layers), moe_strategy="offload")
 
 
 def test_qwen35_window_keeps_one_full_layer_per_rank():
@@ -136,7 +136,7 @@ def _gpt_oss(num_layers=4):
         quantization_config={"quant_method": "mxfp4"}, attention_bias=True,
         swiglu_limit=7.0, hidden_act_alpha=1.702, model_type="gpt_oss", architectures=["GptOssForCausalLM"],
     )
-    return replace(parse_config(hf), moe_backend="offload")
+    return replace(parse_config(hf), moe_strategy="offload")
 
 
 def test_gpt_oss_window_keeps_both_attention_kinds():
@@ -174,20 +174,23 @@ def test_gpt_oss_ranks_split_the_stack(monkeypatch):
     assert sorted(l.layer_id for l in iter_offload_moe_layers(last)) == [0, 1]
 
 
-def test_gpt_oss_bank_window_allocates_local_layers(monkeypatch):
-    from freetoken.distributed import DistributedInfo
-    from freetoken.models.gpt_oss.weight import _bank_window, _empty_mxfp4_triton_banks
+def test_bank_pieces_are_filtered_to_this_ranks_layers(monkeypatch):
+    """The readers yield every layer's experts; a pipeline rank keeps its own window and
+    renumbers it from zero, because its banks only hold that many layers."""
+    from freetoken.moe.expert_banks import _local_pieces
 
     cfg = _gpt_oss()
-    tp = DistributedInfo(rank=0, size=1)
+    pieces = [(layer, 0, 2, {"gate_up": layer}) for layer in range(4)]
+
     _pp(monkeypatch, 1, 2, 2, 4, 4)
-    assert _bank_window(cfg) == (2, 4)
-    banks, _ = _empty_mxfp4_triton_banks(cfg, dtype=torch.bfloat16, tp_info=tp)
-    assert all(len(per_layer) == 2 for per_layer in banks.values())
+    kept = list(_local_pieces(cfg, iter(pieces)))
+    assert [(bank_layer, piece["gate_up"]) for bank_layer, _, _, piece in kept] == [(0, 2), (1, 3)]
+
     _pp(monkeypatch, 0, 1, 0, 4, 4)
-    assert _bank_window(cfg) == (0, 4)
-    banks, _ = _empty_mxfp4_triton_banks(cfg, dtype=torch.bfloat16, tp_info=tp)
-    assert all(len(per_layer) == 4 for per_layer in banks.values())
+    kept = list(_local_pieces(cfg, iter(pieces)))
+    assert [(bank_layer, piece["gate_up"]) for bank_layer, _, _, piece in kept] == [
+        (0, 0), (1, 1), (2, 2), (3, 3)
+    ]
 
 
 def test_gpt_oss_swa_pool_maps_only_local_layers(monkeypatch):

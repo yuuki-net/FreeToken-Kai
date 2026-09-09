@@ -1,10 +1,10 @@
-"""Qwen3.8-Flash-Next (RadixArk NVFP4) checkpoint reader.
+"""Qwen3.8-Flash-Next checkpoint reader (the NVFP4 and the official block-fp8 releases).
 
 Three separate paths, because the checkpoint's three weight classes live in different places:
 
 * :func:`iter_weights` -- every dense (non-expert) tensor, with the ``model.language_model.`` prefix stripped and fused where the model expects one buffer. See ``_FUSIONS``.
 * :func:`load_ple_table` -- the 47.7 GiB FP8 n-gram table, 128 checkpoint shards concatenated into one pinned :class:`HostBank`.
-* :func:`load_nvfp4_expert_sources` -- the routed NVFP4 experts, into the offload cache's source banks.
+* :func:`nvfp4_expert_spec` -- how the routed NVFP4 experts are named, for the offload cache's expert reader.
 
 Dropped: ``mtp.*`` (speculative head, including its stacked ``mtp.layers.0.mlp.experts.*``) and ``model.visual.*`` (served text-only).
 """
@@ -24,7 +24,6 @@ from freetoken.distributed import get_tp_info
 from freetoken.models.loader import drop_page_cache, iter_weight_files
 from freetoken.models.nvfp4_banks import (
     Nvfp4ExpertSourceSpec,
-    load_nvfp4_expert_source_banks,
 )
 from freetoken.moe.host_banks import HostBank, read_range_into
 from freetoken.utils import download_hf_weight
@@ -62,6 +61,7 @@ _PLE_SHARD_RE = re.compile(
     r"\.ple\.ple_embedding\.ngram_embedding\.shard_(?P<shard>\d+)\.weight$"
 )
 _PLE_SCALE_SUFFIX = ".ple.ple_embedding.ngram_embedding.weight_scale"
+_PLE_FILE_BYTES = 4 << 30  # ple-table-*.safetensors written by ftw_side_files
 
 # Zero-centered Qwen4ExpTextRMSNorm weights, loaded RAW: GroupedPlusOneRMSNorm / GemmaPlusOneRMSNorm
 # and the vendored grouped_gemma_rmsnorm all apply (1+w) at runtime in fp32, so folding the +1 into
@@ -160,15 +160,16 @@ def iter_weights(
     it when --spec-mtp built the head on this process); off, like upstream, it is skipped.
 
     Keys keep the checkpoint's module names below the stripped prefix, so the emitted set is the
-    model's state dict minus the routed experts. Nothing here is quantized: the modelopt
-    ``ignore`` list covers everything except those experts, so attention, GDN, HC, PLE, the shared
-    expert and lm_head are all plain bf16 (the n-gram hash constants stay int64). Fusions:
+    model's state dict minus the routed experts. Nothing here is quantized: every release's skip
+    list (modelopt ``ignore``, fp8 ``modules_to_not_convert``) covers everything except those experts,
+    so attention, GDN, HC, PLE, the shared expert and lm_head are all plain bf16 (the n-gram hash
+    constants stay int64). Fusions:
     attention q|k|v -> ``qkv_proj``, GDN ``in_proj_{qkv,z,b,a}`` -> ``in_proj``, shared-expert
     gate|up -> ``gate_up_proj``, and each per-layer HC's ``input_mix_weight_down`` |
     ``block_inject_weight`` -> a zero-padded ``input_mix_weight_down_block_inject``.
 
     ``include_moe_experts`` is accepted for the loader contract but never yields anything: the
-    routed experts are NVFP4 and always come from :func:`load_nvfp4_expert_sources`.
+    routed experts are NVFP4 and always come from the offload cache's expert reader.
     """
     if get_tp_info().size > 1:
         raise NotImplementedError("qwen4_exp weight loading supports TP=1 only")
@@ -238,6 +239,39 @@ def _ple_table_files(folder: str) -> list[str]:
     return sorted(os.path.join(folder, shard) for shard in files)
 
 
+def ftw_side_files(model_path: str, out_dir: str) -> list[str]:
+    """Write the PLE n-gram table tensors, and only those, into ``ple-table-*.safetensors`` next to an FTW checkpoint.
+
+    The table is served from safetensors files in the checkpoint dir (see load_ple_table), not from FTW entries."""
+    from safetensors.torch import save_file
+
+    folder = download_hf_weight(model_path)
+    written: list[str] = []
+    batch: dict[str, torch.Tensor] = {}
+    size = 0
+
+    def flush():
+        nonlocal batch, size
+        if batch:
+            name = f"ple-table-{len(written):05d}.safetensors"
+            save_file(batch, os.path.join(out_dir, name))
+            written.append(name)
+            batch, size = {}, 0
+
+    for path in _ple_table_files(folder):
+        with safetensors.safe_open(path, framework="pt", device="cpu") as f:
+            for key in f.keys():
+                if _PLE_TABLE_INFIX not in key:
+                    continue
+                t = f.get_tensor(key)
+                batch[key] = t
+                size += t.numel() * t.element_size()
+                if size >= _PLE_FILE_BYTES:
+                    flush()
+    flush()
+    return written
+
+
 def load_ple_table(model_path: str, qwen4_args, *, pin: bool = True,
                    workers: int = 8, chunk: int = 8 << 20) -> PleTable:
     """Concatenate the checkpoint's ``ngram_embedding.shard_<i>`` tensors into one pinned host bank.
@@ -305,40 +339,13 @@ def load_ple_table(model_path: str, qwen4_args, *, pin: bool = True,
 # ======================================================================================
 
 
-def load_nvfp4_expert_sources(model_path: str, config, *, layer_sink=None) -> dict:
-    """Build the CPU NVFP4 expert source banks for the offload cache (gate/up fused on the output-row axis, down separate; weight_scale_2 carried as the per-row global scale)."""
-    return load_nvfp4_expert_source_banks(
-        model_path,
-        config,
-        _NVFP4_SOURCE_SPEC,
-        drop_page_cache=drop_page_cache,
-        primary=_is_primary(),
-        layer_sink=layer_sink,
-    )
-
-
-def load_nvfp4_expert_sources_parallel(
-    model_path: str, config, *, workers: int = 8, chunk: int = 8 << 20, layer_sink=None
-) -> dict:
-    """parallel: same NVFP4 source banks via the common chunked multi-threaded reader."""
-    from freetoken.models.nvfp4_banks import load_nvfp4_expert_source_banks_parallel
-
-    return load_nvfp4_expert_source_banks_parallel(
-        model_path,
-        config,
-        _NVFP4_SOURCE_SPEC,
-        drop_page_cache=drop_page_cache,
-        primary=_is_primary(),
-        workers=workers,
-        chunk=chunk,
-        layer_sink=layer_sink,
-    )
+def nvfp4_expert_spec(model_path: str, config):
+    return _NVFP4_SOURCE_SPEC
 
 
 __all__ = [
+    "nvfp4_expert_spec",
     "PleTable",
     "iter_weights",
-    "load_nvfp4_expert_sources",
-    "load_nvfp4_expert_sources_parallel",
     "load_ple_table",
 ]

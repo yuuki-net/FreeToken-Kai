@@ -227,7 +227,7 @@ use on that card -- 64k of context, the VRAM the KV gives back spent on expert s
 
 ```bash
 ft serve --model ~/models/Ornith-1.5-35B-A3B-NVFP4 --dtype float16 \
-  --moe-backend hybrid --disable-moe-prefill-overlap --max-running-req 1 \
+  --moe-strategy hybrid --disable-moe-prefill-overlap --max-running-req 1 \
   --host-embedding --kv-cache-dtype q4_0 \
   --kv-reserve-tokens 65536 --max-seq-len-override 65536 \
   --memory-ratio 0.82 --moe-cpu-threads 6

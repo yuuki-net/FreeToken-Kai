@@ -31,7 +31,9 @@ class Qwen3_5DecoderLayer(BaseOP):
     where the mixer is a GatedDeltaNet (linear layers) or gated attention (full layers).
     All norms are Gemma-style (1+weight)."""
 
-    def __init__(self, config: ModelConfig, layer_id: int, moe_layer_offset: int = 0):
+    def __init__(
+        self, config: ModelConfig, layer_id: int, moe_layer_offset: int = 0, *, prefix: str = ""
+    ):
         self._layer_id = layer_id
         self._is_linear = config.is_linear_layer(layer_id)
         if self._is_linear:
@@ -46,16 +48,18 @@ class Qwen3_5DecoderLayer(BaseOP):
                 conv_kernel_size=g.conv_kernel_dim,
                 rms_norm_eps=config.rms_norm_eps,
                 layer_id=layer_id,
-                expert_quant=config.expert_quant,
-                attn_quant=config.attn_quant,
+                quant_config=config.quant,
+                prefix=f"{prefix}.linear_attn",
             )
         else:
-            self.self_attn = Qwen3_5Attention(config, layer_id)
+            self.self_attn = Qwen3_5Attention(config, layer_id, prefix=f"{prefix}.self_attn")
         # Dense variants (num_experts==0, e.g. Qwen3.6-27B) use a plain SwiGLU MLP instead of
         # the routed MoE block; both expose ``forward(hidden)->hidden`` and the same key prefix.
         # the offload cache indexes MoE layers rank-locally under the pipeline engine
         self.mlp = (
-            Qwen3_5MoE(config, layer_id - moe_layer_offset) if config.moe_enabled else Qwen3_5DenseMLP(config)
+            Qwen3_5MoE(config, layer_id - moe_layer_offset, prefix=f"{prefix}.mlp")
+            if config.moe_enabled
+            else Qwen3_5DenseMLP(config, prefix=f"{prefix}.mlp")
         )
         self.input_layernorm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -99,7 +103,7 @@ class Qwen3_5MTP(BaseOP):
         self.pre_fc_norm_embedding = GemmaRMSNorm(hidden, eps=config.rms_norm_eps)
         self.pre_fc_norm_hidden = GemmaRMSNorm(hidden, eps=config.rms_norm_eps)
         self.fc = LinearReplicated(2 * hidden, hidden, has_bias=False)
-        head_config = replace(config, attn_quant="none", dense_quant="none")
+        head_config = replace(config, quant=None, attn_quant="none", dense_quant="none")
         self.layers = OPList([Qwen3_5DecoderLayer(head_config, layer_id, moe_layer_offset=moe_layer_offset)])
         self.norm = GemmaRMSNorm(hidden, eps=config.rms_norm_eps)
         # the head shares the target's embedding; a pipeline rank without the embedding table
@@ -133,7 +137,7 @@ class Qwen3_5Model(BaseOP):
     the embedding on the first rank, the final norm on the last; the other layers are
     ``RemoteLayer`` placeholders (see ``models/pipeline.py``)."""
 
-    def __init__(self, config: ModelConfig):
+    def __init__(self, config: ModelConfig, *, prefix: str = "model"):
         self._image_token_id = config.image_token_id
         win = layer_window(config)
         self._window = win
@@ -150,7 +154,10 @@ class Qwen3_5Model(BaseOP):
                 )
         self.layers = OPList(
             [
-                Qwen3_5DecoderLayer(config, layer_id, moe_layer_offset=win.start)
+                Qwen3_5DecoderLayer(
+                    config, layer_id, moe_layer_offset=win.start,
+                    prefix=f"{prefix}.layers.{layer_id}",
+                )
                 if win.owns(layer_id)
                 else RemoteLayer()
                 for layer_id in range(config.num_layers)
@@ -221,15 +228,6 @@ class Qwen3_5MoEForCausalLM(BaseLLMModel):
                 self.mtp._embed_ref = self.model.embed_tokens
         if not self.model.pp_last:
             self.lm_head = None
-        elif getattr(config, "lm_head_quant", "none") == "nvfp4":
-            # checkpoint stores the (untied) lm_head as NVFP4: keep it native (W4A16) -- the
-            # bf16 dequant of this ~1 GB matrix was the single largest decode kernel.
-            from freetoken.kernel.triton.nvfp4_linear import Nvfp4LMHead
-
-            assert not config.tie_word_embeddings, "NVFP4 lm_head assumes untied embeddings"
-            self.lm_head = Nvfp4LMHead(
-                num_embeddings=config.vocab_size, embedding_dim=config.hidden_size
-            )
         else:
             if config.tie_word_embeddings and self.model.embed_tokens is None:
                 raise NotImplementedError(
@@ -240,6 +238,8 @@ class Qwen3_5MoEForCausalLM(BaseLLMModel):
                 embedding_dim=config.hidden_size,
                 tie_word_embeddings=config.tie_word_embeddings,
                 tied_embedding=self.model.embed_tokens if config.tie_word_embeddings else None,
+                quant_config=config.quant,
+                prefix="lm_head",
             )
         super().__init__()
 

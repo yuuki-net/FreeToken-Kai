@@ -1,16 +1,19 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from functools import cached_property
-from typing import TYPE_CHECKING, List
+from typing import TYPE_CHECKING, Any, List
 
 import torch
 from freetoken.distributed import DistributedInfo
 from freetoken.models.register import _load_attr, get_model_spec
-from freetoken.utils import cached_load_hf_config
+from freetoken.utils import cached_load_hf_config, init_logger
+from freetoken.utils.hf import optional_hf_file
 
 if TYPE_CHECKING:
     from freetoken.models import ModelConfig
+
+logger = init_logger(__name__)
 
 
 @dataclass(frozen=True)
@@ -20,9 +23,11 @@ class EngineConfig:
     dtype: torch.dtype
     max_running_req: int = 4
     attention_backend: str = "auto"
-    moe_backend: str = "auto"
-    # NVFP4 routed-expert GEMM backend (--nvfp4-backend): auto|marlin|flashinfer|triton.
-    nvfp4_backend: str = "triton"
+    moe_strategy: str = "auto"
+    # old name of moe_strategy; __post_init__ folds it in
+    moe_backend: str | None = field(default=None, repr=False)
+    # --quant-backend: layer[.kind]=kernel entries, comma separated
+    quant_backend: str | None = None
     # PLE table backend: "disk" (default) reads rows from the checkpoint files per fill, "pinned" preloads the table into page-locked host RAM.
     ple_backend: str = "disk"
     # Expert-bank host load (--expert-load): auto|serial|parallel. "auto" reads scattered
@@ -66,16 +71,16 @@ class EngineConfig:
     moe_bank_stats: list[str] | None = None
     # --moe-bank-dir: where the cold bank file lives. Defaults beside the checkpoint.
     moe_bank_dir: str | None = None
-    # CPU MoE backend (--moe-backend cpu): number of CPU worker threads computing
+    # CPU MoE backend (--moe-strategy cpu): number of CPU worker threads computing
     # the decode experts. 0 = auto (physical cores). Ignored by other backends.
     moe_cpu_threads: int = 0
-    # Hybrid CPU/GPU decode (--moe-backend offload only): which MoE layers decode on
+    # Hybrid CPU/GPU decode (--moe-strategy offload only): which MoE layers decode on
     # the CPU executor instead of the GPU offload/PCIe path. Spec is an explicit id
     # list ("3,7,11"), a count ("8" -> 8 layers evenly strided across depth), or a
-    # fraction ("0.5"). None/"" = all layers on GPU (plain offload). --moe-backend cpu
+    # fraction ("0.5"). None/"" = all layers on GPU (plain offload). --moe-strategy cpu
     # already means all layers on CPU and ignores this.
     moe_cpu_layers: str | None = None
-    # Hybrid MoE backend (--moe-backend hybrid): max experts fetched over PCIe per
+    # Hybrid MoE backend (--moe-strategy hybrid): max experts fetched over PCIe per
     # (layer, decode step); the rest of that step's misses are computed on the CPU.
     # -1 (default) = auto: fetch the benched pcie_bw/cpu_bw fraction of each step's
     # misses so the PCIe fetch and the CPU compute finish together (perfect overlap);
@@ -127,6 +132,15 @@ class EngineConfig:
     # is final. Mutually exclusive with num_page_override.
     num_token_override: int | None = None
 
+    def __post_init__(self):
+        if self.moe_backend is None:
+            return
+        if self.moe_strategy != "auto":
+            raise ValueError("moe_backend is the old name of moe_strategy; pass only moe_strategy")
+        logger.warning("EngineConfig.moe_backend is deprecated; use moe_strategy")
+        object.__setattr__(self, "moe_strategy", self.moe_backend)
+        object.__setattr__(self, "moe_backend", None)
+
     @cached_property
     def hf_config(self):
         return cached_load_hf_config(self.model_path)
@@ -146,20 +160,20 @@ class EngineConfig:
         """The whole model, before any pipeline windowing."""
         spec = get_model_spec(self.hf_config.architectures[0])
         parse_config = _load_attr(spec.module, spec.parse_config)
-        config = parse_config(self.hf_config)
-        if self.dense_quant == "fp8":
-            from dataclasses import replace
+        from dataclasses import replace
 
-            # only the parts the checkpoint left bf16: a native fp8/nvfp4 layer keeps its format
-            fields = {
-                f: "fp8_pertensor"
-                for f in ("attn_quant", "dense_quant", "lm_head_quant", "embed_quant")
-                if getattr(config, f, "none") == "none"
-            }
-            config = replace(config, **fields)
+        config = parse_config(self.hf_config)
+        quant = checkpoint_quant_config(self.model_path, self.hf_config, spec)
+        if self.dense_quant == "fp8":
+            from freetoken.layers.quantization import LoadTimeFp8Config
+
+            # the layers follow the wrapped config; the embedding table is not a quantized
+            # layer kind, so it keeps its own switch
+            quant = LoadTimeFp8Config(quant)
+            config = replace(config, embed_quant="fp8_pertensor")
         elif self.dense_quant != "none":
             raise ValueError(f"--dense-quant {self.dense_quant!r}: supported values are none, fp8")
-        return config
+        return replace(config, quant=quant)
 
     @cached_property
     def pp_layer_range(self) -> tuple[int, int] | None:
@@ -215,3 +229,25 @@ class EngineConfig:
     @property
     def distributed_addr(self) -> str:
         return "tcp://127.0.0.1:2333"
+
+
+def checkpoint_quant_config(model_path: str, hf_config: Any, spec: Any):
+    """The checkpoint's QuantConfig under the family's naming, or None for GGUF, whose native-quant ops the shared parser does not model yet."""
+    from freetoken.layers.quantization import NameMap, QuantConfig
+
+    if spec.parse_config == "parse_gguf_config":
+        return None
+    # NOTE: ModelOpt exports before 0.41 keep the quantization config only in hf_quant_config.json, and the weight download fetches nothing but the safetensors shards, so this sidecar is fetched on its own.
+    hf_quant_config = None
+    sidecar = optional_hf_file(model_path, "hf_quant_config.json")
+    if sidecar is not None:
+        import json
+
+        with open(sidecar) as f:
+            hf_quant_config = json.load(f)
+    return QuantConfig.from_hf(
+        hf_config,
+        name_map=NameMap(roots=spec.checkpoint_roots, segments=spec.checkpoint_segments, packed=spec.packed_modules_mapping),
+        unquantized=spec.unquantized_modules,
+        hf_quant_config=hf_quant_config,
+    )

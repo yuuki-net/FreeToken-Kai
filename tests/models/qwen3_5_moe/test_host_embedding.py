@@ -38,6 +38,7 @@ def test_engine_config_flag_reaches_the_model_config(monkeypatch):
     monkeypatch.setattr(cfg_mod, "get_model_spec", lambda arch: SimpleNamespace(module="m", parse_config="p"))
     monkeypatch.setattr(cfg_mod, "_load_attr", lambda module, name: (lambda hf: _parsed(4)))
     monkeypatch.setattr(cfg_mod, "cached_load_hf_config", lambda path: _toy_hf_config(4))
+    monkeypatch.setattr(cfg_mod, "checkpoint_quant_config", lambda *a, **k: None)
     kw = dict(model_path="x", dtype=torch.bfloat16, tp_info=DistributedInfo(0, 1))
     assert EngineConfig(**kw).model_config.embed_host is False
     assert EngineConfig(host_embedding=True, **kw).model_config.embed_host is True
@@ -52,10 +53,10 @@ def test_model_builds_host_embedding(monkeypatch):
 
     monkeypatch.setattr(info_mod, "_TP_INFO", None)
     info_mod.set_tp_info(0, 1)
-    model = _build(replace(_parsed(4), moe_backend="offload", embed_host=True))
+    model = _build(replace(_parsed(4), moe_strategy="offload", embed_host=True))
     assert isinstance(model.model.embed_tokens, HostEmbedding)
     assert model.host_resident_prefixes == ("model.embed_tokens.",)
     keys = model.state_dict()
     assert keys["model.embed_tokens.weight"].shape == (1000, 64)
-    plain = _build(replace(_parsed(4), moe_backend="offload"))
+    plain = _build(replace(_parsed(4), moe_strategy="offload"))
     assert plain.host_resident_prefixes == ()

@@ -1,10 +1,10 @@
 # FreeToken Kai (改)
 
 An unofficial fork of [FlashML-org/FreeToken](https://github.com/FlashML-org/FreeToken),
-based on upstream `main` at commit `af71ba4` (2026-09-03). It is not affiliated with, endorsed
+merged with upstream `main` at commit `3d919e9` (2026-09-09). It is not affiliated with, endorsed
 by, or supported by FlashML. The license is unchanged (Apache-2.0).
 
-The fork adds eight things upstream does not have:
+The fork adds nine things upstream does not have:
 
 1. **Image input over the OpenAI API** for checkpoints that ship a vision tower but were served
    text-only: Qwen3.8-Flash-Next and the Qwen3.5-MoE family (Qwen3.6-35B-A3B, Ornith-1.5-35B-A3B).
@@ -41,7 +41,15 @@ The fork adds eight things upstream does not have:
    [kv-cache-quant.md](kv-cache-quant.md), and [vram-and-speed.md](vram-and-speed.md) for why
    the VRAM it frees did not make this machine faster -- and how to tell whether it would
    make yours faster.
-8. **A prefill chunk sized to the VRAM that is actually free** (`--prefill-chunk-budget`).
+8. **The checkpoint's bf16 dense weights served as fp8** (`--dense-quant fp8`): the attention
+   and GatedDeltaNet projections, the shared expert, the lm_head and the embedding table are
+   quantized to per-row fp8-e4m3 at load and read W8A16, halving both their VRAM and the bytes
+   each decode step reads. A projection the checkpoint already quantized keeps its own format,
+   and the router, the hyper-connection GEMMs, the QSA indexer and the GDN b/a gates stay bf16 --
+   they decide where tokens go rather than carry the traffic. On Qwen3.8-Flash-Next it takes the
+   resident dense weights from 4.9 GB per card to 2.9 GB, which is what leaves room for 128k of
+   context beside the expert cache. See [pipeline.md](pipeline.md).
+9. **A prefill chunk sized to the VRAM that is actually free** (`--prefill-chunk-budget`).
    The chunk is what the linear-attention kernels size their per-forward buffers from, and
    upstream's fixed 8192 needs 0.97 GiB on a 35B MoE -- more than a 6 GB card has spare, so
    long prompts crawled and sometimes died. The engine measures the cost per token at startup
@@ -118,11 +126,11 @@ to read the thread count as a tuned value.
 
 | Machine | Model | Result |
 |---|---|---|
-| RTX 2060 6 GB, 32 GB RAM, Windows 11 + WSL2 (`memory=24GB`) | `ornith-ai/Ornith-1.5-35B-A3B-NVFP4` (35B MoE, 3B active, vision) | Text and image input work. Decode 25-39 tok/s (`--moe-backend hybrid`, `--dtype float16`), 64k of context with `--host-embedding`. Prefill: a 2062-token prompt in ~7.8 s (68 s before the Turing GEMM changes); ~5 s of that is the per-chunk expert streaming, the rest ~1.3 ms/token; a follow-up turn behind a cached prefix answers in 2-3 s |
+| RTX 2060 6 GB, 32 GB RAM, Windows 11 + WSL2 (`memory=24GB`) | `ornith-ai/Ornith-1.5-35B-A3B-NVFP4` (35B MoE, 3B active, vision) | Text and image input work. Decode 25-39 tok/s (`--moe-strategy hybrid`, `--dtype float16`), 64k of context with `--host-embedding`. Prefill: a 2062-token prompt in ~7.8 s (68 s before the Turing GEMM changes); ~5 s of that is the per-chunk expert streaming, the rest ~1.3 ms/token; a follow-up turn behind a cached prefix answers in 2-3 s |
 | same | `openai/gpt-oss-20b` (MXFP4) | 13-14 tok/s with the Turing patch alone |
 | The two-GPU machine above (`--pp-size 2`, GPU 1 on the chipset x4 slot) | `RadixArk/Qwen3.8-Flash-Next-NVFP4` (125B MoE, vision), `--pp-size 2 --dense-quant fp8` | Does not fit one 12 GB card; runs with 128k of context. 18-20 tok/s plain, 13-27 tok/s with `--spec-mtp 5` (2.1-4.5 tokens accepted per step; the verify window and the draft head run as CUDA graphs on both ranks). Image input validated end to end (colour probe 6/6, chunked image prefill). A follow-up turn behind a cached prefix answers in 2.4-4.5 s (9 s before the CPU short-prefill path) |
-| same | `ornith-ai/Ornith-1.5-35B-A3B-NVFP4` | One card (`--gpu 0`), `--moe-backend hybrid`: 41-46 tok/s, 2,947 expert slots (2026-09-06; the context length of that run was not recorded). The same one-card configuration takes 256k of context (`--max-seq-len-override 262144 --kv-reserve-tokens 262144`, 262154 tokens allocated, K + V = 5.00 GiB, 1.33 GiB free after initialisation) with the expert cache cut to 680 slots. Measured against the depth actually held, 22 sampled steps each: 39.2 tok/s median at 8,185 tokens, 34.8 at 63,655 (-11%), 25.2 at 249,948 (-36%, KV at 95% of capacity). Prefill of the 250k context took 435 s in 8,192-token chunks, the per-chunk rate falling from 896 tok/s over the first chunk to 371 at a depth of 221k. On this host the expert transfer is not the bottleneck, so the cache can be spent on context almost for free; the cost lands on prefill. The first steps after any prefill run at 31-37 until the cache warms. Two cards, `--pp-layers 25 --moe-backend offload`: 40-44 tok/s, 3,833 slots per card; the even split with hybrid is slower (25-30 tok/s). `--spec-mtp 5` on one card: 19-35 tok/s (a 6-row verify step costs 68-92 ms against 23 ms for one row: the window multiplies the expert traffic, as on the 2060) |
-| same | `openai/gpt-oss-120b` (MXFP4, 57 GB of expert banks) | One card: 9-12 tok/s (202 expert slots; the banks exceed the pin budget, so 9 layers decode on the CPU). Two cards, `--pp-layers 26 --moe-backend hybrid`: 12-17 tok/s (394 slots per card, every bank pinned). All gpt-oss-120b runs used 32k of context (`--max-seq-len-override 32768 --kv-reserve-tokens 32768`), not the 128k of the Flash-Next row above: 18 of its 36 layers are full attention at 2048 B per token per layer, so 128k of KV would want 4.7-5.5 GiB against 1.62 GiB free. Untested at 128k |
+| same | `ornith-ai/Ornith-1.5-35B-A3B-NVFP4` | One card (`--gpu 0`), `--moe-strategy hybrid`: 41-46 tok/s, 2,947 expert slots (2026-09-06; the context length of that run was not recorded). The same one-card configuration takes 256k of context (`--max-seq-len-override 262144 --kv-reserve-tokens 262144`, 262154 tokens allocated, K + V = 5.00 GiB, 1.33 GiB free after initialisation) with the expert cache cut to 680 slots. Measured against the depth actually held, 22 sampled steps each: 39.2 tok/s median at 8,185 tokens, 34.8 at 63,655 (-11%), 25.2 at 249,948 (-36%, KV at 95% of capacity). Prefill of the 250k context took 435 s in 8,192-token chunks, the per-chunk rate falling from 896 tok/s over the first chunk to 371 at a depth of 221k. On this host the expert transfer is not the bottleneck, so the cache can be spent on context almost for free; the cost lands on prefill. The first steps after any prefill run at 31-37 until the cache warms. Two cards, `--pp-layers 25 --moe-strategy offload`: 40-44 tok/s, 3,833 slots per card; the even split with hybrid is slower (25-30 tok/s). `--spec-mtp 5` on one card: 19-35 tok/s (a 6-row verify step costs 68-92 ms against 23 ms for one row: the window multiplies the expert traffic, as on the 2060) |
+| same | `openai/gpt-oss-120b` (MXFP4, 57 GB of expert banks) | One card: 9-12 tok/s (202 expert slots; the banks exceed the pin budget, so 9 layers decode on the CPU). Two cards, `--pp-layers 26 --moe-strategy hybrid`: 12-17 tok/s (394 slots per card, every bank pinned). All gpt-oss-120b runs used 32k of context (`--max-seq-len-override 32768 --kv-reserve-tokens 32768`), not the 128k of the Flash-Next row above: 18 of its 36 layers are full attention at 2048 B per token per layer, so 128k of KV would want 4.7-5.5 GiB against 1.62 GiB free. Untested at 128k |
 
 The two-card rows are the only measurements of the layer split; the hand-off between the ranks
 costs under 1 ms per step (`FT_STEP_PROFILE`), and the rest is the two forwards in sequence.
@@ -167,14 +175,15 @@ CUDA kernels are JIT-compiled on first use (CUDA 13 toolkit with `nvcc`, as upst
 ```bash
 FT_IMAGE_MAX_PIXELS=262144 ft serve \
   --model models/Ornith-1.5-35B-A3B-NVFP4 --dtype float16 --host 0.0.0.0 --port 1919 \
-  --moe-backend hybrid --disable-moe-prefill-overlap --max-running-req 1 \
+  --moe-strategy hybrid --moe-cpu-layers auto --disable-moe-prefill-overlap --max-running-req 1 \
   --kv-reserve-tokens 16384 --max-seq-len-override 16384 --memory-ratio 0.85 \
   --moe-cpu-threads 6
 ```
 
 | Flag / variable | Why |
 |---|---|
-| `--moe-backend hybrid` | Experts live in host RAM; misses are split between PCIe and the CPU (`ft bench bw` once to calibrate). NVFP4 experts decode at 50 GB/s with the six threads set below |
+| `--moe-strategy hybrid` | Experts live in host RAM; misses are split between PCIe and the CPU (`ft bench bw` once to calibrate). NVFP4 experts decode at 50 GB/s with the six threads set below |
+| `--moe-cpu-layers auto` | WSL caps how much host RAM CUDA will pin, and the 17 GB of banks are over that cap. `auto` locks just enough head and tail layers to fit and decodes those on the CPU. Required since upstream stopped doing this silently: without the flag the boot stops and asks for it |
 | `--disable-moe-prefill-overlap` | The prefill double buffer needs 2 x 256 expert slots, which a 6 GB card cannot spare |
 | `--max-running-req 1` | GDN state slots 8 -> 2 and one CUDA graph; saves ~200 MB |
 | `--kv-reserve-tokens 16384` | KV pages are carved from the same budget as the expert cache; the default 8192 was too small for Open WebUI prompts, 4096 far too small |
@@ -189,7 +198,7 @@ line and makes a healthy server look stuck.
 
 ### What `ft bench bw` should look like
 
-`--moe-backend hybrid` splits every decode step's expert misses between PCIe and the CPU, and the
+`--moe-strategy hybrid` splits every decode step's expert misses between PCIe and the CPU, and the
 split comes from a bandwidth calibration. There is no published reference for what a healthy
 machine reports, so here is one, from the two-GPU host above (i5-12600KF, DDR5-4000, GPU 0 on
 PCIe 4.0 x16):
@@ -250,7 +259,7 @@ window graph keeps the K+1 per-token GDN states of every layer resident (~250 MB
 capture the graphs are dropped again, because a starved allocator makes the step slower than
 eager.
 
-Measured on the RTX 2060 (Ornith, fp16, `--moe-backend hybrid`, K=3): the head is good
+Measured on the RTX 2060 (Ornith, fp16, `--moe-strategy hybrid`, K=3): the head is good
 (2.5 tokens accepted per step on average, up to 4), and the verify path matches plain decode
 within fp16 rounding (`FT_SPEC_CHECK_STEP`: per-layer residual divergence 1e-4 at layer 0 to
 1e-2 at layer 39, identical top-3 logits, GDN state after rollback within 1e-3). But it does
@@ -262,7 +271,7 @@ off when a multi-row forward costs about as much as a single-row one -- experts 
 the GPU -- which a 6 GB card cannot offer for a 35B MoE. Treat `--spec-mtp` on Turing/offload
 setups as a correctness-verified feature, not a speed-up.
 
-The same holds on an RTX 3060 12 GB (Ornith, `--moe-backend hybrid`, `--attention-backend
+The same holds on an RTX 3060 12 GB (Ornith, `--moe-strategy hybrid`, `--attention-backend
 triton`, K=5, graphs captured): a 6-row verify step takes 68-92 ms against 23 ms for a plain
 step, 1.4-3.8 tokens are accepted, and the result is 19-35 tok/s against 41-46 tok/s plain.
 With 29% of the experts resident the window still multiplies the expert traffic. Flash-Next on
@@ -366,7 +375,13 @@ vocabularies only (Ornith's is untied); Qwen3.5-MoE family.
 
 ## Keeping up with upstream
 
-The fork is a few dozen commits on top of `af71ba4`, touching a small set of files (see `git log
-af71ba4..`). Rebasing onto a newer upstream is expected to be straightforward until upstream ships
-its own multimodal serving or Turing support, at which point the corresponding part of this fork
-should be dropped in favour of the official code.
+The fork is a few dozen commits merged with upstream `main`, touching a small set of files (see
+`git log upstream/main..`). It has been merged once, for upstream's quantization refactor (#418),
+which moved kernel selection into a `QuantConfig` / `QuantMethod` layer. The fork follows it:
+`--dense-quant fp8` (a pipeline flag, see `pipeline.md`) reports an fp8 scheme for the projections a
+checkpoint left bf16 instead of overriding the model config, and the fork's own fp8 and NVFP4 head
+classes were dropped in favour of that layer.
+
+Merging is expected to stay straightforward until upstream ships its own multimodal serving or
+Turing support, at which point the corresponding part of this fork should be dropped in favour of
+the official code.

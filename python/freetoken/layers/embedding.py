@@ -9,6 +9,7 @@ from freetoken.distributed import DistributedCommunicator, get_tp_info
 from freetoken.utils import div_ceil, nvtx_annotate
 
 from .base import BaseOP
+from .quantization import LayerKind, QuantConfig, quant_method_for
 
 
 class VocabParallelEmbedding(BaseOP):
@@ -94,6 +95,11 @@ class HostEmbedding(BaseOP):
 
 
 class ParallelLMHead(VocabParallelEmbedding):
+    """The head is a linear layer over the vocab shard: its weights come from ``quant_method``
+    unless they are tied to the input embedding."""
+
+    quant_layer_kind = LayerKind.LINEAR
+
     def __init__(
         self,
         num_embeddings: int,
@@ -101,11 +107,27 @@ class ParallelLMHead(VocabParallelEmbedding):
         bias: bool = False,
         tie_word_embeddings: bool = False,
         tied_embedding: VocabParallelEmbedding | None = None,
+        *,
+        quant_config: QuantConfig | None = None,
+        prefix: str = "",
     ):
         super().__init__(num_embeddings, embedding_dim)
-        self.bias = torch.empty(self.num_embeddings_tp) if bias else None
+        self.has_bias = bias
+        self.prefix = prefix
         self.tied_embedding = tied_embedding
         assert (tied_embedding is not None) == tie_word_embeddings
+        self.in_features = embedding_dim
+        self.out_features = self.num_embeddings_tp
+        self.output_sizes = (self.num_embeddings_tp,)
+        self.quant_method = None
+        if tied_embedding is None:
+            self.quant_method = quant_method_for(quant_config, self, prefix)
+            self.quant_method.create_weights(self)
+        self.bias = torch.empty(self.num_embeddings_tp) if bias else None
+
+    def finalize(self) -> None:
+        if self.quant_method is not None:
+            self.quant_method.finalize(self)
 
     def load_state_dict(
         self,
@@ -145,8 +167,10 @@ class ParallelLMHead(VocabParallelEmbedding):
             x = x[indices].contiguous()
             del indices
 
-        module = self.tied_embedding or self
-        logits = F.linear(x, module.weight, self.bias)
+        if self.tied_embedding is not None:
+            logits = F.linear(x, self.tied_embedding.weight, self.bias)
+        else:
+            logits = self.quant_method.apply(self, x)
         if self.tp_size == 1:
             return logits
         input_shape = logits.shape
@@ -163,8 +187,9 @@ class ParallelLMHead(VocabParallelEmbedding):
     def logits(self, x: torch.Tensor) -> torch.Tensor:
         """Raw head GEMM over the rows given (no batch bookkeeping; TP=1). The MTP draft head
         scores its own hidden states through the shared head with this."""
-        module = self.tied_embedding or self
-        return F.linear(x, module.weight, self.bias)
+        if self.tied_embedding is not None:
+            return F.linear(x, self.tied_embedding.weight, self.bias)
+        return self.quant_method.apply(self, x)
 
 
 class Fp8VocabParallelEmbedding(VocabParallelEmbedding):
@@ -185,29 +210,3 @@ class Fp8VocabParallelEmbedding(VocabParallelEmbedding):
         # gather on the byte view (index kernels for fp8 dtypes are not universal), then dequant
         rows = self.weight.view(torch.uint8)[idx].view(torch.float8_e4m3fn).to(self._out_dtype)
         return rows * self.weight_scale[idx].to(self._out_dtype)[:, None]
-
-
-class Fp8ParallelLMHead(ParallelLMHead):
-    """W8A16 lm_head: fp8-e4m3 weight + per-row fp32 scale (quantized at load). The full-vocab
-    GEMV reads the whole head every decode step, so fp8 halves that traffic. TP=1, untied only."""
-
-    def __init__(self, num_embeddings: int, embedding_dim: int):
-        super().__init__(num_embeddings, embedding_dim, tie_word_embeddings=False)
-        assert self.tp_size == 1, "fp8 lm_head is TP=1 only"
-        self.weight = torch.empty(num_embeddings, embedding_dim, dtype=torch.float8_e4m3fn)
-        self.weight_scale = torch.empty(num_embeddings, dtype=torch.float32)
-
-    @nvtx_annotate("LMHead")
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        from freetoken.kernel.triton.fp8_pertensor_linear import fp8_pertensor_linear
-
-        batch = get_global_ctx().batch
-        if batch.is_prefill and not getattr(batch, "spec_all_rows", False):
-            indices = batch.attn_metadata.get_last_indices(batch.size)
-            x = x[indices].contiguous()
-        return fp8_pertensor_linear(x, self.weight, self.weight_scale)
-
-    def logits(self, x: torch.Tensor) -> torch.Tensor:
-        from freetoken.kernel.triton.fp8_pertensor_linear import fp8_pertensor_linear
-
-        return fp8_pertensor_linear(x, self.weight, self.weight_scale)

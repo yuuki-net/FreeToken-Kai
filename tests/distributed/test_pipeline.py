@@ -279,7 +279,7 @@ def test_qwen4_segment_owns_only_its_layers(monkeypatch):
     from freetoken.models.qwen4_exp.model import Qwen4ExpForCausalLM, _RemoteLayer
     from freetoken.moe.offload_cache import iter_offload_moe_layers
 
-    full = replace(_parsed_qwen4(), moe_backend="offload")
+    full = replace(_parsed_qwen4(), moe_strategy="offload")
     monkeypatch.setattr(info_mod, "_TP_INFO", None)
     monkeypatch.setattr(info_mod, "_PP_INFO", None)
     info_mod.set_tp_info(0, 1)
@@ -348,17 +348,16 @@ def test_dense_quant_override_wires_fp8_layers(monkeypatch):
     from dataclasses import replace
 
     import freetoken.distributed.info as info_mod
-    from freetoken.kernel.triton.fp8_pertensor_linear import Fp8PerTensorColMerged, Fp8PerTensorLinear
-    from freetoken.layers import Fp8ParallelLMHead, Fp8VocabParallelEmbedding, set_rope_device
+    from freetoken.layers import Fp8VocabParallelEmbedding, set_rope_device
+    from freetoken.layers.quantization import Fp8TensorLinearMethod, LoadTimeFp8Config
     from freetoken.models.qwen4_exp.model import Qwen4ExpForCausalLM
 
     monkeypatch.setattr(info_mod, "_TP_INFO", None)
     monkeypatch.setattr(info_mod, "_PP_INFO", None)
     info_mod.set_tp_info(0, 1)
-    base = replace(_parsed_qwen4(), moe_backend="offload")
+    base = replace(_parsed_qwen4(), moe_strategy="offload")
     assert base.attn_quant == "none" and base.expert_quant == "nvfp4"
-    cfg = replace(base, attn_quant="fp8_pertensor", dense_quant="fp8_pertensor",
-                  lm_head_quant="fp8_pertensor", embed_quant="fp8_pertensor")
+    cfg = replace(base, quant=LoadTimeFp8Config(None), embed_quant="fp8_pertensor")
     set_rope_device(torch.device("cpu"))
     with torch.device("meta"), torch.no_grad():
         prev = torch.get_default_dtype()
@@ -368,14 +367,18 @@ def test_dense_quant_override_wires_fp8_layers(monkeypatch):
         finally:
             torch.set_default_dtype(prev)
 
+    def is_fp8(layer):
+        return isinstance(layer.quant_method, Fp8TensorLinearMethod)
+
     layer0, layer3 = model.model.layers.op_list[0], model.model.layers.op_list[3]
-    assert isinstance(layer3.self_attn.qkv_proj, Fp8PerTensorColMerged)
-    assert isinstance(layer3.self_attn.o_proj, Fp8PerTensorLinear)
-    assert isinstance(layer0.linear_attn.in_proj_qkvz, Fp8PerTensorColMerged)
-    assert isinstance(layer0.linear_attn.out_proj, Fp8PerTensorLinear)
-    assert isinstance(layer0.mlp.shared_expert.gate_up_proj, Fp8PerTensorColMerged)
-    assert isinstance(model.lm_head, Fp8ParallelLMHead)
+    assert is_fp8(layer3.self_attn.qkv_proj) and is_fp8(layer3.self_attn.o_proj)
+    assert is_fp8(layer0.linear_attn.in_proj_qkvz) and is_fp8(layer0.linear_attn.out_proj)
+    assert is_fp8(layer0.mlp.shared_expert.gate_up_proj)
+    assert is_fp8(model.lm_head)
     assert isinstance(model.model.embed_tokens, Fp8VocabParallelEmbedding)
+    # the routing and stream-mixing weights are the ones this never touches
+    assert not is_fp8(layer3.self_attn.indexer.index_qk_proj)
+    assert not is_fp8(layer0.attn_hyper_connection.input_mix_weight_up)
     keys = model.state_dict()
     assert keys["model.layers.0.linear_attn.in_proj_qkvz.weight"].dtype == torch.float8_e4m3fn
     assert "model.layers.0.linear_attn.in_proj_qkvz.weight_scale" in keys
@@ -415,12 +418,17 @@ def test_engine_config_dense_quant_override(monkeypatch):
     monkeypatch.setattr(cfg_mod, "get_model_spec", lambda arch: SimpleNamespace(module="m", parse_config="p"))
     monkeypatch.setattr(cfg_mod, "_load_attr", lambda module, name: (lambda hf: _parsed_qwen4()))
     monkeypatch.setattr(cfg_mod, "cached_load_hf_config", lambda path: _qwen4_hf_config())
+    monkeypatch.setattr(cfg_mod, "checkpoint_quant_config", lambda *a, **k: None)
+    from freetoken.layers.quantization import LoadTimeFp8Config
+
     ec = EngineConfig(model_path="x", tp_info=DistributedInfo(0, 1), dtype=torch.bfloat16, dense_quant="fp8")
     mc = ec.model_config
-    assert (mc.attn_quant, mc.dense_quant, mc.lm_head_quant, mc.embed_quant) == ("fp8_pertensor",) * 4
+    assert isinstance(mc.quant, LoadTimeFp8Config)
+    assert mc.embed_quant == "fp8_pertensor"  # the table is not a quantized layer kind
     assert mc.expert_quant == "nvfp4"  # the routed experts keep the checkpoint's format
     plain = EngineConfig(model_path="x", tp_info=DistributedInfo(0, 1), dtype=torch.bfloat16)
-    assert plain.model_config.attn_quant == "none"
+    assert not isinstance(plain.model_config.quant, LoadTimeFp8Config)
+    assert plain.model_config.embed_quant == "none"
 
 
 def test_fp8_embedding_forward_matches_bf16_table(monkeypatch):
