@@ -399,16 +399,22 @@ class MappedBanks:
         # it every layer is LOCKED, which means every decode miss goes to the CPU executor --
         # and that bypasses the VRAM expert cache entirely, throwing away its ~56% hit rate.
         #
-        # flags=0 asks for read-write pinning, which a read-only mapping cannot give;
-        # cudaHostRegisterReadOnly (0x08) is the flag for exactly this case. Try plain first
-        # so a driver without it still works.
+        # flags=0 asks for read-write pinning, which a file mapping cannot give;
+        # cudaHostRegisterReadOnly (0x08) is the flag for exactly this case. Ask for it first
+        # and keep plain as the fallback for a driver that does not know the flag.
+        #
+        # Every failed attempt leaves a sticky cudaErrorMemoryAllocation on the context, and
+        # the next allocation of any size dies with "CUDA error: out of memory" -- a 48 KB
+        # tensor in OffloadMoeCache, in practice. Clear it after each failure, not only when
+        # they all fail: the path that mattered was flags=0 failing and 0x08 succeeding, which
+        # reported the bank as registered and then killed the boot.
         cudart = torch.cuda.cudart()
-        for flags in (0, 0x08):
+        for flags in (0x08, 0):
             if int(cudart.cudaHostRegister(addr, nbytes, flags)) == 0:
                 self.registered_bytes += nbytes
                 self._registered.append(addr)
                 return
-        torch.cuda.synchronize()  # clear the sticky error the failed attempts left
+            torch.cuda.synchronize()  # clear the sticky error this attempt left
 
     def _advise(self, option, start: int, length: int, limit: int) -> None:
         if option is None or length <= 0:

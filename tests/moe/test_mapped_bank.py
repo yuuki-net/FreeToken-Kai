@@ -283,3 +283,38 @@ def test_small_blocks_are_kept_whole(tmp_path):
         assert banks.whole_blocks == len(lay.layers)
     finally:
         banks.close()
+
+
+def test_a_failed_register_flag_is_cleared_before_the_next_allocation(monkeypatch):
+    """cudaHostRegister leaves a sticky cudaErrorMemoryAllocation on the context when it
+    refuses a flag, and the next device allocation of any size dies with "CUDA error: out of
+    memory" -- a 48 KB tensor in OffloadMoeCache, in practice. The path that mattered was
+    flags=0 refused and ReadOnly accepted: the bank reported itself registered and the boot
+    died anyway, because the clear only ran when every flag had failed."""
+    import torch
+
+    from freetoken.moe.mapped_bank import MappedBanks
+
+    attempts, syncs = [], []
+
+    class _Cudart:
+        def cudaHostRegister(self, addr, nbytes, flags):
+            attempts.append(flags)
+            return 0 if flags == 0x08 else 2  # this driver takes read-only file pages only
+
+    monkeypatch.setattr(torch.cuda, "cudart", lambda: _Cudart())
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda *a, **k: syncs.append(len(attempts)))
+
+    import mmap as _mmap
+
+    bank = MappedBanks.__new__(MappedBanks)
+    bank._base, bank._libc = 0x1000, None
+    bank._map = _mmap.mmap(-1, 1 << 20)  # a real mapping: _settle advises it before locking
+    bank.locked_bytes = bank.registered_bytes = 0
+    bank._registered = []
+    bank._settle(offset=0, nbytes=4096, block_bytes=4096, register=True)
+
+    assert bank.registered_bytes == 4096, "the read-only flag registers the prefix"
+    assert attempts and attempts[0] == 0x08, f"read-only first, got {attempts}"
+    # every refusal is cleared, whether or not a later flag went on to succeed
+    assert len(syncs) == sum(1 for f in attempts if f != 0x08), (attempts, syncs)
