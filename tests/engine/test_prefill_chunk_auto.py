@@ -258,3 +258,80 @@ def test_scheduler_does_not_query_the_driver_on_a_decode_turn():
 
     Scheduler._schedule_next_batch(s)
     assert asked == [8192]
+
+
+# --------------------------------------------------------------------------------------
+# --pp-size: the chunk sizes a message between ranks, so the ranks have to agree on it
+# --------------------------------------------------------------------------------------
+
+
+@dataclass
+class _PPConfig(_Config):
+    is_pp: bool = True
+
+
+def test_pipeline_ranks_solve_the_chunk_from_the_tightest_numbers(monkeypatch):
+    """Each rank measures its own half of the model against its own free VRAM. Solving from
+    those independently gave rank 0 3328 tokens and rank 1 3072, and the first prefill died in
+    gloo with "Received data size doesn't match expected size" (68157440 vs 62914560 bytes)."""
+    import torch
+
+    from freetoken.engine import engine as engine_mod
+
+    seen = {}
+
+    def _all_reduce(tensor, op=None, group=None):
+        seen["op"] = op
+        # the other rank: more transient per token, less VRAM free
+        other = torch.tensor([0.0, 300.0 * KIB, -float(int(1.0 * GIB))], dtype=torch.float64)
+        torch.maximum(tensor, other, out=tensor)
+
+    monkeypatch.setattr(engine_mod.torch.distributed, "all_reduce", _all_reduce)
+
+    sizer = _Sizer(per_token=255.0 * KIB, free=int(1.48 * GIB))
+    sizer.tp_cpu_group = None
+    config = _PPConfig(max_extend_tokens=4096)
+    sizer._autosize_prefill_chunk(config)
+
+    assert seen["op"] is torch.distributed.ReduceOp.MAX
+    # solved from the other rank's numbers: 1.0 GiB * 0.55 / 307,200 B = 1922 -> 1792
+    assert config.max_extend_tokens == 1792
+
+
+def test_a_failed_probe_on_one_rank_leaves_every_rank_configured(monkeypatch):
+    """A rank whose probe failed cannot chunk; the others must not chunk either."""
+    import torch
+
+    from freetoken.engine import engine as engine_mod
+
+    def _all_reduce(tensor, op=None, group=None):
+        other = torch.tensor([1.0, 0.0, -float(int(8.0 * GIB))], dtype=torch.float64)  # failed
+        torch.maximum(tensor, other, out=tensor)
+
+    monkeypatch.setattr(engine_mod.torch.distributed, "all_reduce", _all_reduce)
+
+    sizer = _Sizer(per_token=255.0 * KIB, free=int(1.48 * GIB))
+    sizer.tp_cpu_group = None
+    config = _PPConfig(max_extend_tokens=4096)
+    sizer._autosize_prefill_chunk(config)
+    assert config.max_extend_tokens == 4096
+
+
+def test_the_runtime_resolve_is_frozen_under_pp(monkeypatch):
+    """Re-solving per prefill cannot be agreed without a collective on the hot path, and each
+    rank reaches it on its own schedule, so under --pp-size the boot value stands."""
+    import torch
+
+    # tight enough that a re-solve would drop to the floor, which is what must NOT happen here
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda device=None: (int(0.02 * GIB), 0))
+    monkeypatch.setattr(torch.cuda, "memory_reserved", lambda device=None: 0)
+    monkeypatch.setattr(torch.cuda, "memory_allocated", lambda device=None: 0)
+
+    class _PPLive(_Live):
+        config = _PPConfig(max_extend_tokens=4096)
+
+    single = _Live(per_token=255.0 * KIB, free=0, reserved=0, allocated=0)
+    assert single.prefill_chunk_now(3072) == Engine._PREFILL_CHUNK_FLOOR  # one GPU: re-solves
+
+    live = _PPLive(per_token=255.0 * KIB, free=0, reserved=0, allocated=0)
+    assert live.prefill_chunk_now(3072) == 3072  # two ranks: frozen at what they agreed on

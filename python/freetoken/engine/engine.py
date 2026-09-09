@@ -1926,6 +1926,7 @@ class Engine:
         if probe < 64:
             return
 
+        failed = 0.0
         try:
             per_token, free_before = self._measure_prefill_transient(probe)
         except Exception as exc:  # noqa: BLE001 -- a probe that fails must not stop the boot
@@ -1933,8 +1934,20 @@ class Engine:
                 f"--prefill-chunk-budget: probe failed ({type(exc).__name__}: {exc}); "
                 f"keeping --max-prefill-length {configured}"
             )
-            return
-        if per_token <= 0:
+            per_token, free_before, failed = 0.0, 0, 1.0
+        if getattr(config, "is_pp", False):  # duck-typed test configs omit it
+            # Every rank must chunk a prefill the same way: the residual a rank hands on is
+            # sized from the chunk, so one rank solving 3328 against another's 3072 kills the
+            # run in gloo ("Received data size doesn't match expected size"). The ranks hold
+            # different halves of the model and different runtime buffers, so their own
+            # numbers differ by construction -- agree on the tightest: most transient per
+            # token, least VRAM free, and no chunk at all if any rank's probe failed.
+            agreed = torch.tensor([failed, per_token, -float(free_before)], dtype=torch.float64)
+            torch.distributed.all_reduce(
+                agreed, op=torch.distributed.ReduceOp.MAX, group=self.tp_cpu_group
+            )
+            failed, per_token, free_before = float(agreed[0]), float(agreed[1]), int(-agreed[2])
+        if failed or per_token <= 0:
             return
         # Kept for prefill_chunk_now(): the same measurement, re-applied against whatever is
         # free when a prompt actually arrives.
@@ -2017,6 +2030,12 @@ class Engine:
         """
         per_token = getattr(self, "_prefill_bytes_per_token", 0.0)
         if per_token <= 0 or ceiling <= self._PREFILL_CHUNK_FLOOR:
+            return ceiling
+        # (duck-typed test engines carry no config)
+        if getattr(getattr(self, "config", None), "is_pp", False):
+            # Under --pp-size the chunk is frozen at the value the ranks agreed on at boot
+            # (see _autosize_prefill_chunk): it sizes a cross-rank message, and each rank
+            # reaches this on its own schedule, so there is nowhere safe to re-agree.
             return ceiling
         free = int(torch.cuda.mem_get_info(self.device)[0])
         reserved = int(torch.cuda.memory_reserved(self.device))
