@@ -55,7 +55,10 @@ The fork adds nine things upstream does not have:
    upstream's fixed 8192 needs 0.97 GiB on a 35B MoE -- more than a 6 GB card has spare, so
    long prompts crawled and sometimes died. The engine measures the cost per token at startup
    and re-solves the chunk before every prefill, so a desktop that grabs 300 MB mid-request
-   shrinks the chunk instead of breaking the run. See [prefill-chunk.md](prefill-chunk.md).
+   shrinks the chunk instead of breaking the run. Under `--pp-size` it is settled once at
+   startup instead, from the tightest numbers any rank measured: the chunk sizes the residual
+   stream the ranks hand each other, so it cannot be a per-rank answer. See
+   [prefill-chunk.md](prefill-chunk.md).
 
 Everything else is upstream FreeToken. The feature sets are independent: image input, the MTP
 head, the host embedding, the layer split and the bank mapping also apply to a plain upstream

@@ -41,6 +41,9 @@ Ornith-1.5-35B-A3B; `qwen3_5_moe`) and gpt-oss (`gpt_oss`). Others raise
 - CUDA graphs: the first rank's decode graph outputs the residual stream instead of logits;
   the others capture their graphs against a static input buffer the received stream is
   copied into. `--spec-mtp`'s verify-window graphs work the same way.
+- The prefill chunk (`--prefill-chunk-budget`) is one number for the whole pipeline: the ranks
+  agree on the tightest measurement at startup and keep it, because the residual stream they
+  hand each other is sized from it. See [prefill-chunk.md](prefill-chunk.md#two-gpus).
 - Prefill chunks overlap across the ranks: for a chunk whose sampled token nobody reads (every
   chunk but the last), the first rank hands the stream on and starts the next chunk without
   waiting, so a long prompt costs about the slower rank's time per chunk, not the sum.

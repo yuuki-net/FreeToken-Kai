@@ -66,6 +66,18 @@ Headroom is not free. On the 2060, 0.55 chose 1792-2048 where a fixed 4096 ran t
 prompt about 13% faster — when it fit. The whole point is that "when it fit" is a property
 of the moment, and the moment changes.
 
+## Two GPUs
+
+Under `--pp-size` the chunk is settled once, at startup, from the tightest numbers any rank
+measured -- most transient per token, least VRAM free -- and then left alone. It has to be the
+same number on every rank: a rank hands on one residual row per token of the chunk, and the
+receiver sizes its buffer from its own answer (Qwen3.8-Flash-Next: 20,480 bytes a row). Ranks that solved it separately
+(3328 on one card, 3072 on the other, both correct for their own card) killed the first prefill
+in gloo with `Received data size doesn't match expected size`.
+
+So the re-solve before each prefill is a single-GPU feature. A two-card run keeps the boot
+value, and a desktop that takes 300 MB mid-session no longer shrinks the chunk to match.
+
 ## Where this matters less
 
 A card with room to spare will measure, find that the configured chunk fits, and keep it —
