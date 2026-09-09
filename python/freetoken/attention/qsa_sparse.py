@@ -556,6 +556,28 @@ class QSASparseAttnBackend(BaseAttnBackend):
         assert batch.active_table_idx is not None, "decode batch is missing its page-table rows"
         self._stage_decode(md, batch.padded_size, batch.active_table_idx.to(torch.int64))
 
+    def restage_decode(self, batch: Batch) -> None:
+        """The draft head's chain step: keep the metadata object the chain graph was captured
+        with -- the captured kernels read that object's tensors -- and move it to this step's
+        position: the kv length in place, the addressing through the static buffers."""
+        md = batch.attn_metadata
+        assert isinstance(md, QSASparseMetadata) and md.is_decode
+        reqs = batch.padded_reqs if hasattr(batch, "padded_reqs") else batch.reqs
+        for i, r in enumerate(reqs):
+            md.kv_len_cpu[i] = r.device_len
+        # The plan is this step's, not the capture's: a captured chain step rebuilds it inside
+        # the graph (reset_forward_plan ran before the capture, so those kernels are in it), an
+        # eager one rebuilds it at the layer.
+        md.cmp_rows = None
+        md.ring_rows = None
+        self.prepare_for_replay(batch)
+
+    def reset_forward_plan(self, batch: Batch) -> None:
+        md = getattr(batch, "attn_metadata", None)
+        if isinstance(md, QSASparseMetadata):
+            md.cmp_rows = None
+            md.ring_rows = None
+
     def reset_capture(self) -> None:
         super().reset_capture()
         self._graph = {}

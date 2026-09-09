@@ -20,6 +20,13 @@ rows on the target's static final hidden state, the drafting row scored through 
 lm_head into a static token buffer) and one chain step (a one-token head decode at a staged
 position on the head's own previous output). Each drafted token is read back once, as eagerly.
 
+Both of those run ONE attention layer -- the head's -- and it is not the first layer of the
+model, so a backend that rebuilds its per-forward scatter plan "at the first layer" does not
+rebuild it for them. Each capture therefore clears the plan first (``reset_forward_plan``), so
+the kernels that build it are inside the graph and every replay recomputes it from the static
+buffers; and a chain step restages the captured metadata object in place (``restage_decode``)
+instead of building a new one, because that object owns tensors the captured kernels read.
+
 Windows shorter than K+1 rows (the output budget's tail) fall back to the eager path. An
 attention backend takes part by implementing ``init_spec_capture(rows)`` / ``stage_spec(md,
 table_idx=, kv_len=)`` (the Triton and qsa_sparse backends do); without them the window stays
@@ -140,6 +147,10 @@ class SpecVerifyGraph:
                 self.out = torch.empty_like(warm)
                 self.out.copy_(warm)
                 ctx.spec_stash = []
+                # the capture pass must build the backend's per-forward plan itself (see
+                # capture_mtp): a plan left by the warm run is skipped and then read from
+                # tensors the warm run owned
+                eng.attn_backend.reset_forward_plan(batch)
                 with torch.cuda.graph(graph, stream=eng.stream):
                     self.out.copy_(model.forward())
                 self.stash = list(ctx.spec_stash)
@@ -198,6 +209,11 @@ class SpecVerifyGraph:
         g_window = torch.cuda.CUDAGraph()
         with ctx.forward_batch(batch):
             window()  # warm
+            # The head is ONE attention layer, and it is not the first one of the model, so the
+            # backend's "rebuild the plan at the first layer of a forward" rule does not fire
+            # for it: without this the capture would skip the plan and bake in the warm run's
+            # tensors (freed as soon as the metadata moves on -- an illegal access, later).
+            attn.reset_forward_plan(batch)
             with torch.cuda.graph(g_window, stream=eng.stream):
                 window()
 
@@ -233,6 +249,7 @@ class SpecVerifyGraph:
         g_chain = torch.cuda.CUDAGraph()
         with ctx.forward_batch(mini):
             chain()  # warm
+            attn.reset_forward_plan(mini)  # as above: the plan belongs inside the graph
             with torch.cuda.graph(g_chain, stream=eng.stream):
                 chain()
         if eng.moe_offload_cache is not None:
@@ -259,9 +276,10 @@ class SpecVerifyGraph:
         self.c_out_loc.copy_(eng.page_table[req.table_idx, position : position + 1])
         self.c_table.fill_(req.table_idx)
         self.c_ids.fill_(token)
-        # the backend rebuilds this step's decode addressing and copies it into its capture buffers
-        eng.attn_backend.prepare_metadata(mini)
-        eng.attn_backend.prepare_for_replay(mini)
+        # the backend moves the captured decode metadata to this position and copies the
+        # addressing into its capture buffers (in place for qsa_sparse: the chain graph reads
+        # that metadata object's tensors; a rebuilt object would leave the graph on freed ones)
+        eng.attn_backend.restage_decode(mini)
 
     def mtp_draft(self, req: Req, *, row: int, next_ids: list, pos_row: int, rope_delta: int = 0, prof=None) -> list:
         """Graph replacement of ``Engine._mtp_draft`` for a replayed window: ``next_ids`` are

@@ -73,6 +73,24 @@ class BaseAttnBackend(ABC):
     @abstractmethod
     def prepare_for_replay(self, batch: Batch) -> None: ...
 
+    def restage_decode(self, batch: Batch) -> None:
+        """Re-point a captured one-row decode batch (the MTP draft head's chain step,
+        engine/spec_graph) at its new position and copy the addressing into the capture
+        buffers. The default rebuilds the metadata; a backend whose captured kernels read
+        tensors of the metadata object itself updates that object in place instead."""
+        self.prepare_metadata(batch)
+        self.prepare_for_replay(batch)
+
+    def reset_forward_plan(self, batch: Batch) -> None:
+        """Drop whatever per-forward plan the backend cached on ``batch.attn_metadata``, so
+        the next forward over that batch builds it again.
+
+        Called between a graph's warm run and its capture (engine/spec_graph). A plan the warm
+        run left behind would make the capture skip the kernels that build it, and the captured
+        kernels would then read the warm run's tensors -- which nothing owns once the metadata
+        moves on. Backends that cache nothing per forward need no override."""
+        return None
+
     def reset_capture(self) -> None:
         """Drop CUDA-graph capture scratch so ``init_capture_graph`` can re-run after a
         runtime cache rebuild. The default clears the common capture state (guarded by
@@ -119,6 +137,13 @@ class HybridBackend(BaseAttnBackend):
 
     def prepare_for_replay(self, batch: Batch) -> None:
         self.decode_backend.prepare_for_replay(batch)
+
+    def restage_decode(self, batch: Batch) -> None:
+        self.decode_backend.restage_decode(batch)
+
+    def reset_forward_plan(self, batch: Batch) -> None:
+        backend = self.prefill_backend if batch.is_prefill else self.decode_backend
+        backend.reset_forward_plan(batch)
 
     def reset_capture(self) -> None:
         # Only the decode backend is ever captured (see init_capture_graph above).
