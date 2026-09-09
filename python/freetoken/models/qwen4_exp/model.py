@@ -30,6 +30,7 @@ from freetoken.layers import (
     VocabParallelEmbedding,
 )
 from freetoken.models.blocks import BaseLLMModel
+from freetoken.models.mtp_quant import draft_head_config
 from freetoken.models.pipeline import RemoteLayer as _RemoteLayer
 from freetoken.utils import nvtx_annotate
 
@@ -125,9 +126,10 @@ class Qwen4ExpMTP(BaseOP):
         self.fc_embedding = LinearReplicated(
             hidden, hidden, has_bias=False, quant_config=config.quant, prefix="mtp.fc_embedding"
         )
+        head_config = draft_head_config(config, dense_from_model=True)
         self.layers = OPList([
             Qwen4ExpDecoderLayer(
-                config, layer_id, moe_layer_offset=moe_layer_offset, prefix="mtp.layers.0"
+                head_config, layer_id, moe_layer_offset=moe_layer_offset, prefix="mtp.layers.0"
             )
         ])
         self.hyper_connection_mixer = GatedResidual(

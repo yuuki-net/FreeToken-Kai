@@ -326,3 +326,42 @@ def test_mtp_head_absent_without_spec(monkeypatch):
     model = _build(replace(_parsed(4), moe_strategy="offload"))
     assert model.mtp is None
     assert not any(k.startswith("mtp.") for k in model.state_dict())
+
+
+def test_the_draft_head_binds_the_targets_expert_method(monkeypatch):
+    """A checkpoint excludes its MTP head from quantization, but the engine quantizes the head's
+    experts into one more layer of the target's NVFP4 bank. Reading the head's own entry gave it
+    an unquantized method and stopped the boot: "expert layers disagree on format / kernel:
+    ['none / fused', 'nvfp4 / triton']" (Qwen3.8-Flash-Next on two RTX 3060s)."""
+    from dataclasses import replace
+
+    import freetoken.distributed.info as info_mod
+    from freetoken.engine.engine import shared_offload_method
+    from freetoken.layers.quantization import QuantConfig, QuantKind
+    from freetoken.layers.quantization.scheme import nvfp4_scheme
+    from freetoken.models.config import with_mtp_layer
+
+    class _ExpertsOnlyNvfp4(QuantConfig):
+        """What a ModelOpt NVFP4 export says: routed experts packed, mtp.* left alone."""
+
+        dialect = "test-nvfp4"
+
+        @classmethod
+        def claims(cls, q):
+            return False
+
+        def scheme_for_name(self, name):
+            if name.startswith("mtp."):
+                return None
+            return nvfp4_scheme(input_scale=False) if ".experts" in name else None
+
+    monkeypatch.setattr(info_mod, "_TP_INFO", None)
+    info_mod.set_tp_info(0, 1)
+    cfg = with_mtp_layer(
+        replace(_parsed(4), moe_strategy="offload", quant=_ExpertsOnlyNvfp4()), 4
+    )
+    model = _build(cfg)
+
+    method = shared_offload_method(model)  # raises when the head disagrees
+    assert method.kind is QuantKind.NVFP4
+    assert model.mtp.layers.op_list[0].mlp.experts.quant_method.kind is QuantKind.NVFP4

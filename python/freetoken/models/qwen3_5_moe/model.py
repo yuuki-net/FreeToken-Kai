@@ -14,6 +14,7 @@ from freetoken.layers import (
     VocabParallelEmbedding,
 )
 from freetoken.models.blocks import BaseLLMModel
+from freetoken.models.mtp_quant import draft_head_config
 from freetoken.models.pipeline import RemoteLayer, layer_window, received_hidden
 from freetoken.utils import nvtx_annotate
 
@@ -103,7 +104,11 @@ class Qwen3_5MTP(BaseOP):
         self.pre_fc_norm_embedding = GemmaRMSNorm(hidden, eps=config.rms_norm_eps)
         self.pre_fc_norm_hidden = GemmaRMSNorm(hidden, eps=config.rms_norm_eps)
         self.fc = LinearReplicated(2 * hidden, hidden, has_bias=False)
-        head_config = replace(config, quant=None, attn_quant="none", dense_quant="none")
+        head_config = replace(
+            draft_head_config(config, dense_from_model=False),
+            attn_quant="none",
+            dense_quant="none",
+        )
         self.layers = OPList([Qwen3_5DecoderLayer(head_config, layer_id, moe_layer_offset=moe_layer_offset)])
         self.norm = GemmaRMSNorm(hidden, eps=config.rms_norm_eps)
         # the head shares the target's embedding; a pipeline rank without the embedding table
