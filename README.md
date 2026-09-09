@@ -47,7 +47,7 @@ cost where acceptance runs long. [docs/kai.md](docs/kai.md) has the per-step tim
 | 1× RTX 2060 6 GB | 32 GB | `ornith-ai/Ornith-1.5-35B-A3B-NVFP4` (35B-A3B, vision) | **64k** | **25–39 tok/s** |
 | 2× RTX 3060 12 GB, one card used | 128 GB | `ornith-ai/Ornith-1.5-35B-A3B-NVFP4` (35B-A3B, vision) | **256k** | **39–47 tok/s** near the start, **25** at 250k |
 | 2× RTX 3060 12 GB, one card used | 64 GB* | `openai/gpt-oss-120b` (117B MoE, MXFP4) | 32k | **15 tok/s** (`--moe-bank-ram 48G`) |
-| 2× RTX 3060 12 GB | 128 GB | `RadixArk/Qwen3.8-Flash-Next-NVFP4` (125B MoE, vision) | **128k** | **18–20 tok/s** (`--pp-size 2`) |
+| 2× RTX 3060 12 GB | 128 GB | `RadixArk/Qwen3.8-Flash-Next-NVFP4` (125B MoE, vision) | **128k** | **18–20 tok/s**, and flat with context — 18.8 at 16k, 19.2 at 98k over 58,000 sampled steps (`--pp-size 2`) |
 | 2× RTX 3060 12 GB | 64 GB* | same model, `--moe-bank-ram 48G` | 128k | 14–15 tok/s |
 
 Qwen3.8-Flash-Next does not fit one 12 GB card at all; the two-card rows are what make it run.
