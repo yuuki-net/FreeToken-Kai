@@ -629,6 +629,22 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--prefill-chunk-budget",
+        type=float,
+        default=ServerArgs.prefill_chunk_budget,
+        help=(
+            "Share of the free VRAM one prefill chunk's transient may take (default 0.55; "
+            "0 disables and --max-prefill-length is used as given). The chunk is what the "
+            "linear-attention kernels size their per-forward buffers from, and a chunk whose "
+            "transient is the size of the free VRAM runs slow before it runs out; the engine "
+            "measures that cost per token at startup and re-solves the chunk before every "
+            "prefill against the VRAM free right then. The rest is headroom for whatever else "
+            "uses the card: a dedicated box can run 0.8-0.9, a desktop that opens a browser "
+            "mid-request wants less."
+        ),
+    )
+
+    parser.add_argument(
         "--kv-cache-dtype",
         default=ServerArgs.kv_cache_dtype,
         choices=["auto", "q8_0", "q4_0"],

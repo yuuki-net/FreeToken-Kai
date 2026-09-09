@@ -241,7 +241,6 @@ def _validate_attention_backend_choice(config, override, required: frozenset[Att
                 f"Flash-Next checkpoint resolve to qsa_sparse), or drop --kv-cache-dtype."
             )
 
-
     # An explicitly-selected backend may require a package that isn't installed. Auto
     # never resolves to one of these when its package is missing, so this only fires for
     # explicit --attention-backend choices.
@@ -705,6 +704,9 @@ class Engine:
         )
         # pre-map before the prefill warmup so its persistent buffers come from the cache
         self._premap_vram()
+        # Chunk size decides the prefill transient, so it has to be settled before anything
+        # measures or warms at that size. Backend-independent: the buffers are the model's.
+        self._autosize_prefill_chunk(config)
         if config.attention_backend.split(",")[0] == "triton":
             # Prefill runs on the first comma part; warm its autotune cache.
             self._warmup_prefill()
@@ -1908,6 +1910,159 @@ class Engine:
         mini.out_loc = self.page_table[req.table_idx, position : position + 1]
         self.attn_backend.prepare_metadata(mini)
         return mini
+
+    # Default share of the free VRAM one prefill chunk's transient may occupy
+    # (--prefill-chunk-budget). The rest absorbs whatever else wants the card: on the machine
+    # this was written for, a desktop, free VRAM moved by ~150 MB between runs depending on
+    # what was on screen. A box that serves and nothing else can raise it.
+    _PREFILL_TRANSIENT_BUDGET = 0.55
+    _PREFILL_PROBE_TOKENS = 1024
+    _PREFILL_CHUNK_FLOOR = 512
+
+    @torch.inference_mode()
+    def _autosize_prefill_chunk(self, config) -> None:
+        """Lower ``--max-prefill-length`` until one chunk's transient fits the free VRAM.
+
+        The chunk is the unit of transient allocation: the linear-attention kernels allocate
+        buffers proportional to it on every chunk and free them again, so the peak the engine
+        has to find room for scales with the chunk and not with the prompt. When that peak is
+        the size of the free VRAM the run gets slow first and dies later -- measured on an
+        RTX 2060, a 30k prompt took 1081 s at the default 8192 and 232 s at 4096, and at 8192
+        it sometimes killed the server outright in the GDN prefill.
+
+        Measure, do not search. Probing the *configured* size downwards would mean allocating
+        the very transient that kills the process, at startup, on every boot. Instead this
+        runs one small chunk, takes bytes-per-token from it (the buffers are linear in the
+        chunk), and solves for the largest chunk that fits the budget.
+
+        Only ever lowers: an explicit smaller ``--max-prefill-length`` is honored as-is, and
+        ``--prefill-chunk-budget 0`` turns the whole thing off.
+        """
+        self._prefill_bytes_per_token = 0.0
+        budget_share = float(
+            getattr(config, "prefill_chunk_budget", self._PREFILL_TRANSIENT_BUDGET)
+        )
+        if not 0 < budget_share <= 1:
+            return
+        self._prefill_budget_share = budget_share
+        configured = int(getattr(config, "max_extend_tokens", 0) or 0)
+        if configured <= self._PREFILL_CHUNK_FLOOR:
+            return
+        probe = min(self._PREFILL_PROBE_TOKENS, configured, self.max_seq_len)
+        if probe < 64:
+            return
+
+        try:
+            per_token, free_before = self._measure_prefill_transient(probe)
+        except Exception as exc:  # noqa: BLE001 -- a probe that fails must not stop the boot
+            logger.info_rank0(
+                f"--prefill-chunk-budget: probe failed ({type(exc).__name__}: {exc}); "
+                f"keeping --max-prefill-length {configured}"
+            )
+            return
+        if per_token <= 0:
+            return
+        # Kept for prefill_chunk_now(): the same measurement, re-applied against whatever is
+        # free when a prompt actually arrives.
+        self._prefill_bytes_per_token = per_token
+
+        budget = free_before * budget_share
+        fits = int(budget // per_token)
+        # round down to a multiple of 256 so the number in the log is a size people recognize
+        fits = max(self._PREFILL_CHUNK_FLOOR, (fits // 256) * 256)
+        chosen = min(configured, fits)
+        if chosen >= configured:
+            logger.info_rank0(
+                f"--prefill-chunk-budget: {per_token / 1024:.1f} KiB/token of prefill transient, "
+                f"{free_before / 2**30:.2f} GiB free at {budget_share:.0%} -> {configured} fits, keeping it"
+            )
+            return
+
+        object.__setattr__(config, "max_extend_tokens", chosen)
+        logger.info_rank0(
+            f"--prefill-chunk-budget: {per_token / 1024:.1f} KiB/token of prefill transient and "
+            f"{free_before / 2**30:.2f} GiB free at {budget_share:.0%} -> --max-prefill-length {configured} would need "
+            f"{configured * per_token / 2**30:.2f} GiB; using {chosen} instead"
+        )
+
+    def _measure_prefill_transient(self, length: int) -> tuple[float, int]:
+        """Run one prefill of ``length`` tokens; return (bytes of transient per token, free VRAM).
+
+        Uses the dummy request row the same way ``_warmup_prefill`` does, and restores it. The
+        peak is torch's allocator high-water mark over the forward, minus what was already
+        held, so it counts the buffers the chunk brings into being and nothing else.
+        """
+        dummy_row = self.page_table[self.dummy_req.table_idx]
+        dummy_slot = int(dummy_row[0].item())
+        torch.cuda.synchronize(self.device)
+        free_before = int(torch.cuda.mem_get_info(self.device)[0])
+        held = int(torch.cuda.memory_allocated(self.device))
+        torch.cuda.reset_peak_memory_stats(self.device)
+        try:
+            dummy_row[:length] = torch.arange(length, dtype=torch.int32, device=self.device)
+            warm_req = Req(
+                input_ids=torch.zeros(length, dtype=torch.int32, device="cpu"),
+                table_idx=self.dummy_req.table_idx,
+                cached_len=0,
+                output_len=1,
+                uid=-1,
+                sampling_params=None,  # type: ignore[arg-type]
+                cache_handle=None,  # type: ignore[arg-type]
+            )
+            batch = Batch(reqs=[warm_req], phase="prefill")
+            batch.padded_reqs = batch.reqs
+            batch.input_ids = torch.zeros(length, dtype=torch.int32, device=self.device)
+            batch.positions = torch.arange(length, dtype=torch.int32, device=self.device)
+            batch.out_loc = dummy_row[:length]
+            self.attn_backend.prepare_metadata(batch)
+            with self.ctx.forward_batch(batch):
+                self.model.forward()
+            torch.cuda.synchronize(self.device)
+            peak = int(torch.cuda.max_memory_allocated(self.device))
+        finally:
+            dummy_row.fill_(dummy_slot)
+            if self.moe_offload_cache is not None:
+                self.moe_offload_cache.reset()
+        transient = max(0, peak - held)
+        return transient / length, free_before
+
+    def prefill_chunk_now(self, ceiling: int) -> int:
+        """The chunk to use for a prompt starting *now*, given what is free *now*.
+
+        The startup sizer settles a chunk against the free VRAM at boot. On a machine that is
+        also somebody's desktop that number goes stale within minutes -- free VRAM here moved
+        by ~150 MB between runs depending on what was on screen -- and the direction that
+        hurts is the one where a chunk sized in a quiet moment is issued into a busy one.
+
+        Re-solving costs a driver query and an integer divide, and changes nothing that is
+        allocated: the chunk is a scheduling bound, not a buffer. The caller pays it once per
+        prefill batch, and a prefill batch runs for seconds.
+
+        Counts the allocator's cached-but-unused blocks as available, because they are: the
+        transient this is sizing will be served out of exactly those.
+        """
+        per_token = getattr(self, "_prefill_bytes_per_token", 0.0)
+        if per_token <= 0 or ceiling <= self._PREFILL_CHUNK_FLOOR:
+            return ceiling
+        free = int(torch.cuda.mem_get_info(self.device)[0])
+        reserved = int(torch.cuda.memory_reserved(self.device))
+        allocated = int(torch.cuda.memory_allocated(self.device))
+        usable = free + max(0, reserved - allocated)
+        share = getattr(self, "_prefill_budget_share", self._PREFILL_TRANSIENT_BUDGET)
+        fits = int((usable * share) // per_token)
+        fits = max(self._PREFILL_CHUNK_FLOOR, (fits // 256) * 256)
+        chosen = min(ceiling, fits)
+        # Log only on a real move. This runs before every prefill batch; a line per batch
+        # would bury the log, and a line per change is what someone debugging a slow prompt
+        # actually wants to see.
+        last = getattr(self, "_prefill_chunk_logged", None)
+        if last is None or abs(chosen - last) >= 256:
+            self._prefill_chunk_logged = chosen
+            if last is not None:
+                logger.info_rank0(
+                    f"prefill chunk {last} -> {chosen} ({usable / 2**30:.2f} GiB usable)"
+                )
+        return chosen
 
     @torch.inference_mode()
     def _warmup_prefill(self) -> None:

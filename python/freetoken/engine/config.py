@@ -34,6 +34,11 @@ class EngineConfig:
     moe_cache_rate: float | None = None
     moe_cache_auto: bool = False
     kv_reserve_tokens: int = 8192  # KV floor for --moe-cache-auto; small by design (MoE-priority)
+    # --prefill-chunk-budget: the share of free VRAM one prefill chunk's transient may take.
+    # The engine measures that transient per token at startup and sizes max_extend_tokens to
+    # fit, then re-solves before each prefill against the VRAM free at that moment. 0 turns
+    # the whole thing off and max_extend_tokens is used exactly as given.
+    prefill_chunk_budget: float = 0.55
     # --kv-cache-dtype: "auto" (16-bit), "q8_0" or "q4_0". Narrows the paged KV slab so
     # --moe-cache-auto can hand the difference to the expert cache (see kvcache/kv_quant.py).
     kv_cache_dtype: str | None = None
