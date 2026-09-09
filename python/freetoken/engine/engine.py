@@ -219,20 +219,28 @@ def _validate_attention_backend_choice(config, override, required: frozenset[Att
                 f"SWA models require, got {config.attention_backend!r}."
             )
 
-    # --kv-cache-dtype: only the triton backend dequantizes the code slabs. Any other
-    # backend would read the uint8 codes as 16-bit floats -- no exception, just wrong
-    # numbers -- and "auto" resolves to flashinfer on sm_80+, so this is the common case
-    # on every card newer than the one it was developed on, not an exotic one.
+    # --kv-cache-dtype: only these backends dequantize the code slabs. Any other backend
+    # would read the uint8 codes as 16-bit floats -- no exception, just wrong numbers --
+    # and "auto" resolves to flashinfer on sm_80+, so this is the common case on every card
+    # newer than the one it was developed on, not an exotic one.
+    #
+    # qsa_sparse belongs here and the list is not interchangeable with it: a Flash-Next
+    # checkpoint resolves to qsa_sparse and CANNOT run on triton (triton serves FULL/SWA,
+    # not QSA), so demanding triton here would make the flag unreachable on exactly the
+    # model family it suits best.
     from freetoken.kvcache.kv_quant import resolve as _resolve_kv_quant
 
+    _DEQUANTIZING_BACKENDS = ("triton", "qsa_sparse")
     if _resolve_kv_quant(getattr(config, "kv_cache_dtype", None)) is not None:
-        wrong = [p for p in backend_parts if p != "triton"]
+        wrong = [p for p in backend_parts if p not in _DEQUANTIZING_BACKENDS]
         if wrong:
             raise ValueError(
-                f"--kv-cache-dtype {config.kv_cache_dtype} is only read by the triton "
-                f"attention backend; got {config.attention_backend!r}. Pass "
-                f"--attention-backend triton, or drop --kv-cache-dtype."
+                f"--kv-cache-dtype {config.kv_cache_dtype} is only read by the "
+                f"{' and '.join(_DEQUANTIZING_BACKENDS)} attention backends; got "
+                f"{config.attention_backend!r}. Pass --attention-backend triton (or let a "
+                f"Flash-Next checkpoint resolve to qsa_sparse), or drop --kv-cache-dtype."
             )
+
 
     # An explicitly-selected backend may require a package that isn't installed. Auto
     # never resolves to one of these when its package is missing, so this only fires for
@@ -1736,6 +1744,11 @@ class Engine:
                 try:
                     d[f"k{lid}"] = kv.k_cache(lid)[loc].clone()
                     d[f"v{lid}"] = kv.v_cache(lid)[loc].clone()
+                    # Under --kv-cache-dtype the slabs above are codes; equal codes with
+                    # unequal scales are unequal values, so the scales belong in the digest.
+                    if kv.kv_quant is not None:
+                        d[f"ks{lid}"] = kv.k_scales(lid)[loc].clone()
+                        d[f"vs{lid}"] = kv.v_scales(lid)[loc].clone()
                 except Exception:  # noqa: BLE001
                     pass
                 cap = kv.ring_capacity
