@@ -296,8 +296,8 @@ def parse_args(
             "Quantize the checkpoint's bf16 dense (non-expert) weights at load: 'fp8' = per-row "
             "fp8-e4m3 W8A16 for attention, GDN, shared expert, lm_head and the embedding "
             "(roughly halves their VRAM and per-token read traffic). A projection the checkpoint "
-            "already quantized keeps its own format, and the router, hyper-connection, QSA indexer "
-            "and GDN b/a gates stay bf16. Measured on qwen4_exp (Qwen3.8-Flash-Next)."
+            "already quantized keeps its own format, and the router, hyper-connection, QSA indexer, "
+            "PLE and GDN b/a gates stay bf16. Measured on qwen4_exp (Qwen3.8-Flash-Next)."
         ),
     )
 

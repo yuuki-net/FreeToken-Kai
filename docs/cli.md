@@ -33,7 +33,7 @@ parsers all resolve automatically from the checkpoint and the GPU.
 |---|---|---|
 | `--model-path`, `--model` | required | Local dir, HF repo id, or an FTW dir (auto-detected) |
 | `--served-model-name` | basename of `--model` | Model id reported by `/v1/models` |
-| `--dense-quant` | none | `fp8` serves the checkpoint's bf16 dense (non-expert) weights as per-row fp8-e4m3, quantized at load and read W8A16: attention, GDN, shared expert, lm_head, embedding. Already-quantized projections keep their format; router, hyper-connection, QSA indexer and GDN b/a gates stay bf16. See [pipeline.md](pipeline.md) |
+| `--dense-quant` | none | `fp8` serves the checkpoint's bf16 dense (non-expert) weights as per-row fp8-e4m3, quantized at load and read W8A16: attention, GDN, shared expert, lm_head, embedding. Already-quantized projections keep their format; router, hyper-connection, QSA indexer, PLE and GDN b/a gates stay bf16. See [pipeline.md](pipeline.md) |
 
 ### Server & runtime
 

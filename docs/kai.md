@@ -45,7 +45,8 @@ The fork adds nine things upstream does not have:
    and GatedDeltaNet projections, the shared expert, the lm_head and the embedding table are
    quantized to per-row fp8-e4m3 at load and read W8A16, halving both their VRAM and the bytes
    each decode step reads. A projection the checkpoint already quantized keeps its own format,
-   and the router, the hyper-connection GEMMs, the QSA indexer and the GDN b/a gates stay bf16 --
+   and the router, the hyper-connection GEMMs, the QSA indexer, the PLE projections and the GDN
+   b/a gates stay bf16 --
    they decide where tokens go rather than carry the traffic. On Qwen3.8-Flash-Next it takes the
    resident dense weights from 4.9 GB per card to 2.9 GB, which is what leaves room for 128k of
    context beside the expert cache. See [pipeline.md](pipeline.md).

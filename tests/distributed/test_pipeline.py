@@ -376,9 +376,13 @@ def test_dense_quant_override_wires_fp8_layers(monkeypatch):
     assert is_fp8(layer0.mlp.shared_expert.gate_up_proj)
     assert is_fp8(model.lm_head)
     assert isinstance(model.model.embed_tokens, Fp8VocabParallelEmbedding)
-    # the routing and stream-mixing weights are the ones this never touches
+    # the routing, stream-mixing and n-gram lookup weights are the ones this never touches
     assert not is_fp8(layer3.self_attn.indexer.index_qk_proj)
     assert not is_fp8(layer0.attn_hyper_connection.input_mix_weight_up)
+    # the PLE projections read the n-gram table; quantizing them was a 2-tensor drift from
+    # what the flag has always done (97 -> 99 projections on rank 0 of the two-GPU machine)
+    ple = model.model.layers.op_list[1].ple
+    assert ple is not None and not is_fp8(ple.key_proj) and not is_fp8(ple.value_proj)
     keys = model.state_dict()
     assert keys["model.layers.0.linear_attn.in_proj_qkvz.weight"].dtype == torch.float8_e4m3fn
     assert "model.layers.0.linear_attn.in_proj_qkvz.weight_scale" in keys
