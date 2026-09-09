@@ -45,8 +45,8 @@ def test_out_of_range_raises(spec):
         parse(spec, L)
 
 
-def _cfg(backend, spec=None):
-    return SimpleNamespace(moe_strategy=backend, moe_cpu_layers=spec)
+def _cfg(backend, spec=None, bank_ram=None):
+    return SimpleNamespace(moe_strategy=backend, moe_cpu_layers=spec, moe_bank_ram=bank_ram, model_config=None)
 
 
 def test_resolve_backend_dispatch():
@@ -59,6 +59,21 @@ def test_resolve_backend_dispatch():
     assert resolve(_cfg("offload", None), L) == frozenset()
     # non-offload backend ignores the spec (validation lives in _adjust_config)
     assert resolve(_cfg("fused", "8"), L) == frozenset()
+
+
+def test_auto_defers_to_bank_ram(monkeypatch):
+    """The split exists to answer "more banks than we may pin"; --moe-bank-ram answers it first
+    and differently, so `auto` picks nothing there (an explicit spec still means what it says)."""
+    import freetoken.engine.engine as engine
+
+    # a pin budget the banks blow through: without --moe-bank-ram this is what makes auto fire
+    monkeypatch.setattr(engine, "_pin_budget_bytes", lambda reserved=0: 8 << 30)
+    monkeypatch.setattr(engine, "_bank_bytes", lambda config, method=None: 56 << 30)
+    monkeypatch.setattr(engine, "_cpu_moe_executor_viable", lambda model_config: True)
+
+    assert resolve(_cfg("hybrid", "auto"), L) != frozenset()
+    assert resolve(_cfg("hybrid", "auto", bank_ram="60G"), L) == frozenset()
+    assert len(resolve(_cfg("hybrid", "8", bank_ram="60G"), L)) == 8
 
 
 if __name__ == "__main__":

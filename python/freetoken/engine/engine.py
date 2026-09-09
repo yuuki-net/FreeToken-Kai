@@ -2388,6 +2388,14 @@ def _auto_cpu_layers(config: EngineConfig, num_moe_layers: int, *, reserved: int
     """Pick CPU (locked) MoE layers for ``--moe-cpu-layers auto``: none while the banks fit the pin budget.
 
     Locks just enough head+tail layers: per-layer decode miss rates are U-shaped, so the ends are the cheapest to move off the slot cache."""
+    if config.moe_bank_ram:
+        # --moe-bank-ram already answers the question this split exists to answer: the banks are
+        # a file mapping and only the resident prefix is locked, so the pin budget is not what
+        # decides how much of them fits. Splitting anyway takes the VRAM expert cache away from
+        # the layers it locks -- on gpt-oss-120b that was 9 of 36 layers and 12.5 vs 14.6 tok/s.
+        # An explicit layer list or count still means what it says.
+        logger.info_rank0("--moe-cpu-layers auto: ignored under --moe-bank-ram (the banks are mapped, not pinned)")
+        return frozenset()
     bank_bytes = _bank_bytes(config, method)
     if not bank_bytes:
         return frozenset()
