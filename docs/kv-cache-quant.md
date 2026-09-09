@@ -81,6 +81,66 @@ So, if you raise the context:
 - watch decode, not just capacity. See the table above: at ~30k this costs a third of the
   decode rate, reproducibly. It gets worse as the context grows, not better.
 
+## Why Flash-Next is the case this actually suits
+
+The measured cost above — a third of the decode rate at 30k of context — is not a property of
+the format. It is a property of *dense* attention: decode reads the whole KV every step, so
+the dequantization scales with the context it has to walk.
+
+Qwen3.8-Flash-Next does not read the whole KV. Its sparse attention scores compressed
+index keys, takes the top blocks, and reads back **2048 tokens' worth of K/V per query**
+(`indexer_budget`), whatever the context length is. So the dequantization per decode step is
+a constant, not a function of the context:
+
+| | dense (Ornith, 10 full-attention layers) | QSA (Flash-Next, 12 layers) |
+|---|---|---|
+| KV read per decode step at 30k | 300,000 token-layers | 24,576 |
+| at 262k | 2,620,000 | **24,576** |
+
+Which inverts the trade. On a dense model the flag buys VRAM and charges decode, and the
+charge grows exactly where you wanted the VRAM. On Flash-Next the charge stays flat while
+the saving grows with the context you configure.
+
+Only the paged K/V is quantized. The compressed index slab is 3% of the KV's bytes and stays
+16-bit — it decides *which* blocks are read, and an error there drops the relevant context
+outright instead of blurring a value. Prefill still touches everything and still pays.
+
+### Measured
+
+Two RTX 3060 12 GB (`--pp-size 2`), Qwen3.8-Flash-Next-NVFP4, 131k of reserved context,
+i5-12600KF, 110 GiB of RAM. What the allocation did:
+
+| | 16-bit | `q4_0` |
+|---|---|---|
+| KV per rank, 131k | 1.55 GiB | **0.47 GiB** |
+| expert slots (`--moe-cache-auto`) | 1180 | **1598** |
+| free VRAM after init | 1.61 GiB | 1.60 GiB |
+
+The saving went where it was supposed to: 1.08 GiB per rank turned into 418 more expert
+slots, and the free memory did not move.
+
+And what it cost — decode medians read off the server log, bucketed by the `#token` on each
+`Decode batch` line:
+
+| context | 16-bit | `q4_0` |
+|---|---|---|
+| ~8k | — | 18.47 (n=22) |
+| ~16k | 18.79 (n=550) | — |
+| ~31k | 18.88 (n=224) | 18.04 (n=23) |
+| ~65k | 19.39 (n=11544) | — |
+| ~98k | 19.18 (n=3886) | — |
+| ~125k | — | 18.21 (n=23) |
+
+**`q4_0` decode is flat across the context: 18.47 at 8k to 18.21 at 125k, −1.4% over a 15x
+range.** The dense model in the section above lost a third of its decode rate by 30k. The
+cost of the format itself, comparing the same ~31k bucket across the two runs, is about
+−4%; the `q4_0` samples are 23 decode-log lines per stage against thousands for the 16-bit
+baseline, so treat that as "a few percent" and not as a figure with three digits.
+
+The 16-bit baseline is itself worth noting: 58,000 decode samples from 16k to 98k, +2.1%.
+Sparse attention does not slow down with context, quantized or not. That is what makes the
+flag a straight VRAM saving here.
+
 ## Platform note
 
 Every number here was measured under **WSL2 on Windows**. Two things behave differently on
@@ -95,45 +155,63 @@ native Linux, both of which affect this feature:
 
 ## Where it applies
 
-Only to models whose KV lives in the plain paged pool (`MHAKVCache`), served by the Triton
-attention backend. Everything else is **refused at startup**, with a message naming the
+Only to models whose KV lives in the plain paged pool (`MHAKVCache`) or the Flash-Next pool
+(`QSAKVCache`), served by an attention backend that knows the layout — `triton` or
+`qsa_sparse`. Everything else is **refused at startup**, with a message naming the
 reason — a quantized slab read by code that does not know the layout returns plausible wrong
 numbers rather than an error, so none of these are left to chance.
 
 | Model | Attention | KV pool | `--kv-cache-dtype` |
 |---|---|---|---|
-| Qwen3.5-MoE family (Ornith-1.5-35B-A3B, Qwen3.6-35B-A3B) | full | `MHAKVCache` | **supported** (tested) |
+| Qwen3.5-MoE family (Ornith-1.5-35B-A3B, Qwen3.6-35B-A3B) | full | `MHAKVCache` | **supported** (measured) |
 | Qwen3 / Qwen2 dense, Llama, Mistral | full | `MHAKVCache` | supported (untested) |
+| **Qwen3.8-Flash-Next** | QSA (compressed-block sparse) | `QSAKVCache` | **supported** (measured; the case it suits best) |
 | gpt-oss-20b / gpt-oss-120b | full + sliding window | `HybridSWAKVCache` | refused |
-| Qwen3.8-Flash-Next | QSA (compressed-block sparse) | `QSAKVCache` | refused |
 | GLM-5.3-Flash | DSA | `KpoolDSAKVCache` | refused |
 | DeepSeek-V4-Flash | DSV4 | `DSV4PagedKVCache` | refused |
 | MiniMax-M3 | BSA | `BSAKVCache` | refused |
 | MLA checkpoints | latent KV | `MLAKVCache` | refused |
 
-The refused families all keep secondary tiers next to the paged slab — an SWA window pool,
-a sparse index slab plus its pending ring, a latent KV — which stay 16-bit and are read by
-their own kernels. Supporting them is per-family work, not a flag.
+The refused families keep secondary tiers next to the paged slab — an SWA window pool, a
+latent KV — which stay 16-bit and are read by their own kernels. Supporting them is
+per-family work, not a flag.
 
-**Backend**: only `--attention-backend triton` reads the code slabs. `auto` picks Triton on
-Turing but flashinfer on sm_80 and newer, so on an Ampere or later card you have to ask for
-Triton explicitly:
+QSA has such tiers too (the compressed index slab, the pending ring, the scratch rows) and
+they stay 16-bit here as well; what made it worth doing anyway is the next section.
 
-```bash
-ft serve --model ... --kv-cache-dtype q4_0 --attention-backend triton
-```
+**Backend**: two backends read the code slabs — `triton` for the plain paged pool, and
+`qsa_sparse` for Flash-Next. Which one you need is decided by the checkpoint, not by you:
 
-Without it the run stops at config time rather than serving wrong numbers.
+- **Flash-Next** resolves to `qsa_sparse` on its own and there is nothing to pass. It
+  *cannot* run on `triton`, which serves full and sliding-window attention but not QSA — so
+  the two are not interchangeable, and asking for Triton here is an error.
+- **Everything else** wants `--attention-backend triton` spelled out, because `auto` picks
+  Triton on Turing but flashinfer on sm_80 and newer:
+
+  ```bash
+  ft serve --model ... --kv-cache-dtype q4_0 --attention-backend triton
+  ```
+
+Either way a backend that cannot read the slabs stops the run at config time rather than
+serving wrong numbers.
 
 ## Accuracy
 
-`q8_0` is close to free: the error is under half a step of a 32-value block scale, and
-attention output tracks the unquantized answer to ~1e-4 relative.
+Measured through the real sparse-attention kernel, quantized K/V against 16-bit K/V, at
+Flash-Next's own shapes (head_dim 128, 2 KV heads, 16 query heads, page 64) on iid Gaussian
+K/V — a worst case, because it gives the per-32-value block scale no structure to exploit:
 
-`q4_0` costs something real. On synthetic worst-case input (iid Gaussian, no structure for
-the block scale to exploit) the attention output lands at cosine ≈ 0.99 against unquantized;
-on real prompts the answers stayed correct in Japanese prose, arithmetic-with-working and
-Python generation, but this has not been measured on a benchmark suite. Treat `q4_0` as a
+| | relative RMS error | cosine vs 16-bit | max abs difference |
+|---|---|---|---|
+| `q8_0` | 0.64% | 0.999979 | 0.0020 |
+| `q4_0` | 9.8% | 0.995204 | 0.0259 |
+
+`q8_0` is close to free: the error stays under half a step of the block scale.
+
+`q4_0` costs something real — an order of magnitude more error, as the extra four bits
+predict. On real prompts the answers stayed correct in Japanese prose,
+arithmetic-with-working and Python generation, but this has not been measured on a
+benchmark suite. Treat `q4_0` as a
 capacity trade you should sanity-check on your own workload, and prefer `q8_0` when the
 VRAM it buys is enough.
 

@@ -103,6 +103,29 @@ This is the part to read if your machine is not this machine.
   all on native Linux, so the CPU/GPU layer split — and therefore all of the above — can
   differ on identical hardware.
 
+## One thing that is not about the bus at all
+
+Everything above is about *where the expert weights come from*. There is a second reason a
+VRAM saving may or may not turn into speed, and it belongs to the model rather than the
+machine: **how much KV a decode step has to read.**
+
+A dense model reads all of it, every step. So quantizing the KV to free VRAM also puts a
+dequantization cost on every step, and that cost grows with the context — the measured third
+of the decode rate at 30k. Whatever the freed VRAM buys has to beat that.
+
+A model with sparse attention does not. Qwen3.8-Flash-Next scores compressed index keys and
+reads back a fixed 2048 tokens' worth of K/V per query, so the dequantization is a constant
+no matter how long the context is. There the saving grows with the context you configure
+while the cost does not move.
+
+Measured on two RTX 3060s serving Qwen3.8-Flash-Next: `q4_0` decode is 18.47 tok/s at 8k of
+context and 18.21 at 125k — flat over a 15x range — while the KV per rank drops from 1.55 to
+0.47 GiB. The dense model on this page lost a third of its decode rate by 30k.
+
+Which is worth knowing before you decide the flag is useless: on this machine, for this
+model, it was. The same flag on a sparse-attention model is a different trade, and that is
+the case it was kept for.
+
 ## How to tell, on your machine, in two log lines
 
 ```
