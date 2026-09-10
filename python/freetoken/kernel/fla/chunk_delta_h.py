@@ -21,9 +21,30 @@ from freetoken.kernel.fla.utils import (
 
 NUM_WARPS = [2, 4] if is_nvidia_hopper else [2, 4, 8, 16]
 CHUNK_SIZE = 64
-GDN_CHUNK_H_BV = int(os.getenv("SGLANG_GDN_CHUNK_H_BV", "32"))
-GDN_CHUNK_H_NUM_WARPS = int(os.getenv("SGLANG_GDN_CHUNK_H_NUM_WARPS", "4"))
-GDN_CHUNK_H_NUM_STAGES = int(os.getenv("SGLANG_GDN_CHUNK_H_NUM_STAGES", "2"))
+
+
+def _default_chunk_h_tile() -> tuple[int, int, int]:
+    """``(BV, num_warps, num_stages)`` the single autotune config below is built from.
+
+    Upstream's (32, 4 warps) is an Ampere+ choice. Measured on an RTX 2060 at Ornith's GDN
+    shapes (T=2048, Hg=16, H=32, K=V=128), one layer of the 30:
+
+        BV=32,  4 warps   20.8 ms   <- upstream
+        BV=32,  8 warps    5.3 ms
+        BV=16,  8 warps    4.0 ms   <- this
+
+    0.62 s -> 0.12 s over 30 layers of every prefill chunk. The env knobs keep their
+    upstream names and still win, so a card this was not measured on can be pinned by hand.
+    """
+    from freetoken.utils.arch import is_pre_ampere
+
+    return (16, 8, 2) if is_pre_ampere() else (32, 4, 2)
+
+
+_BV, _WARPS, _STAGES = _default_chunk_h_tile()
+GDN_CHUNK_H_BV = int(os.getenv("SGLANG_GDN_CHUNK_H_BV") or _BV)
+GDN_CHUNK_H_NUM_WARPS = int(os.getenv("SGLANG_GDN_CHUNK_H_NUM_WARPS") or _WARPS)
+GDN_CHUNK_H_NUM_STAGES = int(os.getenv("SGLANG_GDN_CHUNK_H_NUM_STAGES") or _STAGES)
 
 
 @triton.autotune(

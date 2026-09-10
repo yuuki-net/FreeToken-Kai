@@ -2,6 +2,8 @@
 # -*- coding: utf-8 -*-
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
 
+import os
+from functools import lru_cache
 from typing import Optional
 
 import torch
@@ -14,6 +16,36 @@ from freetoken.kernel.fla.utils import check_shared_mem, is_nvidia_hopper
 
 BKV_LIST = [64, 128] if check_shared_mem() else [32, 64]
 NUM_WARPS = [2, 4] if is_nvidia_hopper else [2, 4, 8]
+
+
+@lru_cache(maxsize=1)
+def chunk_o_config() -> tuple[int, int, int, int]:
+    """``(BK, BV, num_warps, num_stages)`` for ``chunk_fwd_kernel_o``.
+
+    Upstream's autotune above is commented out, so one hardcoded config serves every card.
+    That config -- (128, 64), 4 warps -- is an Ampere+ choice, and on a Turing card it is
+    the wrong one: with 64 KB of shared memory the (128, 64) tiles leave one block per SM
+    and four warps to hide it. Measured on an RTX 2060 at Ornith's GDN shapes (T=2048,
+    Hg=16, H=32, K=V=128, BT=64), one layer of the 30:
+
+        (128, 64) 4 warps   63.6 ms   0.07 TFLOPS   <- upstream
+        (128, 64) 8 warps   38.6 ms   0.11
+        ( 64, 32) 8 warps   11.2 ms   0.38
+        ( 64, 64) 8 warps   11.2 ms   0.39          <- this
+
+    Over 30 GDN layers that is 1.91 s -> 0.33 s of every prefill chunk. The tiling does not
+    change what the kernel computes, only how it is cut. ``FREETOKEN_GDN_CHUNK_O_*``
+    overrides each field for a card this was not measured on.
+    """
+    from freetoken.utils.arch import is_pre_ampere
+
+    bk, bv, warps, stages = (64, 64, 8, 2) if is_pre_ampere() else (128, 64, 4, 2)
+    return (
+        int(os.getenv("FREETOKEN_GDN_CHUNK_O_BK") or bk),
+        int(os.getenv("FREETOKEN_GDN_CHUNK_O_BV") or bv),
+        int(os.getenv("FREETOKEN_GDN_CHUNK_O_NUM_WARPS") or warps),
+        int(os.getenv("FREETOKEN_GDN_CHUNK_O_NUM_STAGES") or stages),
+    )
 
 
 # @triton.autotune(
@@ -145,6 +177,8 @@ def chunk_fwd_o(
 
     o = torch.zeros_like(v)
 
+    block_k, block_v, num_warps, num_stages = chunk_o_config()
+
     def grid(meta):
         return (triton.cdiv(V, meta["BV"]), NT, B * H)
 
@@ -164,11 +198,11 @@ def chunk_fwd_o(
         K=K,
         V=V,
         BT=BT,
-        BK=128,
-        BV=64,
+        BK=block_k,
+        BV=block_v,
         USE_G=g is not None,
         IS_VARLEN=cu_seqlens is not None,
-        num_warps=4,
-        num_stages=2,
+        num_warps=num_warps,
+        num_stages=num_stages,
     )
     return o
