@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import functools
+import os
 
 import torch
 import triton
@@ -765,6 +766,142 @@ def _extend_attention_kernel(
     )
 
 
+# ---------------------------------------------------------------------------------------
+# Prefill attention through cuBLAS, for cards the fused kernel does not fit
+# ---------------------------------------------------------------------------------------
+# The fused kernel stages q and four k/v tiles in shared memory, so its tile is bounded by
+# what the device has: at head_dim 256 a Turing card (64 KB) is cut to (32, 16) and runs the
+# prefill at 0.47 TFLOPS, while the same card does 19 TFLOPS of fp16 cuBLAS. This path spends
+# memory to get that back -- materialize the scores, softmax them, matmul again -- which is
+# what --dense-quant fp8 and the NVFP4 MoE already do on this hardware.
+#
+# Measured on an RTX 2060 (Ornith: 16 q heads, 2 kv heads, head_dim 256), one layer, 2048 new
+# tokens behind an 8192-token prefix: 658 ms fused -> 51 ms here, output bit-identical.
+_ATTN_SCRATCH_ENV = "FREETOKEN_ATTN_SCRATCH"
+_ATTN_SCRATCH_MB_ENV = "FREETOKEN_ATTN_SCRATCH_MB"
+# The score tile is the knob. Everything else this path allocates is fixed by the request.
+_ATTN_SCRATCH_MB = 48
+# Below this many rows the fused kernel is the better shape (a verify window, a chat turn
+# behind a cached prefix): the GEMMs are thin and the gather is paid for a handful of rows.
+_ATTN_SCRATCH_MIN_ROWS = 128
+# The gathered contiguous K/V is the one allocation not bounded by the score budget -- it is
+# the whole context. Past this multiple of the budget, leave it to the fused kernel, whose
+# footprint is its tile.
+_ATTN_SCRATCH_GATHER_LIMIT = 4
+
+
+def _attn_scratch_bytes() -> int:
+    return max(1, int(os.getenv(_ATTN_SCRATCH_MB_ENV) or _ATTN_SCRATCH_MB)) << 20
+
+
+@functools.lru_cache(maxsize=1)
+def _attn_scratch_default() -> bool:
+    """On by default where the fused tile had to be cut: pre-Ampere (64 KB of shared memory).
+
+    Ampere and later fit (128, 64) and run the fused kernel at rates this path cannot reach,
+    so they keep it. ``FREETOKEN_ATTN_SCRATCH=1`` forces this path on for a card that was not
+    measured, ``=0`` forces it off.
+    """
+    from freetoken.utils.arch import is_pre_ampere
+
+    return is_pre_ampere()
+
+
+def _scratch_attention_applies(
+    q: torch.Tensor,
+    k_extend: torch.Tensor | None,
+    v_extend: torch.Tensor | None,
+    sliding_window: int | None,
+    sinks: torch.Tensor | None,
+    kv_quant,
+    num_rows: int,
+    kv_len: int,
+    head_dim: int,
+    num_kv_heads: int,
+) -> bool:
+    """Whether the cuBLAS path can serve this call.
+
+    Everything it cannot express falls through to the fused kernel rather than growing a
+    second implementation of it: a sliding window, attention sinks, a quantized cache
+    (``--kv-cache-dtype``, whose slabs are decoded inside the kernel), and the non-split call
+    where this forward own K/V are already in the cache.
+    """
+    forced = os.getenv(_ATTN_SCRATCH_ENV)
+    if forced is not None:
+        if forced.strip() not in ("1", "true", "yes", "on"):
+            return False
+    elif not _attn_scratch_default():
+        return False
+    if k_extend is None or v_extend is None or kv_quant is not None:
+        return False
+    if sliding_window or sinks is not None:
+        return False
+    if num_rows < _ATTN_SCRATCH_MIN_ROWS:
+        return False
+    gather = 2 * num_kv_heads * kv_len * head_dim * q.element_size()
+    return gather <= _ATTN_SCRATCH_GATHER_LIMIT * _attn_scratch_bytes()
+
+
+def _extend_attention_scratch(
+    q: torch.Tensor,
+    k_extend: torch.Tensor,
+    v_extend: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    o: torch.Tensor,
+    qo_indptr: torch.Tensor,
+    kv_indptr: torch.Tensor,
+    kv_indices: torch.Tensor,
+    prefix_lens: torch.Tensor,
+    sm_scale: float,
+) -> torch.Tensor:
+    """Causal extend attention as three cuBLAS calls per tile, over a materialized score tile.
+
+    Per sequence and per KV head: gather the prefix rows out of the paged cache, append this
+    forward K/V so the keys are one contiguous matrix, then walk the query rows in tiles whose
+    score block fits ``FREETOKEN_ATTN_SCRATCH_MB``. The whole key range is scored at once, so
+    the softmax is the plain one -- no running maximum, nothing to rescale.
+
+    The mask is only ever needed on the last ``rows`` columns: every prefix key precedes every
+    query row in this forward, and within the forward row i takes keys 0..i.
+    """
+    num_q_heads = q.shape[1]
+    num_kv_heads = k_cache.shape[1]
+    group = num_q_heads // num_kv_heads
+    budget = _attn_scratch_bytes()
+    # one .tolist() per call, not one .item() per index: these are tiny host-side loop bounds
+    starts = qo_indptr.tolist()
+    kv_starts = kv_indptr.tolist()
+    prefixes = prefix_lens.tolist()
+
+    for seq, prefix in enumerate(prefixes):
+        q0, q1 = starts[seq], starts[seq + 1]
+        rows = q1 - q0
+        if rows <= 0:
+            continue
+        kv_len = prefix + rows
+        # bytes one query row costs in the score block: the fp16 scores, the fp32 softmax
+        # torch materializes, and the cast back
+        per_row = group * kv_len * (2 * q.element_size() + 4)
+        block = max(16, min(rows, int(budget // max(1, per_row))))
+        cols = torch.arange(rows, device=q.device)
+        slots = kv_indices[kv_starts[seq] : kv_starts[seq] + prefix].long()
+        for head in range(num_kv_heads):
+            keys = torch.cat([k_cache[slots, head], k_extend[q0:q1, head]]).transpose(0, 1)
+            values = torch.cat([v_cache[slots, head], v_extend[q0:q1, head]])
+            lo, hi = head * group, (head + 1) * group
+            for start in range(0, rows, block):
+                end = min(start + block, rows)
+                # [group, tile, head_dim] @ [head_dim, kv_len] -> [group, tile, kv_len]
+                scores = torch.matmul(q[q0 + start : q0 + end, lo:hi].permute(1, 0, 2), keys)
+                scores.mul_(sm_scale)
+                future = cols[None, :] > cols[start:end, None]
+                scores[:, :, prefix:].masked_fill_(future, -float("inf"))
+                probs = torch.softmax(scores, dim=-1, dtype=torch.float32).to(q.dtype)
+                o[q0 + start : q0 + end, lo:hi] = torch.matmul(probs, values).permute(1, 0, 2)
+    return o
+
+
 @triton.jit
 def _extend_attention_split_kernel(
     q_ptr,
@@ -1023,6 +1160,22 @@ def extend_paged_attention(
 
     o = out if out is not None else torch.empty_like(q)
     sinks_arg = sinks if sinks is not None else q
+    if _scratch_attention_applies(
+        q,
+        k_extend,
+        v_extend,
+        sliding_window,
+        sinks,
+        kv_quant,
+        num_rows=num_q_tokens // max(1, qo_indptr.numel() - 1),
+        kv_len=int(prefix_lens.max()) + num_q_tokens,
+        head_dim=head_dim,
+        num_kv_heads=num_kv_heads,
+    ):
+        return _extend_attention_scratch(
+            q, k_extend, v_extend, k_cache, v_cache, o,
+            qo_indptr, kv_indptr, kv_indices, prefix_lens, sm_scale,
+        )
     block_d = triton.next_power_of_2(head_dim)
     block_dv = triton.next_power_of_2(head_dim)
     # Tile size is shared-memory bound: keep the fast (large) tiles on GPUs whose opt-in
