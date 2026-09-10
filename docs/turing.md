@@ -113,6 +113,53 @@ to it; router weights and the sum over a token's routes are applied in fp32. One
 expert streaming (the CPU-side layers' banks are pageable under WSL and are copied synchronously each
 chunk); the compute part is ~1.3 ms per token.
 
+## 7. Prefill attention: scratch + cuBLAS below Ampere
+
+`python/freetoken/kernel/triton/attention.py`, `_extend_attention_scratch()` /
+`_scratch_attention_applies()`.
+
+**Symptom.** Change 3 fits the extend kernel into 64 KB, and the tile it has to shrink to is what it
+then runs at: 0.47 TFLOPS at head_dim 256. A sweep of every tile and warp count that fits confirmed
+`(32, 16)` with 8 warps is the best of them -- 511 ms is the nearest rival at 2048 new tokens behind
+an 8192-token prefix, against 521 ms for the shipped choice. The kernel is not badly configured; the
+shape it is allowed to have is too small for a tensor core.
+
+**Fix.** Below Ampere, take the same trade as changes 4 and 6: gather the prefix out of the paged
+cache so the keys are one contiguous matrix, score a tile of query rows against all of them with
+cuBLAS, softmax in fp32, and matmul again. The whole key range is scored at once, so the softmax is
+the plain one -- no running maximum, nothing to rescale. The query tile is sized from
+`FREETOKEN_ATTN_SCRATCH_MB` (48); `FREETOKEN_ATTN_SCRATCH=0/1` overrides the arch choice.
+
+Anything the path cannot express falls back to the fused kernel: a sliding window, attention sinks, a
+quantized cache (`--kv-cache-dtype`, whose slabs are decoded inside the kernel), the non-split call,
+an extend shorter than 128 rows (the gather would be paid for a handful of rows), and a context whose
+gathered K/V would exceed four times the score budget.
+
+**Result.** 658 ms -> 51 ms per layer at those shapes, 6.51 TFLOPS. Attention is the prefill term
+that grows with context, so this is what flattens the curve: seconds per 1k tokens of prompt on the
+2060 went 2.45 / 2.9 / 4.9 at 4k / 7.5k / 24k to 2.63 / 2.69 / 2.93. torch SDPA with an explicit mask
+was measured too and sits between the two (179 ms).
+
+## 8. GDN prefill kernels: eight warps, not four
+
+`python/freetoken/kernel/fla/chunk_o.py`, `chunk_o_config()`;
+`python/freetoken/kernel/fla/chunk_delta_h.py`, `_default_chunk_h_tile()`.
+
+**Symptom.** With changes 4-7 in, the two GDN chunk kernels are the largest item left in a prefill
+chunk: 63.6 ms and 20.8 ms per layer, over 30 layers.
+
+**Cause.** Both ship a single hardcoded configuration -- upstream's autotune is commented out in one
+and reduced to one config in the other (it writes the final state back in place, so a multi-config
+benchmark phase corrupts the state pool). Both configurations are Ampere+ choices. With 64 KB of
+shared memory the `(128, 64)` tiles leave one block per SM, and four warps cannot hide it.
+
+**Fix.** Below Ampere use `(64, 64)` with 8 warps for the output kernel and `BV=16` with 8 warps for
+the state kernel. `FREETOKEN_GDN_CHUNK_O_*` and upstream's `SGLANG_GDN_CHUNK_H_*` override both.
+
+**Result.** 63.6 -> 11.2 ms and 20.8 -> 4.0 ms per layer; 2.53 s -> 0.45 s per prefill chunk over the
+30 GDN layers. Bit-identical output and recurrent state -- the tiling is how the work is cut, not
+what it computes.
+
 ## What was checked and found fine
 
 `tools/turing_kernel_probe.py` runs every GPU kernel of the Qwen3.5-MoE decode path in its own
@@ -146,12 +193,18 @@ Two things that look like failures but are not:
 - Decode: 25-37 tok/s for Ornith-1.5-35B-A3B in `hybrid` mode with `--dtype float16` (3B active
   parameters, NVFP4 experts; the CPU path reads about 0.5 GB per token at 50 GB/s). 13-14 tok/s
   for gpt-oss-20b.
-- Prefill (fp16, after changes 4-6): 2785 tokens in ~8.5 s, of which ~5 s is the per-chunk expert
-  streaming and ~1.3 ms/token is compute. Use `--dtype float16`: Turing has fp16 tensor cores but
-  no bf16 ones (cuBLAS 19 vs 3 TFLOPS). Ornith's output is unaffected by fp16.
+- Prefill (fp16, after changes 4-8): about 2.5 s per 1k tokens of prompt, near flat from 4k to 24k
+  (400 tok/s at 19k). Use `--dtype float16`: Turing has fp16 tensor cores but no bf16 ones (cuBLAS 19
+  vs 3 TFLOPS). Ornith's output is unaffected by fp16.
+- Where a 2048-token chunk goes, measured with the profiler on a 6.4 s chunk before changes 7 and 8:
+  GDN 2.20 s, expert streaming 1.51 s (16.93 GiB at 9.6-11.4 GB/s, which is the PCIe ceiling on this
+  card -- see `--moe-strategy hybrid`), MoE GEMM and dequant 0.93 s, attention 0.51 s at 2k of context
+  and rising with it, dense projections 0.23 s. Changes 7 and 8 take the GDN and attention terms out;
+  what is left is dominated by the streaming, which is why the chunk size matters (`prefill-chunk.md`).
 - Per-kernel numbers at 2785 tokens (`tools/turing_prefill_bench.py`): fp8 GEMM 16.4 TFLOPS (scratch),
-  MoE prefill 2.9 TFLOPS (scratch), Triton extend attention 0.68 TFLOPS (0.9 s / prefill), GDN chunk
-  0.12-0.19 TFLOPS (2-3 s / prefill), NVFP4 dense 16 TFLOPS.
+  MoE prefill 2.9 TFLOPS (scratch), NVFP4 dense 16 TFLOPS. Extend attention 0.47 TFLOPS fused and
+  6.51 with the scratch path; GDN chunk 0.07 TFLOPS at upstream's tile and 0.39 at the one change 8
+  selects.
 
 ## WSL2 notes
 
