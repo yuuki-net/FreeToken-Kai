@@ -117,6 +117,8 @@ class PrefillAdder:
         table_idx: int,
         cached_len: int,
         linear_slot_idx: int | None = None,
+        chunk_upto: int | None = None,
+        chunk_dups: list | None = None,
         ping_pong: tuple | None = None,
         next_track_idx: int = 0,
         restore_src: int | None = None,
@@ -194,6 +196,8 @@ class PrefillAdder:
         # Hybrid GDN per-request state slots (None for non-hybrid). On a fresh admit these are
         # freshly allocated; on a chunked continuation they are inherited from the prior chunk.
         req.linear_slot_idx = linear_slot_idx
+        req.chunk_upto = chunk_upto
+        req.chunk_dups = [] if chunk_dups is None else chunk_dups
         req.mamba_ping_pong = ping_pong
         req.mamba_next_track_idx = next_track_idx
         req.mamba_restore_src = restore_src
@@ -211,6 +215,8 @@ class PrefillAdder:
                 table_idx=chunked_req.table_idx,
                 cached_len=chunked_req.cached_len,
                 linear_slot_idx=chunked_req.linear_slot_idx,
+                chunk_upto=chunked_req.chunk_upto,
+                chunk_dups=chunked_req.chunk_dups,
                 ping_pong=chunked_req.mamba_ping_pong,
                 next_track_idx=chunked_req.mamba_next_track_idx,
                 restore_src=None,  # continuation chunk already has live state
@@ -296,10 +302,15 @@ class PrefillManager:
             if pending_req.mm_embeds is not None and reqs:
                 break
             if req := adder.try_add_one(pending_req):
+                predecessor = pending_req.chunked_req
                 pending_req.chunked_req = None
                 if isinstance(req, ChunkedReq):
                     pending_req.chunked_req = req
                     chunked_list.append(pending_req)
+                if predecessor is not None:
+                    # The chunk this one continues is still in flight (overlap): let its commit
+                    # find us, so a handle swap reaches the object that will unlock it.
+                    predecessor.successor = req
                 reqs.append(req)
                 if not is_continuation:
                     # Record the COMPLETE prompt length and the prefix-cache hit on the

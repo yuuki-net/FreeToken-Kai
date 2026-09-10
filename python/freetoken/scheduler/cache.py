@@ -370,6 +370,9 @@ class CacheManager:
         from freetoken.kvcache.hybrid_radix_cache import HybridCacheHandle
 
         pool = self.linear_state_pool
+        # Settle the chunk commits' duplicate spans before anything reads the row or frees out
+        # of it: from here on the row is canonical up to the handle.
+        self._settle_chunk_dups(req)
         old_handle = req.cache_handle
         page_indices = self.page_table[req.table_idx, : req.cached_len]
 
@@ -456,6 +459,93 @@ class CacheManager:
             pp[frozen_idx] = pool.alloc(1)[0]
             req.mamba_ping_pong = tuple(pp)
         req.mamba_last_track_seqlen = None
+
+    def commit_chunk_checkpoint(self, req: Req) -> None:
+        """Hand the GDN checkpoint of a NON-final prefill chunk to the tree (hybrid only).
+
+        The forward wrote the state at ``mamba_last_track_seqlen`` (the deepest x64 boundary
+        inside this chunk) into the frozen ping-pong slot. Donating it there gives a later
+        request a point to resume the recurrence from; without it a prompt leaves exactly one
+        reuse point, within 64 tokens of its own end (guides/25).
+
+        What this does NOT do is move page ownership around: the next chunk is already in
+        flight over the same page-table row, so the dedup free and the re-point that
+        ``_cache_req_hybrid`` performs would pull memory out from under it. Two cases:
+
+        * no dedup -- the node the insert created names THIS request's pages, so the tree owns
+          them from now on: lock the node, advance the handle, and hand the handle to the
+          in-flight successor (which was built from the one being replaced). The request's own
+          free floor is its handle, so the finish/abort path already skips the donated span.
+        * dedup -- somebody else already had this prefix. Leave every page alone and let the
+          checkpoint ride on their node; the final chunk's commit settles ownership as before.
+        """
+        if not self.is_hybrid or req.mm_embeds is not None:
+            return
+        pool = self.linear_state_pool
+        L = req.mamba_last_track_seqlen
+        req.mamba_last_track_seqlen = None
+        if L is None or req.mamba_ping_pong is None or req.table_idx == -1:
+            return
+        old_handle = req.cache_handle
+        base = old_handle.cached_len if req.chunk_upto is None else req.chunk_upto
+        if not (base < L <= req.cached_len):
+            return                                  # already accounted for, or past this chunk
+        if align_down(L, self.page_size) != L:
+            # page_size>1: insert would align the key down and attach a state that encodes L
+            # tokens to a SHORTER node. Skip; the next aligned boundary commits instead.
+            return
+        from freetoken.kvcache.hybrid_radix_cache import HybridCacheHandle
+
+        frozen_idx = 1 - req.mamba_next_track_idx   # the slot the forward just wrote
+        frozen = req.mamba_ping_pong[frozen_idx]
+        page_indices = self.page_table[req.table_idx, :L]
+        prefix_len, mamba_exist = self.prefix_cache.insert(req.input_ids[:L], page_indices, frozen)
+        # [prefix_len, L) came from THIS request's pages -- the tree owns them from now on.
+        # [base, prefix_len) is what the tree already held: this request's pages there are
+        # duplicates, and freeing them HERE would pull the row out from under the in-flight
+        # next chunk. Remember the span; _settle_chunk_dups gives it back where the generic
+        # commit already re-points a deduped span.
+        if prefix_len > base:
+            req.chunk_dups.append((base, prefix_len))
+        req.chunk_upto = L
+        # The node at L owns a snapshot either way (insert attached one, or reported the one
+        # already there), so the match truncates to exactly L. Lock BEFORE the replacement
+        # alloc below: that can evict_mamba, which would otherwise reclaim this still-unlocked
+        # node and free its KV pages under the in-flight chunk.
+        m = self.prefix_cache.match_prefix(req.input_ids[:L])
+        if m.cached_len == L:
+            handle = HybridCacheHandle(m.cached_len, m.node, m.kv_indices)
+            self.lock(handle)
+            self.unlock(old_handle)
+            req.cache_handle = handle
+            successor = req.successor
+            while successor is not None:             # overlap depth is 1 today; walk anyway
+                successor.cache_handle = handle
+                successor = successor.successor
+        if not mamba_exist:                          # the tree took `frozen`; replace it
+            self.ensure_mamba_slots(1)
+            pp = list(req.mamba_ping_pong)
+            pp[frozen_idx] = pool.alloc(1)[0]
+            req.mamba_ping_pong = tuple(pp)
+
+    def _settle_chunk_dups(self, req: Req) -> None:
+        """Give back the duplicate pages the chunk commits left behind (see above).
+
+        Runs where the generic commit already re-points a deduped span -- the final prefill
+        chunk and the finish, both of which own the row. Reads this request's ids out of the
+        row first, points the row at the tree's canonical pages, then frees ours."""
+        dups, req.chunk_dups = req.chunk_dups, []
+        req.chunk_upto = None
+        if not dups or req.table_idx == -1:
+            return
+        canonical = req.cache_handle.get_matched_indices()
+        row = self.page_table[req.table_idx]
+        for start, end in dups:
+            if end > len(canonical) or end <= start:
+                continue                             # the handle never advanced over it
+            ours = row[start:end].clone()
+            row[start:end].copy_(canonical[start:end])
+            self._free(ours)
 
     def _cache_req_swa(self, req: Req, *, finished: bool) -> None:
         """SWA cache_req: commit the request's full KV prefix into the SWARadixCache (node.value =

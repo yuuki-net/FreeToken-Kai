@@ -319,14 +319,18 @@ class Scheduler(SchedulerIOMixin):
         with self.cache_manager.lazy_free_region():
             for i, req in enumerate(batch.reqs):
                 if isinstance(req, ChunkedReq):
-                    # Don't cache intermediate chunks; the full prompt is cached once when the
-                    # final chunk is processed. Caching here snapshots a handle the next chunk
-                    # already copied (overlap), so cache_req double-frees the prior chunk.
+                    # The prompt's PAGES are still cached once, at the final chunk: a full
+                    # cache_req here would free and re-point spans the next chunk (overlap)
+                    # already reads. What this does commit is the GDN checkpoint the forward
+                    # just wrote, so a later request can resume the recurrence from inside a
+                    # long prompt instead of only from its last 64 tokens (guides/25).
                     if req.aborted:
                         # Aborted mid-chunked-prefill while this chunk was in flight: the abort
                         # popped the pending continuation (no next chunk launches), and this
                         # drain point frees the chunk's pages/slots exactly once.
                         self._free_req_resources(req)
+                    else:
+                        self.cache_manager.commit_chunk_checkpoint(req)
                     continue
                 if req.aborted:
                     # Aborted while this final-chunk prefill / decode step was in flight: free

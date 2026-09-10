@@ -63,6 +63,17 @@ class Req:
     mamba_next_track_idx: int = 0                   # which ping-pong slot is the next snapshot dst (0/1)
     mamba_last_track_seqlen: int | None = None      # chunk-aligned committed len of the last snapshot
     mamba_restore_src: int | None = None            # on a prefix hit: tree snapshot slot to COW into the live slot (first chunk only)
+    # Chunked prefill: the NEXT chunk of the same prompt, once the scheduler has created it.
+    # A chunk commit hands its new cache handle down this chain -- under overlap the successor
+    # was built from the handle this commit is about to replace, and would otherwise unlock a
+    # handle nobody holds (scheduler/cache.commit_chunk_checkpoint).
+    successor: "Req | None" = None
+    # Chunked prefill checkpoints: how far the chunk commits have accounted for, and the spans
+    # of THIS request's pages that duplicate what the tree already held there. A commit hands
+    # over its own pages but cannot free the duplicates where it runs (the next chunk is in
+    # flight over the same page-table row), so they are settled at the final commit.
+    chunk_upto: int | None = None
+    chunk_dups: List[Tuple[int, int]] = field(default_factory=list)
     swa_evicted_seqlen: int = 0                      # SWA radix: positions < this had their swa KV freed (slid out of window) during decode
     decode_batch_idx: int = 0                        # SWA radix: # of decode forwards done; the proactive free_swa skips the first (overlap guard)
     # Set once, at the first sampled tool-call opener token (scheduler detection): the state
