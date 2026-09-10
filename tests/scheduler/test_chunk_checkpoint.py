@@ -150,3 +150,33 @@ def test_settle_is_a_no_op_for_a_freed_request():
     req.chunk_dups = [(0, 7)]
     cm._settle_chunk_dups(req)
     assert cm.freed == []
+
+
+def test_the_successor_is_told_about_the_replacement_slot():
+    """The commit hands the tree one of the request's two GDN state slots and takes a fresh one.
+    The successor chunk was built from the tuple being replaced -- the scheduler admits the next
+    chunk before it drains this one -- so it has to be told, or two things go wrong at once: the
+    final commit frees the slot the tree now owns (the next request to take it overwrites a live
+    snapshot), and the replacement is orphaned, one slot per chunk, until admission stalls.
+
+    Found by a soak: nine of nine slots outstanding, none held by the tree or by any request,
+    every one of them allocated at this line."""
+    cm = _manager()
+    allocated = [909]
+    cm.linear_state_pool = SimpleNamespace(num_free_slots=1, alloc=lambda n: allocated[:n])
+    req = _req()
+    donated = req.mamba_ping_pong[1 - req.mamba_next_track_idx]
+    succ2 = SimpleNamespace(cache_handle=None, mamba_ping_pong=req.mamba_ping_pong,
+                            successor=None)
+    succ1 = SimpleNamespace(cache_handle=None, mamba_ping_pong=req.mamba_ping_pong,
+                            successor=succ2)
+    req.successor = succ1
+
+    CacheManager.commit_chunk_checkpoint(cm, req)
+
+    assert req.mamba_ping_pong == succ1.mamba_ping_pong == succ2.mamba_ping_pong
+    assert 909 in req.mamba_ping_pong, "the replacement has to be in the tuple"
+    for holder in (req, succ1, succ2):
+        assert donated not in holder.mamba_ping_pong, (
+            "the donated slot belongs to the tree now; a holder that still names it will free it"
+        )

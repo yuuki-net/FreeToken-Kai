@@ -527,6 +527,18 @@ class CacheManager:
             pp = list(req.mamba_ping_pong)
             pp[frozen_idx] = pool.alloc(1)[0]
             req.mamba_ping_pong = tuple(pp)
+            # ... and tell the in-flight successors, exactly as the handle above does. They were
+            # built from the tuple this just replaced (the scheduler admits the next chunk before
+            # draining this one), so they still name the slot the tree now owns. Left stale, the
+            # final commit frees that slot back into the pool while the tree still points at it --
+            # the next request to take it writes its own GDN state into somebody's snapshot -- and
+            # the replacement allocated here is orphaned, one slot per chunk, until the pool is
+            # empty and admission stalls. The successor writes the OTHER ping-pong index next, so
+            # swapping this one under it changes nothing it is about to touch.
+            successor = req.successor
+            while successor is not None:
+                successor.mamba_ping_pong = req.mamba_ping_pong
+                successor = successor.successor
 
     def _settle_chunk_dups(self, req: Req) -> None:
         """Give back the duplicate pages the chunk commits left behind (see above).
