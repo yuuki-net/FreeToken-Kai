@@ -1902,9 +1902,20 @@ class Engine:
     _PREFILL_PROBE_TOKENS = 1024
     _PREFILL_CHUNK_FLOOR = 512
 
+    def _fit_prefill_chunk(self, per_token: float, usable: int, ceiling: int, share: float) -> int:
+        """The largest chunk whose transient fits ``share`` of ``usable``, at most ``ceiling``.
+
+        Rounded down to a multiple of 256 so the number in the log is a size people recognize,
+        and floored so a momentarily starved card still makes progress instead of chunking a
+        prompt into single tokens.
+        """
+        fits = int((usable * share) // per_token)
+        fits = max(self._PREFILL_CHUNK_FLOOR, (fits // 256) * 256)
+        return min(ceiling, fits)
+
     @torch.inference_mode()
     def _autosize_prefill_chunk(self, config) -> None:
-        """Lower ``--max-prefill-length`` until one chunk's transient fits the free VRAM.
+        """Measure the prefill transient per token, so a chunk can be solved from it.
 
         The chunk is the unit of transient allocation: the linear-attention kernels allocate
         buffers proportional to it on every chunk and free them again, so the peak the engine
@@ -1918,7 +1929,15 @@ class Engine:
         runs one small chunk, takes bytes-per-token from it (the buffers are linear in the
         chunk), and solves for the largest chunk that fits the budget.
 
-        Only ever lowers: an explicit smaller ``--max-prefill-length`` is honored as-is, and
+        What is done with the measurement differs by topology. On one GPU nothing is written
+        back: ``--max-prefill-length`` stays the ceiling for the run and ``prefill_chunk_now``
+        narrows each prefill against the VRAM free at that moment, so a boot that happened to
+        read a busy card does not cap the rest of the run. Under ``--pp-size`` there is no
+        per-prefill re-solve to fall back on (the chunk sizes a cross-rank message and the
+        ranks reach the re-solve on their own schedules), so there the boot value is written
+        into the config and stands.
+
+        Never raises: an explicit smaller ``--max-prefill-length`` is honored as-is, and
         ``--prefill-chunk-budget 0`` turns the whole thing off.
         """
         self._prefill_bytes_per_token = 0.0
@@ -1962,22 +1981,34 @@ class Engine:
         # free when a prompt actually arrives.
         self._prefill_bytes_per_token = per_token
 
-        budget = free_before * budget_share
-        fits = int(budget // per_token)
-        # round down to a multiple of 256 so the number in the log is a size people recognize
-        fits = max(self._PREFILL_CHUNK_FLOOR, (fits // 256) * 256)
-        chosen = min(configured, fits)
-        if chosen >= configured:
-            logger.info_rank0(
-                f"--prefill-chunk-budget: {per_token / 1024:.1f} KiB/token of prefill transient, "
-                f"{free_before / 2**30:.2f} GiB free at {budget_share:.0%} -> {configured} fits, keeping it"
-            )
+        chosen = self._fit_prefill_chunk(per_token, free_before, configured, budget_share)
+        head = (
+            f"--prefill-chunk-budget: {per_token / 1024:.1f} KiB/token of prefill transient and "
+            f"{free_before / 2**30:.2f} GiB free at {budget_share:.0%}"
+        )
+        if not getattr(config, "is_pp", False):
+            # One GPU: the configured value stays the ceiling, and every prefill is solved
+            # against the free VRAM it actually starts with (prefill_chunk_now). Writing the
+            # boot answer into the config would make a single busy moment at startup -- a
+            # desktop drawing, another model still shutting down -- the cap for the whole run,
+            # with no way back up short of a restart.
+            if chosen >= configured:
+                logger.info_rank0(f"{head} -> {configured} fits; re-solved before every prefill")
+            else:
+                logger.info_rank0(
+                    f"{head} -> --max-prefill-length {configured} would need "
+                    f"{configured * per_token / 2**30:.2f} GiB; a prefill starting now would use "
+                    f"{chosen}. {configured} stays the ceiling and each prefill is solved against "
+                    f"the VRAM free then"
+                )
             return
 
+        if chosen >= configured:
+            logger.info_rank0(f"{head} -> {configured} fits, keeping it")
+            return
         object.__setattr__(config, "max_extend_tokens", chosen)
         logger.info_rank0(
-            f"--prefill-chunk-budget: {per_token / 1024:.1f} KiB/token of prefill transient and "
-            f"{free_before / 2**30:.2f} GiB free at {budget_share:.0%} -> --max-prefill-length {configured} would need "
+            f"{head} -> --max-prefill-length {configured} would need "
             f"{configured * per_token / 2**30:.2f} GiB; using {chosen} instead"
         )
 
@@ -2051,19 +2082,18 @@ class Engine:
         allocated = int(torch.cuda.memory_allocated(self.device))
         usable = free + max(0, reserved - allocated)
         share = getattr(self, "_prefill_budget_share", self._PREFILL_TRANSIENT_BUDGET)
-        fits = int((usable * share) // per_token)
-        fits = max(self._PREFILL_CHUNK_FLOOR, (fits // 256) * 256)
-        chosen = min(ceiling, fits)
-        # Log only on a real move. This runs before every prefill batch; a line per batch
-        # would bury the log, and a line per change is what someone debugging a slow prompt
-        # actually wants to see.
+        chosen = self._fit_prefill_chunk(per_token, usable, ceiling, share)
+        # Log the first answer, then only real moves. This runs before every prefill batch; a
+        # line per batch would bury the log, while the first line is the one that says what
+        # this run is actually chunking at -- the boot line only says what it would have been.
         last = getattr(self, "_prefill_chunk_logged", None)
         if last is None or abs(chosen - last) >= 256:
             self._prefill_chunk_logged = chosen
-            if last is not None:
-                logger.info_rank0(
-                    f"prefill chunk {last} -> {chosen} ({usable / 2**30:.2f} GiB usable)"
-                )
+            logger.info_rank0(
+                f"prefill chunk {chosen} ({usable / 2**30:.2f} GiB usable)"
+                if last is None
+                else f"prefill chunk {last} -> {chosen} ({usable / 2**30:.2f} GiB usable)"
+            )
         return chosen
 
     @torch.inference_mode()

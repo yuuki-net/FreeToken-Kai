@@ -4,6 +4,11 @@ The measurement itself needs a GPU and a loaded model, so it is stubbed here and
 decision is exercised — which is the part with the edge cases: the rounding, the floor, the
 refusal to ever raise the configured value, and the promise that a failed probe leaves the
 configuration alone rather than taking the server down at boot.
+
+Who decides differs by topology, and that split is exercised too: on one GPU the boot pass
+only measures and every prefill is solved against the VRAM free then, while under ``--pp-size``
+the boot answer is written into the config and stands, because the chunk sizes a message
+between ranks that cannot be re-agreed on the hot path.
 """
 
 from __future__ import annotations
@@ -29,6 +34,7 @@ class _Sizer:
     _PREFILL_TRANSIENT_BUDGET = Engine._PREFILL_TRANSIENT_BUDGET
     _PREFILL_PROBE_TOKENS = Engine._PREFILL_PROBE_TOKENS
     _PREFILL_CHUNK_FLOOR = Engine._PREFILL_CHUNK_FLOOR
+    _fit_prefill_chunk = Engine._fit_prefill_chunk
     _autosize_prefill_chunk = Engine._autosize_prefill_chunk.__wrapped__
 
     def __init__(self, per_token: float, free: int, max_seq_len: int = 65536, boom=None):
@@ -49,16 +55,37 @@ GIB = 2**30
 KIB = 1024
 
 
-def test_lowers_the_chunk_to_what_the_free_vram_holds():
+def test_solves_the_chunk_from_what_the_free_vram_holds():
     # 124.5 KiB/token was measured on the 2060, with 0.39 GiB free that morning.
-    sizer = _Sizer(per_token=124.5 * KIB, free=int(0.39 * GIB))
-    config = _Config(max_extend_tokens=8192)
-    sizer._autosize_prefill_chunk(config)
     # 0.39 GiB * 0.55 / 127,488 B = 1806 tokens, floored to a multiple of 256.
     # (The live run picked 1536 from the same log line: the "0.39 GiB" there is rounded for
     # display and the real free number was a little lower. The rounding is why this is a
     # multiple of 256 and not an exact quotient.)
-    assert config.max_extend_tokens == 1792
+    sizer = _Sizer(per_token=124.5 * KIB, free=int(0.39 * GIB))
+    assert sizer._fit_prefill_chunk(124.5 * KIB, int(0.39 * GIB), 8192, 0.55) == 1792
+
+
+def test_one_gpu_keeps_the_configured_value_as_the_ceiling():
+    """The boot pass measures; it does not decide. Writing its answer into the config would
+    make one busy moment at startup the cap for the whole run, with no way back up."""
+    sizer = _Sizer(per_token=124.5 * KIB, free=int(0.39 * GIB))
+    config = _Config(max_extend_tokens=8192)
+    sizer._autosize_prefill_chunk(config)
+    assert config.max_extend_tokens == 8192
+    assert sizer._prefill_bytes_per_token == 124.5 * KIB  # kept for the per-prefill solve
+
+
+def test_a_busy_boot_does_not_cap_the_rest_of_the_run(patched_cuda):
+    """The measurement at boot lands wherever it lands -- a desktop drawing, another model
+    still shutting down, the sizer's own probe holding allocator blocks. What the prefills
+    after it may use is decided against the VRAM free then, not against that moment."""
+    sizer = _Sizer(per_token=124.5 * KIB, free=int(0.06 * GIB))  # 0.06 GiB free at boot
+    config = _Config(max_extend_tokens=8192)
+    sizer._autosize_prefill_chunk(config)
+    assert config.max_extend_tokens == 8192
+
+    live = patched_cuda(_Live(per_token=sizer._prefill_bytes_per_token, free=int(0.46 * GIB)))
+    assert live.prefill_chunk_now(config.max_extend_tokens) == 2048
 
 
 def test_keeps_the_configured_value_when_it_already_fits():
@@ -78,9 +105,10 @@ def test_never_raises_an_explicitly_smaller_setting():
 
 def test_does_not_go_below_the_floor():
     sizer = _Sizer(per_token=4 * 1024 * KIB, free=int(0.1 * GIB))  # absurdly expensive
-    config = _Config(max_extend_tokens=8192)
-    sizer._autosize_prefill_chunk(config)
-    assert config.max_extend_tokens == Engine._PREFILL_CHUNK_FLOOR
+    assert (
+        sizer._fit_prefill_chunk(4 * 1024 * KIB, int(0.1 * GIB), 8192, 0.55)
+        == Engine._PREFILL_CHUNK_FLOOR
+    )
 
 
 def test_a_zero_budget_turns_the_whole_thing_off():
@@ -99,12 +127,16 @@ def test_a_zero_budget_turns_the_whole_thing_off():
         (0.90, 2816),   # a box that serves and nothing else
     ],
 )
-def test_the_budget_share_is_what_moves_the_answer(share, expected):
+def test_the_budget_share_is_what_moves_the_answer(share, expected, patched_cuda):
     """Same machine, same measurement -- the operator's tolerance picks the chunk."""
     sizer = _Sizer(per_token=124.5 * KIB, free=int(0.39 * GIB))
     config = _Config(max_extend_tokens=8192, prefill_chunk_budget=share)
     sizer._autosize_prefill_chunk(config)
-    assert config.max_extend_tokens == expected
+    assert sizer._prefill_budget_share == share  # the boot pass carries it to the re-solve
+    live = patched_cuda(
+        _Live(per_token=124.5 * KIB, free=int(0.39 * GIB), share=sizer._prefill_budget_share)
+    )
+    assert live.prefill_chunk_now(config.max_extend_tokens) == expected
 
 
 @pytest.mark.parametrize("bad", [-0.1, 1.5])
@@ -153,6 +185,7 @@ class _Live:
 
     _PREFILL_TRANSIENT_BUDGET = Engine._PREFILL_TRANSIENT_BUDGET
     _PREFILL_CHUNK_FLOOR = Engine._PREFILL_CHUNK_FLOOR
+    _fit_prefill_chunk = Engine._fit_prefill_chunk
     prefill_chunk_now = Engine.prefill_chunk_now
 
     def __init__(self, per_token, free, reserved=0, allocated=0, share=None):

@@ -18,25 +18,20 @@ The card had 0.39-0.63 GiB free depending on what the desktop was doing. 8192 ne
 
 ## What the engine does about it
 
-At startup it runs one small prefill (1024 tokens), measures the transient with the
-allocator's own high-water mark, and divides: **124.5 KiB per token** on that machine. Then
-it solves for the largest chunk whose transient fits inside `--prefill-chunk-budget` of the
-free VRAM (default 0.55) and lowers `--max-prefill-length` to it, never raising it.
+At startup it runs one small prefill (1024 tokens) and measures the transient with the
+allocator's own high-water mark: **124.5 KiB per token** on that machine. It measures rather
+than searching downwards from the configured size on purpose — probing 8192 to see whether it
+fits means allocating the very thing that kills the process, at startup, on every boot.
+
+Startup only measures. `--max-prefill-length` stays the ceiling for the run, and the chunk is
+solved **before every prefill**, against the VRAM free at that moment:
 
 ```
 --prefill-chunk-budget: 124.5 KiB/token of prefill transient and 0.46 GiB free at 55%
-  -> --max-prefill-length 8192 would need 0.97 GiB; using 2048 instead
-```
-
-It measures rather than searching downwards from the configured size on purpose: probing
-8192 to see whether it fits means allocating the very thing that kills the process, at
-startup, on every boot.
-
-Then it **re-solves before every prefill**, against the VRAM free at that moment:
-
-```
+  -> --max-prefill-length 8192 would need 0.97 GiB; a prefill starting now would use 2048.
+     8192 stays the ceiling and each prefill is solved against the VRAM free then
+prefill chunk 2048 (0.46 GiB usable)           <- the first prompt
 prefill chunk 2048 -> 1792 (0.40 GiB usable)
-prefill chunk 1792 -> 2048 (0.48 GiB usable)
 prefill chunk 1792 -> 1280 (0.28 GiB usable)   <- something else took 300 MB
 prefill chunk 1280 -> 2048 (0.46 GiB usable)   <- and gave it back
 ```
@@ -45,6 +40,16 @@ That costs a driver query and an integer divide, and it changes nothing that is 
 the chunk is a bound, not a buffer. A prefill chunk runs for seconds; the query does not
 register. Cached-but-unused allocator blocks count as available, because that is exactly
 what the transient will be served from.
+
+The boot number is deliberately not written back. Free VRAM at startup is whatever the moment
+happened to hold — a desktop drawing, another model still shutting down, the sizer's own probe
+— and a value written into the configuration there would cap the run with no way back up short
+of a restart.
+
+**`--pp-size` is the exception.** The chunk sizes the residual one rank hands the next, so it
+cannot be a per-rank answer, and each rank reaches the per-prefill solve on its own schedule
+with nowhere safe to re-agree. There the ranks agree at boot on the tightest numbers any of
+them measured, that value is written into the configuration, and it stands for the run.
 
 ## Choosing the budget
 
