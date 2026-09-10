@@ -22,13 +22,13 @@ This fork adds nine things on top of it. They are independent — take one, igno
 |---|---|---|
 | 1 | **Two consumer GPUs, one model.** Layer split, one process per card, the residual stream handed over gloo — **no NCCL and no GPU-to-GPU peer access.** Uneven splits for cards of different sizes. | `--pp-size 2` |
 | 2 | **Half the host RAM** an offloaded MoE needs. Expert banks become a file mapping with a locked resident prefix, so 128 GB configurations run in 64 GB. | `--moe-bank-ram 48G` |
-| 3 | **Turing (RTX 20 series, sm_75) support.** Upstream requires Ampere or newer. Six small, isolated changes. | automatic |
+| 3 | **Turing (RTX 20 series, sm_75) support — and at the card's own speed.** Upstream requires Ampere or newer, and the assumption shows up as tiles and warp counts that a 64 KB shared-memory card cannot run: the prefill attention and the two GDN chunk kernels were at 1-3% of what the card does in fp16. Eight changes, each isolated to pre-Ampere. On an RTX 2060, prefill went from 192 to 386 tok/s on a 19k prompt and stopped falling off with context. | automatic |
 | 4 | **Image input over the OpenAI API** for checkpoints that ship a vision tower but were served text-only. The vision tower runs on the CPU, so it costs no VRAM. | send `image_url` parts |
 | 5 | **Speculative decoding with the checkpoint's own MTP head.** Verify window and draft head captured as CUDA graphs. Correctness-verified. It pays off only where a multi-row verify costs about what a single row costs: with the experts in host RAM that means long acceptance, so it wins on code and tool calls on two cards and loses on free prose and on one card. | `--spec-mtp 5` |
 | 6 | **64k of context on a 6 GB card.** The input embedding table lives in host memory and the GPU reads rows from it directly. | `--host-embedding` |
 | 7 | **A KV cache 1.9x or 3.6x smaller**, stored as block-quantized codes: 1.25 GiB down to 0.35 GiB at 64k on a 6 GB card. It buys VRAM, not speed — past a few thousand tokens of context it costs about a third of the decode rate. Plain paged-attention models on the Triton backend, and Qwen3.8-Flash-Next on its own sparse backend — where the cost above does not apply: measured on two RTX 3060s, `q4_0` decode is flat from 8k to 125k of context (−1.4%) while the KV drops 1.55 GiB to 0.47 GiB per rank, because its attention reads a fixed budget of tokens however long the context is. | `--kv-cache-dtype q4_0` |
 | 8 | **The checkpoint's bf16 dense weights served as fp8.** Attention, GDN, shared expert, lm_head and the embedding are quantized per output row at load and read W8A16; the router, hyper-connection, QSA indexer, PLE and GDN gates stay bf16. Qwen3.8-Flash-Next's resident dense weights go from 4.9 GB per card to 2.9 GB, and the freed VRAM goes to the expert cache. | `--dense-quant fp8` |
-| 9 | **A prefill chunk sized to the VRAM that is actually free.** Upstream's fixed 8192 needs 0.97 GiB of transient on a 35B MoE; a 6 GB card does not have it, so long prompts crawled and sometimes died. Measured at startup, re-solved before every prefill. | automatic, `--prefill-chunk-budget` |
+| 9 | **A prefill chunk sized to the VRAM that is actually free.** Upstream's fixed 8192 needs 0.97 GiB of transient on a 35B MoE; a 6 GB card does not have it, so long prompts crawled and sometimes died. The transient is measured at startup; the chunk itself is solved before every prefill, against the VRAM free at that moment, with `--max-prefill-length` left as the ceiling. | automatic, `--prefill-chunk-budget` |
 
 Everything else is upstream FreeToken.
 
@@ -97,12 +97,21 @@ and two of the changes here are prefill changes.
 
 | Hardware, model | Prefill | Follow-up turn behind a cached prefix |
 |---|---|---|
-| 1× RTX 2060 6 GB, Ornith-1.5-35B-A3B | a 2,062-token prompt in **~7.8 s** — it was **68 s** before the Turing GEMM changes | 2–3 s |
+| 1× RTX 2060 6 GB, Ornith-1.5-35B-A3B | **386 tok/s** on a 19,361-token prompt (50.1 s, against 103.6 s before the GDN and attention changes); 418 tok/s at 4.5k | 1–3 s |
 | 2× RTX 3060 12 GB, Qwen3.8-Flash-Next | **6 s** per 4,096-token chunk, against 12 s before the two ranks overlapped; 16,159 tokens in **~29 s** against ~48 s | 2.4–4.5 s, against 9 s before the CPU short-prefill path |
 
 The follow-up-turn column is the one a person actually feels in a chat client: the prefix is
 already cached, only the new message is prefilled. Getting it from 9 s to 2.4–4.5 s took removing
 the expert streaming that a cached prefix was still paying for every turn.
+
+A card whose fused kernels do not fit pays for it here more than anywhere else. On the 2060 the
+prefill used to cost 3.2 s per 1k tokens at 4k of prompt and 5.2 s at 20k — the curve rose because
+attention is the one term that grows with the context, and at head_dim 256 the fused kernel is cut
+to a 32x16 tile by 64 KB of shared memory and runs at 0.47 TFLOPS. Scoring through cuBLAS instead
+(the same trade this fork already makes for fp8 and NVFP4 weights) takes that layer from 658 ms to
+51 ms, and the two GDN chunk kernels give another 2.1 s per chunk to eight warps instead of four.
+The curve is close to flat now: 2.4 s per 1k at 4.5k of prompt, 2.6 at 19k. Ampere and later keep
+upstream's kernels, which fit their tiles and are faster than either replacement.
 
 Prefill is also where a very long context is paid for. Filling 250k tokens on one RTX 3060 12 GB
 (Ornith-1.5-35B-A3B, 8,192-token chunks) took **435 s**, and the per-chunk rate falls as the prefix

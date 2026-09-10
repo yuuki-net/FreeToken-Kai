@@ -109,9 +109,10 @@ to it; router weights and the sum over a token's routes are applied in fp32. One
 (route counts). Measured 48-53 ms per layer in fp16 (2.9 TFLOPS; the remaining gap to cuBLAS is the
 512 small launches per layer, not the GEMMs), 106 ms in bf16. `FREETOKEN_NVFP4_MOE_SCRATCH=0/1` overrides.
 
-**Result.** The 2785-token prompt went from 68 s to ~8.5 s. About 5 s of that is now the per-chunk
-expert streaming (the CPU-side layers' banks are pageable under WSL and are copied synchronously each
-chunk); the compute part is ~1.3 ms per token.
+**Result.** The 2785-token prompt went from 68 s to ~8.5 s with this change, and to about 5 s once
+changes 7 and 8 landed. The per-chunk expert streaming inside that was ~5 s when this was written;
+a staging buffer for the pageable (CPU-side) layers took it to ~1.5 s, which is the PCIe ceiling on
+this card -- see the performance section below.
 
 ## 7. Prefill attention: scratch + cuBLAS below Ampere
 
