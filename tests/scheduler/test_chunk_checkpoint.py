@@ -49,7 +49,7 @@ def _manager(page_size: int = 1, already: int = 0):
     cm.page_size = page_size
     cm.page_table = torch.arange(4 * 40_000, dtype=torch.int32).reshape(4, 40_000)
     cm.prefix_cache = FakeTree(already)
-    cm.linear_state_pool = SimpleNamespace(alloc=lambda n: [777])
+    cm.linear_state_pool = SimpleNamespace(num_free_slots=1, alloc=lambda n: [777])
     cm.ensure_mamba_slots = lambda n: None
     cm.freed: list[torch.Tensor] = []
     cm._free = cm.freed.append
@@ -150,6 +150,50 @@ def test_settle_is_a_no_op_for_a_freed_request():
     req.chunk_dups = [(0, 7)]
     cm._settle_chunk_dups(req)
     assert cm.freed == []
+
+
+def test_a_checkpoint_is_skipped_when_the_pool_cannot_replace_the_donated_slot():
+    """The tree takes the request's live slot and the request takes a fresh one in its place.
+    When the pool has none to give -- every slot a snapshot somebody holds, eviction finding
+    nothing -- the commit has to skip rather than donate a slot it cannot replace.
+
+    Not a hypothetical: a soak on a 6 GB card raised ``LinearStatePool exhausted`` in that
+    alloc, in the scheduler process, which ends the server. The checkpoint is an optimization
+    for a later request, so skipping costs a reuse point and nothing else."""
+
+    def _boom(n):
+        raise RuntimeError(f"LinearStatePool exhausted: need {n}, have 0")
+
+    cm = _manager()
+    cm.linear_state_pool = SimpleNamespace(num_free_slots=0, alloc=_boom)
+    req = _req()
+
+    CacheManager.commit_chunk_checkpoint(cm, req)          # must not raise
+
+    assert cm.prefix_cache.inserted == [], "nothing may be handed to the tree"
+    assert req.chunk_upto is None, "the watermark must not move"
+    assert req.mamba_ping_pong == (11, 12), "the request keeps both of its slots"
+    assert cm.locked == [] and cm.unlocked == []
+
+
+def test_a_checkpoint_still_commits_when_eviction_frees_a_slot():
+    """The pool starts empty and ensure_mamba_slots gives one back -- the ordinary case under
+    pressure, which must still produce a checkpoint."""
+    cm = _manager()
+    freed = []
+
+    def _evict(n):
+        freed.append(n)
+        cm.linear_state_pool.num_free_slots = n
+
+    cm.linear_state_pool = SimpleNamespace(num_free_slots=0, alloc=lambda n: [777])
+    cm.ensure_mamba_slots = _evict
+    req = _req()
+
+    CacheManager.commit_chunk_checkpoint(cm, req)
+
+    assert freed and cm.prefix_cache.inserted == [(2048, 12)]  # ping_pong[1 - next_idx]
+    assert req.chunk_upto == 2048
 
 
 def test_the_successor_is_told_about_the_replacement_slot():

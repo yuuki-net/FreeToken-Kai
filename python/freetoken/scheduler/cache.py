@@ -7,7 +7,9 @@ from typing import TYPE_CHECKING, List, Tuple
 import torch
 from freetoken.core import Req
 from freetoken.kvcache import BaseCacheHandle, MatchResult, create_prefix_cache
-from freetoken.utils import align_down, div_ceil
+from freetoken.utils import align_down, div_ceil, init_logger
+
+logger = init_logger(__name__)
 
 if TYPE_CHECKING:
     from .utils import PendingReq
@@ -493,6 +495,27 @@ class CacheManager:
         if align_down(L, self.page_size) != L:
             # page_size>1: insert would align the key down and attach a state that encodes L
             # tokens to a SHORTER node. Skip; the next aligned boundary commits instead.
+            return
+        # The commit hands this request's live state slot to the tree and takes a fresh one in
+        # its place. If the pool cannot produce that replacement -- every slot in it a snapshot
+        # somebody still holds, and eviction finding nothing to give back -- there is nothing to
+        # hand over with, while the request still needs its ping-pong pair to keep prefilling.
+        # So decide it here, before the insert, rather than in the alloc after: a checkpoint is
+        # a reuse point for a LATER request and never something this one needs. The next
+        # boundary tries again, and the final commit runs where slots have been released.
+        # (A soak found this: a 16k prompt whose chunks another process had shrunk by taking
+        # VRAM raised LinearStatePool exhausted in the alloc below and took the server down.)
+        self.ensure_mamba_slots(1)
+        if pool.num_free_slots < 1:
+            n = self._chunk_ckpt_skipped = getattr(self, "_chunk_ckpt_skipped", 0) + 1
+            if n == 1 or n % 100 == 0:
+                logger.warning(
+                    f"chunk checkpoint skipped ({n} so far): every GDN state slot holds a "
+                    f"snapshot that is still in use, so there is none to take in place of the "
+                    f"one this would hand over. The prompt prefills normally; it leaves one "
+                    f"fewer reuse point behind. Raise --linear-state-cache-ratio if this is "
+                    f"frequent."
+                )
             return
         from freetoken.kvcache.hybrid_radix_cache import HybridCacheHandle
 
