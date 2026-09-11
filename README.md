@@ -22,7 +22,7 @@ This fork adds nine things on top of it. They are independent — take one, igno
 |---|---|---|
 | 1 | **Two consumer GPUs, one model.** Layer split, one process per card, the residual stream handed over gloo — **no NCCL and no GPU-to-GPU peer access.** Uneven splits for cards of different sizes. | `--pp-size 2` |
 | 2 | **Half the host RAM** an offloaded MoE needs. Expert banks become a file mapping with a locked resident prefix, so 128 GB configurations run in 64 GB. | `--moe-bank-ram 48G` |
-| 3 | **Turing (RTX 20 series, sm_75) support — and at the card's own speed.** Upstream requires Ampere or newer, and the assumption shows up as tiles and warp counts that a 64 KB shared-memory card cannot run: the prefill attention and the two GDN chunk kernels were at 1-3% of what the card does in fp16. Eight changes, each isolated to pre-Ampere. On an RTX 2060, prefill went from 192 to 386 tok/s on a 19k prompt and stopped falling off with context. | automatic |
+| 3 | **Turing (RTX 20 series, sm_75) support — and at the card's own speed.** Upstream requires Ampere or newer, and the assumption shows up as tiles and warp counts that a 64 KB shared-memory card cannot run: the prefill attention and the two GDN chunk kernels were at 1-3% of what the card does in fp16. Eight changes, each isolated to pre-Ampere. On an RTX 2060, prefill went from 192 to 469 tok/s on a 27k prompt and stopped falling off with context. | automatic |
 | 4 | **Image input over the OpenAI API** for checkpoints that ship a vision tower but were served text-only. The vision tower runs on the CPU, so it costs no VRAM. | send `image_url` parts |
 | 5 | **Speculative decoding with the checkpoint's own MTP head.** Verify window and draft head captured as CUDA graphs. Correctness-verified. It pays off only where a multi-row verify costs about what a single row costs: with the experts in host RAM that means long acceptance, so it wins on code and tool calls on two cards and loses on free prose and on one card. | `--spec-mtp 5` |
 | 6 | **64k of context on a 6 GB card.** The input embedding table lives in host memory and the GPU reads rows from it directly. | `--host-embedding` |
@@ -97,7 +97,7 @@ and two of the changes here are prefill changes.
 
 | Hardware, model | Prefill | Follow-up turn behind a cached prefix |
 |---|---|---|
-| 1× RTX 2060 6 GB, Ornith-1.5-35B-A3B | **386 tok/s** on a 19,361-token prompt (50.1 s, against 103.6 s before the GDN and attention changes); 418 tok/s at 4.5k | 1–3 s |
+| 1× RTX 2060 6 GB, Ornith-1.5-35B-A3B | **469 tok/s** on a 27,061-token prompt with `--kv-cache-dtype q8_0` at 64k of context, 480 at 4.2k — flat. Without the quantized cache, 386 tok/s at 19k (50.1 s, against 103.6 s before the GDN and attention changes) | 1–3 s |
 | 2× RTX 3060 12 GB, Qwen3.8-Flash-Next | **6 s** per 4,096-token chunk, against 12 s before the two ranks overlapped; 16,159 tokens in **~29 s** against ~48 s | 2.4–4.5 s, against 9 s before the CPU short-prefill path |
 
 The follow-up-turn column is the one a person actually feels in a chat client: the prefix is
@@ -112,6 +112,12 @@ to a 32x16 tile by 64 KB of shared memory and runs at 0.47 TFLOPS. Scoring throu
 51 ms, and the two GDN chunk kernels give another 2.1 s per chunk to eight warps instead of four.
 The curve is close to flat now: 2.4 s per 1k at 4.5k of prompt, 2.6 at 19k. Ampere and later keep
 upstream's kernels, which fit their tiles and are faster than either replacement.
+
+The quantized cache composes with it. `--kv-cache-dtype q8_0` is what buys 64k of context on a
+6 GB card, and it used to cost the attention rewrite — a quantized slab went back to the fused
+kernel, which decodes it inside itself. The scratch path decodes the prefix it gathers instead,
+so the two now stack: 2.1 s per 1k from 4k to 27k of prompt, which is the fastest of the three
+configurations as well as the one that keeps the context.
 
 Prefill is also where a very long context is paid for. Filling 250k tokens on one RTX 3060 12 GB
 (Ornith-1.5-35B-A3B, 8,192-token chunks) took **435 s**, and the per-chunk rate falls as the prefix
