@@ -10,9 +10,11 @@ to a file, rows reordered so the frequently routed experts come first, then maps
 hands the cache ``[num_experts, ...]`` tensor views. The shape the cache sees never changes.
 What changes is which rows are guaranteed to be in RAM:
 
-* rows ``[0, hot)`` of every block are ``mlock``ed, so the prefill sweep -- which touches
-  every expert of every layer on each chunk -- cannot evict them, and they are
-  ``cudaHostRegister``ed so the PCIe fetch path can still DMA from them;
+* rows ``[0, hot)`` of every block are held resident and ``cudaHostRegister``ed, so the
+  prefill sweep -- which touches every expert of every layer on each chunk -- cannot evict
+  them and the PCIe fetch path can still DMA from them. Which form that takes depends on
+  what the device will register: page cache held down with ``mlock`` where a read-only file
+  mapping can be registered, private anonymous copies where it cannot (``_pick_map_mode``);
 * rows ``[hot, num_experts)`` are ordinary file-backed pages. They fault in when routing
   reaches them and the kernel drops them again under pressure, with no writeback, because the
   mapping is read-only.
@@ -280,14 +282,21 @@ class MappedBanks:
         self.path = path
         self.layout = MappedBankLayout.read(path)
         self._fd = os.open(path, os.O_RDONLY | getattr(os, "O_BINARY", 0))
-        # ACCESS_READ, and the read-only part is load-bearing. ACCESS_COPY maps
-        # MAP_PRIVATE *writable*, and mlock populates a writable private mapping with
-        # FOLL_WRITE -- which copy-on-writes every locked page into anonymous memory. That
-        # turned 24 GiB of shared clean page cache into 24 GiB of private dirty pages per
-        # rank, and the host went to swap. Read-only keeps the locked pages as page cache:
-        # resident, shared with the file, and droppable without writeback once unlocked.
-        self._map = mmap.mmap(self._fd, 0, access=mmap.ACCESS_READ)
         self._libc = ctypes.CDLL("libc.so.6", use_errno=True) if os.name == "posix" else None
+        self._buf = None
+        # FREETOKEN_BANK_MAP: shared keeps the read-only file mapping, private copies the
+        # resident rows into anonymous pages, auto (default) asks the device which of the
+        # two it is willing to register. _pick_map_mode has the reasoning.
+        self.map_mode = os.environ.get("FREETOKEN_BANK_MAP", "auto").strip().lower()
+        if self.map_mode not in ("auto", "shared", "private"):
+            raise ValueError(
+                f"FREETOKEN_BANK_MAP={self.map_mode!r}: expected auto, shared or private"
+            )
+        self.private = self._pick_map_mode(register)
+        self.probe_refused = self.private and self.map_mode == "auto"
+        self._map = mmap.mmap(
+            self._fd, 0, access=mmap.ACCESS_COPY if self.private else mmap.ACCESS_READ
+        )
         self._registered: list[int] = []
         self.hot_blocks = 0
         self.registered_blocks = 0
@@ -335,14 +344,17 @@ class MappedBanks:
         self.advise_mode = advise
         started = time.perf_counter()
         with warnings.catch_warnings():
-            # torch warns that a read-only buffer cannot be written through. Nothing writes
-            # to a bank -- and if anything did, the COW that warning is about is exactly
-            # what the read-only mapping exists to prevent.
+            # torch warns that a read-only buffer cannot be written through -- on the shared
+            # form, where nothing writes to a bank anyway. The private form is writable by
+            # construction, which is how its resident rows become anonymous, and does not
+            # warn; nothing writes to it either beyond the byte per page _cow puts back
+            # exactly as it found it.
             warnings.filterwarnings("ignore", message=".*buffer is not writable.*")
             buf = torch.frombuffer(self._map, dtype=torch.uint8)
         # via the tensor, not ctypes.from_buffer: that one insists on a writable buffer,
-        # which is the property being avoided here
+        # which on the shared form is the property being avoided here
         self._base = buf.data_ptr()
+        self._buf = buf
         for name, row_shape, dtype_name, row_bytes in self.layout.banks:
             dtype = _dtype_of(dtype_name)
             per_layer = []
@@ -365,6 +377,102 @@ class MappedBanks:
             self.sources[name] = per_layer
         self.settle_seconds = time.perf_counter() - started
         self.preloaded = preload
+
+    def _pick_map_mode(self, register: bool) -> bool:
+        """Ask the device which form of resident row it is willing to register.
+
+        ACCESS_READ is the cheaper form and stays the default where it works: the resident
+        rows are page cache, shared with the file, droppable without writeback once
+        unlocked, and nothing is copied. It needs cudaHostRegisterReadOnly (0x08), because
+        flags=0 asks for read-write pinning and a read-only mapping cannot give it.
+
+        Some hosts have no 0x08: cudaDevAttrHostRegisterReadOnlySupported is 0 on an RTX
+        3060 pair on native Ubuntu with the open kernel module (the same GA106 has it under
+        WSL2 -- platform, not silicon), and there both flags fail. Registering nothing is a
+        supported state but an expensive one: attach() then sends every decode miss to the
+        CPU executor, which is the whole VRAM expert cache thrown away.
+
+        Anonymous memory does register on that host -- measured, 1 GiB with flags=0. So when
+        the read-only form is refused, map ACCESS_COPY instead (MAP_PRIVATE, writable) and
+        let _cow turn the resident rows into private anonymous pages. The non-resident rows
+        stay file-backed in either form, which is the part that makes 31.7 GiB of banks fit
+        in 24 GiB of RAM at all.
+
+        Asked with the bank file itself, one page of it, before the real mapping exists --
+        rather than read off cudaDevAttrHostRegisterReadOnlySupported, so that a host which
+        advertises the flag and still refuses this file lands on the form that works.
+        """
+        if not register or self.map_mode == "shared":
+            return False
+        if self.map_mode == "private":
+            return True
+        if os.name != "posix":
+            return False
+        try:
+            import torch
+
+            if not torch.cuda.is_available():
+                return False
+            torch.cuda.init()
+            cudart = torch.cuda.cudart()
+        except Exception:
+            return False
+        probe = buf = None
+        try:
+            probe = mmap.mmap(self._fd, ALIGN, access=mmap.ACCESS_READ)
+            with warnings.catch_warnings():
+                warnings.filterwarnings("ignore", message=".*buffer is not writable.*")
+                buf = torch.frombuffer(probe, dtype=torch.uint8)
+            addr = buf.data_ptr()
+            for flags in (0x08, 0):
+                if int(cudart.cudaHostRegister(addr, ALIGN, flags)) == 0:
+                    cudart.cudaHostUnregister(addr)
+                    clear_cuda_error()
+                    return False
+                # a refused call leaves its error in this thread's slot; see _settle
+                clear_cuda_error()
+            return True
+        except Exception:
+            return False
+        finally:
+            del buf
+            if probe is not None:
+                probe.close()
+
+    def _cow(self, offset: int, nbytes: int) -> None:
+        """Make the resident rows of one block private, and give the file's copy back.
+
+        A byte per page, written back as it was read, which is all it takes: MAP_PRIVATE
+        shares the page cache until something writes, and that write is what copies the page
+        into the anonymous memory flags=0 can pin.
+
+        Deliberately not mlock, though mlock would do the same thing -- it populates a
+        writable private mapping with FOLL_WRITE. mlock only reaches as far as
+        RLIMIT_MEMLOCK, and the host this exists for stops at 7.83 GiB of the 24 GiB it asks
+        to keep resident. A range that is copied for part of its length and still page cache
+        for the rest is a range the registration below cannot take.
+
+        Then POSIX_FADV_DONTNEED on the same bytes of the file, per block and not once at
+        the end: between the copy and the fadvise the block is resident twice. Per block
+        that overshoot is one block (1.3 GiB for Flash-Next); deferred to the end it is the
+        whole resident half, 24 GiB, and a 64 GB host goes to swap -- which is exactly how
+        this approach was measured into the ground the first time (docs/bank-ram.md).
+
+        MADV_DONTNEED is the wrong call here and would undo the work: on a private mapping
+        it discards the private copies, not the file's pages.
+        """
+        buf = self._buf
+        if buf is None or nbytes <= 0:
+            return
+        view = buf[offset:offset + nbytes:ALIGN]
+        if view.numel():
+            view |= 0
+        # and the last page: hot_rows * row_bytes need not end on a page boundary
+        buf[offset + nbytes - 1:offset + nbytes] |= 0
+        try:
+            os.posix_fadvise(self._fd, offset, nbytes, os.POSIX_FADV_DONTNEED)
+        except (AttributeError, OSError):
+            pass
 
     @property
     def fully_registered(self) -> bool:
@@ -413,6 +521,8 @@ class MappedBanks:
             addr = self._base + offset
             self.requested_bytes += nbytes
             self.hot_blocks += 1
+            if self.private:
+                self._cow(offset, nbytes)
             if self._libc is None:
                 pass
             elif self._libc.mlock(ctypes.c_void_p(addr), ctypes.c_size_t(nbytes)) == 0:
@@ -422,6 +532,11 @@ class MappedBanks:
                 # 64 GB host stops at 8 GiB of the 24 GiB --moe-bank-ram asks for and the rest
                 # is evictable page cache. Silence here cost a bug report: the summary said
                 # "7.8 GiB locked resident" against a 24 GiB budget and explained nothing.
+                #
+                # On the private form this is a second line of defence rather than the
+                # mechanism: the rows are copied and resident before mlock is asked, and
+                # registering them pins them where mlock could not reach. finish() only
+                # warns when the registration did not cover them either.
                 self.lock_errno = ctypes.get_errno()
         if not nbytes:
             return
@@ -432,9 +547,11 @@ class MappedBanks:
         # it every layer is LOCKED, which means every decode miss goes to the CPU executor --
         # and that bypasses the VRAM expert cache entirely, throwing away its ~56% hit rate.
         #
-        # flags=0 asks for read-write pinning, which a file mapping cannot give;
+        # flags=0 asks for read-write pinning, which a read-only file mapping cannot give;
         # cudaHostRegisterReadOnly (0x08) is the flag for exactly this case. Ask for it first
-        # and keep plain as the fallback for a driver that does not know the flag.
+        # and keep plain as the fallback for a driver that does not know the flag. On the
+        # private form the order reverses: those rows are anonymous now, flags=0 is what
+        # they take, and 0x08 is the fallback.
         #
         # Every failed attempt leaves its error in this thread's slot, and the next kernel
         # launch of any size reports it -- a 48 KB tensor in OffloadMoeCache, in practice,
@@ -450,7 +567,7 @@ class MappedBanks:
         # is a supported state -- attach() sends every miss to the CPU executor -- so this
         # must return quietly, not poison the context.
         cudart = torch.cuda.cudart()
-        for flags in (0x08, 0):
+        for flags in (0, 0x08) if self.private else (0x08, 0):
             if int(cudart.cudaHostRegister(addr, nbytes, flags)) == 0:
                 self.registered_bytes += nbytes
                 self.registered_blocks += 1
@@ -546,6 +663,13 @@ class MappedTier:
         self.log("--moe-bank-ram: faulting in and locking the resident rows")
         self.banks = MappedBanks(self.path)
         b = self.banks
+        if b.probe_refused:
+            self.log(
+                "--moe-bank-ram: this device will not register a read-only file mapping, so "
+                "the resident rows are kept as private copies instead -- they cost anonymous "
+                "RAM rather than page cache, and the GPU can address them. "
+                "FREETOKEN_BANK_MAP=shared forces the read-only form back"
+            )
         ra = readahead_kb(self.path)
         if ra is not None:
             kb, where = ra
@@ -572,6 +696,7 @@ class MappedTier:
             f"--moe-bank-ram: mapped {b.layout.total_bytes() / 2**30:.1f} GiB, "
             f"{b.locked_bytes / 2**30:.1f} GiB locked resident, "
             f"{b.registered_bytes / 2**30:.1f} GiB registered for PCIe"
+            + (", private pages" if b.private else ", shared page cache")
             + (f", {b.whole_blocks} small blocks kept whole" if b.whole_blocks else "")
             + f", {b.advise_mode} fault readahead"
             + (", whole file preloaded" if b.preloaded else "")
@@ -585,7 +710,7 @@ class MappedTier:
                 f"the CPU executor. Lower --moe-bank-ram, or FREETOKEN_BANK_REGISTER=none "
                 f"to stop asking"
             )
-        if b.lock_errno:
+        if b.lock_errno and not b.fully_registered:
             import resource
 
             soft, hard = resource.getrlimit(resource.RLIMIT_MEMLOCK)

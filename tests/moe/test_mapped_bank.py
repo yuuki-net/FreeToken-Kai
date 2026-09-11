@@ -242,7 +242,7 @@ def test_a_bank_registered_in_part_is_treated_as_not_registered(tmp_path):
     """prefix_pinned_rows は層にもブロックにも 1 つしかない。
 
     それは「行 [0, hot) はどこでもデバイスから触れる」という主張で、1 ブロックでも登録に
-    失敗していれば嘘になる。嘘になった先は decode graph の中の illegal access なので、
+    失敗していれば嘘になる。嘘になった先は decode graph の中の illegal access で、
     そこまで行かせない。いまのところ登録は全部通るか全部断られるかのどちらかだが、
     24 GiB ぶんのブロックの途中で上限に当たればそうではなくなる。
     """
@@ -309,7 +309,7 @@ def test_small_blocks_are_kept_whole(tmp_path):
         banks.close()
 
 
-def _bare_bank(libc=None):
+def _bare_bank(libc=None, private=False):
     """A MappedBanks with only what ``_settle`` touches, over an anonymous mapping."""
     import mmap as _mmap
 
@@ -322,6 +322,10 @@ def _bare_bank(libc=None):
     bank.lock_errno = 0
     bank._registered = []
     bank.hot_blocks = bank.registered_blocks = 0
+    bank.private = private
+    bank._buf = torch.frombuffer(bank._map, dtype=torch.uint8) if private else None
+    if private:
+        bank._base = bank._buf.data_ptr()
     return bank
 
 
@@ -376,6 +380,125 @@ def test_every_refused_register_flag_is_cleared(monkeypatch):
         assert attempts[0] == 0x08, f"read-only first, got {attempts}"
         assert len(cleared) == sum(1 for f in attempts if f != accepts), (attempts, cleared)
         assert bank.registered_bytes == (4096 if accepts is not None else 0)
+
+
+def test_the_private_form_asks_for_plain_pinning_first(monkeypatch):
+    """形が変われば通るフラグも変わる。
+
+    読取専用のファイル写像に要るのは 0x08 で、flags=0 は原理的に通らない。私的写像で
+    コピーし終わった行は匿名メモリなので逆になる —— 通るのは flags=0 のほうで、0x08 は
+    cudaDevAttrHostRegisterReadOnlySupported が 0 の機械では 801 を返す。その機械のために
+    この形があるのだから、最初に投げるのは flags=0 でなければ 1 回ぶん無駄に断られる。
+    """
+    import freetoken.moe.mapped_bank as mb
+
+    attempts = []
+
+    class _Cudart:
+        def cudaHostRegister(self, addr, nbytes, flags):
+            attempts.append(flags)
+            return 0 if flags == 0 else 1
+
+    monkeypatch.setattr(torch.cuda, "cudart", lambda: _Cudart())
+    monkeypatch.setattr(mb, "clear_cuda_error", lambda: None)
+
+    bank = _bare_bank(private=True)
+    bank._settle(offset=0, nbytes=4096, block_bytes=4096, register=True)
+
+    assert attempts == [0], f"plain first on the private form, got {attempts}"
+    assert bank.registered_bytes == 4096
+    assert bank.fully_registered
+
+
+def test_the_shared_form_still_asks_for_read_only_first(monkeypatch):
+    import freetoken.moe.mapped_bank as mb
+
+    attempts = []
+
+    class _Cudart:
+        def cudaHostRegister(self, addr, nbytes, flags):
+            attempts.append(flags)
+            return 0 if flags == 0x08 else 1
+
+    monkeypatch.setattr(torch.cuda, "cudart", lambda: _Cudart())
+    monkeypatch.setattr(mb, "clear_cuda_error", lambda: None)
+
+    bank = _bare_bank()
+    bank._settle(offset=0, nbytes=4096, block_bytes=4096, register=True)
+    assert attempts == [0x08]
+
+
+def test_the_form_is_chosen_by_what_the_device_accepts(tmp_path, monkeypatch):
+    """写像の形は mmap の前に決めるしかないので、ファイルの 1 ページで先に訊く。
+
+    属性 113 を読むのではなく実際に投げるのは、フラグを持っていると言いながらこのファイルを
+    断る機械をその一言で拾えるため。
+    """
+    import freetoken.moe.mapped_bank as mb
+
+    _, _, _, path = _built(tmp_path)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "init", lambda: None)
+    monkeypatch.setattr(mb, "clear_cuda_error", lambda: None)
+
+    for accepts, want_private in ((0x08, False), (0, False), (None, True)):
+        class _Cudart:
+            def cudaHostRegister(self, addr, nbytes, flags):
+                return 0 if flags == accepts else 1
+
+            def cudaHostUnregister(self, addr):
+                return 0
+
+        monkeypatch.setattr(torch.cuda, "cudart", lambda: _Cudart())
+        banks = MappedBanks(path, register=False)   # register=False: 形だけ見る
+        try:
+            assert banks.private is False, "register=False は問い合わせもしない"
+        finally:
+            banks.close()
+        monkeypatch.setenv("FREETOKEN_BANK_MAP", "auto")
+        banks = MappedBanks.__new__(MappedBanks)
+        banks._fd = os.open(path, os.O_RDONLY)
+        banks.map_mode = "auto"
+        try:
+            assert banks._pick_map_mode(register=True) is want_private, accepts
+        finally:
+            os.close(banks._fd)
+
+
+def test_the_private_form_hands_back_the_same_bytes(tmp_path, monkeypatch):
+    """コピーしたページの中身が元と 1 バイトも違わないこと。
+
+    _cow は「読んだ値をそのまま書き戻す」でページを私的にする。書き戻しを間違えれば
+    ページの先頭 1 バイトだけが壊れた重みになり、形も長さも合ったまま出力だけが濁る。
+    """
+    import freetoken.moe.mapped_bank as mb
+
+    class _Cudart:
+        def cudaHostRegister(self, addr, nbytes, flags):
+            return 0 if flags == 0 else 1
+
+        def cudaHostUnregister(self, addr):
+            return 0
+
+    monkeypatch.setattr(torch.cuda, "cudart", lambda: _Cudart())
+    monkeypatch.setattr(mb, "clear_cuda_error", lambda: None)
+    monkeypatch.setenv("FREETOKEN_BANK_MAP", "private")
+    freq = {0: [0, 9, 8, 0, 7, 0], 1: [5, 0, 0, 6, 0, 7], 2: [1, 2, 3, 4, 5, 6]}
+    src, p, _, path = _built(tmp_path, freq=freq)
+    # register=True: copying without registering would be cost for nothing, so the form is
+    # only taken when something is going to be registered
+    banks = MappedBanks(path)
+    try:
+        assert banks.private
+        assert banks.fully_registered
+        for name in src:
+            for layer in (0, 1, 2):
+                view = banks.sources[name][layer]
+                for physical in range(6):
+                    logical = p.order[layer][physical]
+                    assert torch.equal(view[physical], src[name][layer][logical])
+    finally:
+        banks.close()
 
 
 def test_a_short_mlock_is_reported_not_swallowed():

@@ -55,19 +55,49 @@ illegal access inside the decode graph. Both paths avoid it without touching the
   then bounces the remainder through the pinned staging buffer once the layer's GEMMs are
   enqueued. A plain `cudaMemcpy` reads unregistered host memory; only async DMA cannot.
 
-### Some hosts cannot register anything
+### Some hosts will not register a read-only file mapping
 
-Registering a read-only file mapping needs `cudaHostRegisterReadOnly`, which needs
+Registering one needs `cudaHostRegisterReadOnly`, which needs
 `cudaDevAttrHostRegisterReadOnlySupported`. That attribute reads 1 under WSL2 and 0 on an RTX
 3060 pair on native Ubuntu 24.04 with the 615.71.09 open kernel module -- the same GA106
-silicon, so this is the platform rather than the card. Where it reads 0 nothing can be
-registered at all, because plain `flags=0` asks for read-write pinning and a read-only
-mapping cannot give it.
+silicon, so this is the platform rather than the card. Where it reads 0 the read-only form
+cannot be registered at all, because plain `flags=0` asks for read-write pinning and a
+read-only mapping cannot give it.
 
-That is a supported state rather than a failure. The startup line says `0.0 GiB registered
-for PCIe`, every decode miss goes to the CPU executor, and the VRAM expert cache is left
-unused -- the log says that too. It serves, and it is slower, because that cache is where the
-hit rate lived. `FREETOKEN_BANK_REGISTER=none` asks for the same state deliberately.
+What such a host *will* register is ordinary anonymous memory. So the resident rows are put
+into anonymous memory instead: the file is mapped `MAP_PRIVATE` and writable, and each
+resident row is written to once -- a byte per page, put back exactly as it was read -- which
+copies it out of the page cache into a private page that `flags=0` accepts. The page cache
+copy is then handed back with `posix_fadvise(POSIX_FADV_DONTNEED)`, one block at a time, so
+the two copies never coexist for more than one block. The non-resident rows stay file-backed
+and evictable in either form, which is what makes 31.7 GiB of banks fit in 24 GiB of RAM.
+
+Which form is used is decided at startup by asking the device, with one page of the bank file
+itself -- not by reading the attribute, so that a host which advertises the flag and still
+refuses this particular file lands on the form that works. The startup line says which:
+
+```
+--moe-bank-ram: mapped 31.7 GiB, 24.0 GiB locked resident, 24.0 GiB registered for PCIe, shared page cache, ...
+--moe-bank-ram: mapped 31.7 GiB, 0.1 GiB locked resident, 24.0 GiB registered for PCIe, private pages, ...
+```
+
+`FREETOKEN_BANK_MAP` overrides the choice: `shared` for the read-only form, `private` for the
+copied one, `auto` (the default) to ask. The private form costs the copy -- 8 s against 4 s to
+settle a 6 GiB resident half from warm page cache, measured on a 2060 -- and the same amount
+of RAM, but a different kind of it: anonymous pages rather than page cache, which the next
+start cannot reuse. Decode speed was the same either way within run-to-run variation on that
+machine.
+
+If neither form registers, that is still a supported state rather than a failure. The startup
+line says `0.0 GiB registered for PCIe`, every decode miss goes to the CPU executor, and the
+VRAM expert cache is left unused -- the log says that too. It serves, and it is slower,
+because that cache is where the hit rate lived. `FREETOKEN_BANK_REGISTER=none` asks for the
+same state deliberately.
+
+The same is true if only *some* of the resident blocks register, which is what a pinning limit
+reached partway looks like. `prefix_pinned_rows` is one number for every layer, so a bank that
+is registered in part cannot be described to the cache at all; it is treated as none, with a
+warning naming how many blocks made it.
 
 ## The memlock limit
 
@@ -76,6 +106,12 @@ hit rate lived. `FREETOKEN_BANK_REGISTER=none` asks for the same state deliberat
 host -- so the resident half comes out at a third of what was asked for and the remainder is
 evictable page cache that goes back to disk under pressure. The startup line reports what was
 actually locked, and warns when it fell short of the budget.
+
+This matters on the shared form, where `mlock` is what holds the resident rows down. On the
+private form they are already copies, and registering them pins them where `mlock` could not
+reach -- a low `ulimit -l` there shows as `0.1 GiB locked resident` next to a full
+`24.0 GiB registered for PCIe`, and draws no warning, because nothing is actually evictable.
+The warning appears only when the registration did not cover them either.
 
 Check it as the user that runs the server. The value is in KB; 25165824 is 24 GiB:
 
