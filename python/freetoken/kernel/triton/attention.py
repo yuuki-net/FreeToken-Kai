@@ -818,13 +818,15 @@ def _scratch_attention_applies(
     kv_len: int,
     head_dim: int,
     num_kv_heads: int,
+    k_scales: torch.Tensor | None = None,
+    v_scales: torch.Tensor | None = None,
 ) -> bool:
     """Whether the cuBLAS path can serve this call.
 
     Everything it cannot express falls through to the fused kernel rather than growing a
-    second implementation of it: a sliding window, attention sinks, a quantized cache
-    (``--kv-cache-dtype``, whose slabs are decoded inside the kernel), and the non-split call
-    where this forward own K/V are already in the cache.
+    second implementation of it: a sliding window, attention sinks, and the non-split call
+    where this forward's own K/V are already in the cache. A quantized cache
+    (``--kv-cache-dtype``) IS served here -- the prefix is decoded as part of the gather.
     """
     forced = os.getenv(_ATTN_SCRATCH_ENV)
     if forced is not None:
@@ -832,8 +834,10 @@ def _scratch_attention_applies(
             return False
     elif not _attn_scratch_default():
         return False
-    if k_extend is None or v_extend is None or kv_quant is not None:
+    if k_extend is None or v_extend is None:
         return False
+    if kv_quant is not None and (k_scales is None or v_scales is None):
+        return False        # a quantized slab without its scales cannot be decoded
     if sliding_window or sinks is not None:
         return False
     if num_rows < _ATTN_SCRATCH_MIN_ROWS:
@@ -854,6 +858,9 @@ def _extend_attention_scratch(
     kv_indices: torch.Tensor,
     prefix_lens: torch.Tensor,
     sm_scale: float,
+    kv_quant=None,
+    k_scales: torch.Tensor | None = None,
+    v_scales: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Causal extend attention as three cuBLAS calls per tile, over a materialized score tile.
 
@@ -887,8 +894,18 @@ def _extend_attention_scratch(
         cols = torch.arange(rows, device=q.device)
         slots = kv_indices[kv_starts[seq] : kv_starts[seq] + prefix].long()
         for head in range(num_kv_heads):
-            keys = torch.cat([k_cache[slots, head], k_extend[q0:q1, head]]).transpose(0, 1)
-            values = torch.cat([v_cache[slots, head], v_extend[q0:q1, head]])
+            prefix_k, prefix_v = k_cache[slots, head], v_cache[slots, head]
+            if kv_quant is not None:
+                # The slabs hold packed codes; decode the rows this sequence actually reads,
+                # once, into the gather that was going to be built anyway. The result is the
+                # same fp16 matrix the unquantized path produces, so nothing downstream
+                # changes -- and the transient does not grow either.
+                from freetoken.kvcache.kv_quant import dequantize_rows
+
+                prefix_k = dequantize_rows(prefix_k, k_scales[slots, head], kv_quant, q.dtype)
+                prefix_v = dequantize_rows(prefix_v, v_scales[slots, head], kv_quant, q.dtype)
+            keys = torch.cat([prefix_k, k_extend[q0:q1, head]]).transpose(0, 1)
+            values = torch.cat([prefix_v, v_extend[q0:q1, head]])
             lo, hi = head * group, (head + 1) * group
             for start in range(0, rows, block):
                 end = min(start + block, rows)
@@ -1171,10 +1188,13 @@ def extend_paged_attention(
         kv_len=int(prefix_lens.max()) + num_q_tokens,
         head_dim=head_dim,
         num_kv_heads=num_kv_heads,
+        k_scales=k_scales,
+        v_scales=v_scales,
     ):
         return _extend_attention_scratch(
             q, k_extend, v_extend, k_cache, v_cache, o,
             qo_indptr, kv_indptr, kv_indices, prefix_lens, sm_scale,
+            kv_quant=kv_quant, k_scales=k_scales, v_scales=v_scales,
         )
     block_d = triton.next_power_of_2(head_dim)
     block_dv = triton.next_power_of_2(head_dim)

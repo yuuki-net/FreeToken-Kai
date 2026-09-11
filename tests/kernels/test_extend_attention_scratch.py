@@ -178,6 +178,48 @@ def test_a_short_extend_stays_on_the_fused_kernel(monkeypatch):
 
 
 @cuda_only
+@pytest.mark.parametrize("name", ["q8_0", "q4_0"])
+def test_a_quantized_cache_is_decoded_in_the_gather(name, monkeypatch):
+    """--kv-cache-dtype stores the prefix as packed codes. The fused kernel decodes them tile
+    by tile inside itself; this path decodes the rows it gathers, once, into the matrix it was
+    going to build anyway. Both must answer the same thing.
+
+    Worth pinning because the two are easy to leave exclusive: while they were, turning the KV
+    cache down for the context it buys silently gave up the attention rewrite."""
+    from freetoken.kvcache.kv_quant import quantize_rows, resolve
+
+    spec = resolve(name)
+    case = _case(256, 512)
+    k_codes, k_scale = quantize_rows(case["k_cache"], spec)
+    v_codes, v_scale = quantize_rows(case["v_cache"], spec)
+    case = dict(case, k_cache=k_codes, v_cache=v_codes)
+    extra = dict(k_scales=k_scale, v_scales=v_scale, kv_quant=spec)
+
+    scratch = _run(case, monkeypatch, "1", **extra)
+    fused = _run(case, monkeypatch, "0", **extra)
+
+    # q4_0 is a coarse format: the two paths round the same codes in a different order, so the
+    # bar is the one the format itself sets, not bit equality
+    tol = 2e-3 if name == "q8_0" else 2e-2
+    torch.testing.assert_close(scratch, fused, rtol=tol, atol=tol)
+
+
+def test_a_quantized_cache_without_scales_is_refused():
+    """Codes with no scales cannot be decoded; reading them as values would be silent garbage.
+    Checked on the gate itself, which is where the decision lives."""
+    from freetoken.kvcache.kv_quant import resolve
+
+    args = dict(
+        q=torch.zeros(1, dtype=torch.float16), k_extend=torch.zeros(1), v_extend=torch.zeros(1),
+        sliding_window=0, sinks=None, kv_quant=resolve("q8_0"),
+        num_rows=1024, kv_len=2048, head_dim=256, num_kv_heads=2,
+    )
+    assert attn._scratch_attention_applies(**args, k_scales=None, v_scales=None) is False
+    scales = torch.zeros(1)
+    assert attn._scratch_attention_applies(**args, k_scales=scales, v_scales=None) is False
+
+
+@cuda_only
 def test_a_context_too_large_to_gather_falls_back(monkeypatch):
     """The gathered contiguous K/V is the whole context and is not bounded by the score
     budget, so past a multiple of it the fused kernel -- whose footprint is its tile -- takes
