@@ -423,15 +423,21 @@ def test_engine_config_dense_quant_override(monkeypatch):
     monkeypatch.setattr(cfg_mod, "_load_attr", lambda module, name: (lambda hf: _parsed_qwen4()))
     monkeypatch.setattr(cfg_mod, "cached_load_hf_config", lambda path: _qwen4_hf_config())
     monkeypatch.setattr(cfg_mod, "checkpoint_quant_config", lambda *a, **k: None)
-    from freetoken.layers.quantization import LoadTimeFp8Config
+    from freetoken.layers.quantization import LoadTimeFp8Config, get_quant_config
 
     ec = EngineConfig(model_path="x", tp_info=DistributedInfo(0, 1), dtype=torch.bfloat16, dense_quant="fp8")
     mc = ec.model_config
     assert isinstance(mc.quant, LoadTimeFp8Config)
+    # The weight readers get the model path only and take their schemes from the installed
+    # config, so it has to be the wrapper the layers were built from -- not the checkpoint's
+    # own config, which would leave a reader quantizing against a scheme the model does not
+    # have. Nothing calls get_quant_config() yet, so only this assert catches the difference.
+    assert get_quant_config() is mc.quant
     assert mc.embed_quant == "fp8_pertensor"  # the table is not a quantized layer kind
     assert mc.expert_quant == "nvfp4"  # the routed experts keep the checkpoint's format
     plain = EngineConfig(model_path="x", tp_info=DistributedInfo(0, 1), dtype=torch.bfloat16)
     assert not isinstance(plain.model_config.quant, LoadTimeFp8Config)
+    assert not isinstance(get_quant_config(), LoadTimeFp8Config)
     assert plain.model_config.embed_quant == "none"
 
 

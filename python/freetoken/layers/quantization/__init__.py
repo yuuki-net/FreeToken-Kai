@@ -33,8 +33,10 @@ from .configs import (
     Mxfp4Config,
     NoQuantConfig,
     QuantConfig,
+    get_quant_config,
     quant_method_for,
     quantization_config_of,
+    set_quant_config,
 )
 
 __all__ = [
@@ -47,6 +49,6 @@ __all__ = [
     "UnquantizedMoEMethod", "Fp8BlockMoEMethod", "Nvfp4MoEMethod", "Mxfp4MoEMethod", "Mxfp8MoEMethod",
     "QuantBackend", "set_quant_backend", "get_quant_backend", "NameMap",
     "QuantConfig", "NoQuantConfig", "ModelOptConfig", "CompressedTensorsConfig", "Fp8BlockConfig", "Mxfp4Config",
-    "quant_method_for", "quantization_config_of", "finalize_quant",
+    "quant_method_for", "quantization_config_of", "set_quant_config", "get_quant_config", "finalize_quant",
     "LoadTimeFp8Config", "AT_LOAD_FP8",
 ]

@@ -4,7 +4,7 @@
 at the far end. A 125B MoE on two of them. A 35B MoE on an RTX 2060 6 GB.**
 
 > An unofficial fork of [FlashML-org/FreeToken](https://github.com/FlashML-org/FreeToken), merged
-> with upstream `main` at `3d919e9` (2026-09-09). Not affiliated with, endorsed by, or supported by
+> with upstream `main` at `fb7f732` (2026-09-10). Not affiliated with, endorsed by, or supported by
 > FlashML. The license is unchanged (Apache-2.0).
 >
 > **Please keep questions and bug reports about this fork in this repository.** The FreeToken
@@ -258,6 +258,7 @@ For More details:
 - [Quick start](https://github.com/FlashML-org/FreeToken/blob/main/docs/quickstart.md)
 - [Supported models](https://github.com/FlashML-org/FreeToken/blob/main/docs/models.md)
 - [CLI reference](https://github.com/FlashML-org/FreeToken/blob/main/docs/cli.md)
+- [Repairing old FTW checkpoints](https://github.com/FlashML-org/FreeToken/blob/main/docs/ftw-hotfix.md)
 
 ## Citation
 
