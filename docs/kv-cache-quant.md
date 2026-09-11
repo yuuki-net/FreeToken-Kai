@@ -201,6 +201,11 @@ per-family work, not a flag.
 QSA has such tiers too (the compressed index slab, the pending ring, the scratch rows) and
 they stay 16-bit here as well; what made it worth doing anyway is the next section.
 
+**Shared memory, on Flash-Next**: `q8_0` makes the sparse-attention tile ask for 104 KiB of
+shared memory per block in its prefill profile, and a GA10x card has 99. The kernel gives up
+its pipelining there (`num_stages` 2 -> 1, the tile width unchanged) and logs the profile it
+settled on, once per shape.
+
 **Backend**: two backends read the code slabs — `triton` for the plain paged pool, and
 `qsa_sparse` for Flash-Next. Which one you need is decided by the checkpoint, not by you:
 

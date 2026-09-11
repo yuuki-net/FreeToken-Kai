@@ -15,6 +15,15 @@ at the far end. A 125B MoE on two of them. A 35B MoE on an RTX 2060 6 GB.**
 > session on two RTX 3060s, unrelated to context length, reset only by a restart. The cause and
 > the fix are in [docs/pipeline.md](docs/pipeline.md). Single-GPU runs were never affected.
 
+> **2026-09-12 — pull if you cloned before this date and either serve Qwen3.8-Flash-Next with
+> `--kv-cache-dtype q8_0` or use `--moe-bank-ram`.** Two refused CUDA calls were left
+> uncleaned, and each surfaced somewhere it had nothing to do with. One killed the boot with
+> `--moe-bank-ram` on a host that cannot register a read-only file mapping, reporting itself
+> out of an unrelated 48 KB allocation. The other killed the first request: under `q8_0` the
+> sparse-attention tile does not fit a GA10x card's shared memory, and nothing before that
+> request complained. See [docs/bank-ram.md](docs/bank-ram.md) and
+> [docs/kv-cache-quant.md](docs/kv-cache-quant.md). `q4_0` and 16-bit KV were never affected.
+
 Upstream FreeToken serves one model on one GPU, on Ampere (RTX 30 series) or newer, text only.
 This fork adds nine things on top of it. They are independent — take one, ignore the rest.
 

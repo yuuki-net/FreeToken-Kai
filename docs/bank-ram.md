@@ -55,6 +55,46 @@ illegal access inside the decode graph. Both paths avoid it without touching the
   then bounces the remainder through the pinned staging buffer once the layer's GEMMs are
   enqueued. A plain `cudaMemcpy` reads unregistered host memory; only async DMA cannot.
 
+### Some hosts cannot register anything
+
+Registering a read-only file mapping needs `cudaHostRegisterReadOnly`, which needs
+`cudaDevAttrHostRegisterReadOnlySupported`. That attribute reads 1 under WSL2 and 0 on an RTX
+3060 pair on native Ubuntu 24.04 with the 615.71.09 open kernel module -- the same GA106
+silicon, so this is the platform rather than the card. Where it reads 0 nothing can be
+registered at all, because plain `flags=0` asks for read-write pinning and a read-only
+mapping cannot give it.
+
+That is a supported state rather than a failure. The startup line says `0.0 GiB registered
+for PCIe`, every decode miss goes to the CPU executor, and the VRAM expert cache is left
+unused -- the log says that too. It serves, and it is slower, because that cache is where the
+hit rate lived. `FREETOKEN_BANK_REGISTER=none` asks for the same state deliberately.
+
+## The memlock limit
+
+`--moe-bank-ram 48G` across two ranks asks each process to `mlock` 24 GiB, and
+`RLIMIT_MEMLOCK` is per process. systemd's default is `MAX(64M, RAM/8)` -- 8 GiB on a 64 GB
+host -- so the resident half comes out at a third of what was asked for and the remainder is
+evictable page cache that goes back to disk under pressure. The startup line reports what was
+actually locked, and warns when it fell short of the budget.
+
+Check it as the user that runs the server. The value is in KB; 25165824 is 24 GiB:
+
+```bash
+ulimit -l
+```
+
+Raising it needs root when the hard limit is low too, which is the systemd case. Allow a
+little over one rank's half:
+
+```bash
+printf '%s soft memlock 27262976\n%s hard memlock 27262976\n' "$USER" "$USER" \
+  | sudo tee /etc/security/limits.d/90-freetoken.conf
+```
+
+PAM applies that at login, so log out and back in; `su` does not pick it up. For a single run
+without the re-login, `sudo prlimit --memlock=27917287424 --pid $$` raises the current shell
+instead and the server inherits it.
+
 ## Running
 
 ### 1. Measure the routing
