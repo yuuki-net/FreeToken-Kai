@@ -1,11 +1,42 @@
 from __future__ import annotations
 
+import ctypes
 import functools
+import os
 from contextlib import contextmanager
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     import torch
+
+
+def clear_cuda_error() -> None:
+    """Drop the error a refused CUDA call left in this thread's error slot.
+
+    Only ``cudaGetLastError`` resets that slot. ``cudaDeviceSynchronize`` -- what
+    ``torch.cuda.synchronize()`` calls -- returns success for a non-sticky error and leaves it
+    standing, so whatever touches CUDA next reports it instead, with the real culprit nowhere
+    in the traceback. Two callers need this and both were found the hard way: a refused
+    ``cudaHostRegister`` surfacing as "CUDA error: invalid argument" out of a 48 KB
+    ``torch.full`` in ``OffloadMoeCache``, and a tile Triton refuses to load surfacing out of
+    a tensor destructor as ``terminate called after throwing c10::AcceleratorError``.
+
+    ``torch._C._cudart`` binds neither call, so go through libcudart (torch dlopens it
+    RTLD_GLOBAL, so the symbol resolves by name) and fall back to spending the error on a
+    throwaway launch, which clears the slot the same way -- by raising.
+    """
+    import torch
+
+    if os.name == "posix":
+        try:
+            ctypes.CDLL(None).cudaGetLastError()
+            return
+        except (OSError, AttributeError):
+            pass
+    try:
+        torch.empty(1, dtype=torch.int32, device="cuda").fill_(0)
+    except RuntimeError:
+        pass  # the launch check consumed it, which is the point
 
 
 @contextmanager

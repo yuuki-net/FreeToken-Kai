@@ -285,36 +285,91 @@ def test_small_blocks_are_kept_whole(tmp_path):
         banks.close()
 
 
-def test_a_failed_register_flag_is_cleared_before_the_next_allocation(monkeypatch):
-    """cudaHostRegister leaves a sticky cudaErrorMemoryAllocation on the context when it
-    refuses a flag, and the next device allocation of any size dies with "CUDA error: out of
-    memory" -- a 48 KB tensor in OffloadMoeCache, in practice. The path that mattered was
-    flags=0 refused and ReadOnly accepted: the bank reported itself registered and the boot
-    died anyway, because the clear only ran when every flag had failed."""
-    import torch
+def _bare_bank(libc=None):
+    """A MappedBanks with only what ``_settle`` touches, over an anonymous mapping."""
+    import mmap as _mmap
 
     from freetoken.moe.mapped_bank import MappedBanks
 
-    attempts, syncs = [], []
-
-    class _Cudart:
-        def cudaHostRegister(self, addr, nbytes, flags):
-            attempts.append(flags)
-            return 0 if flags == 0x08 else 2  # this driver takes read-only file pages only
-
-    monkeypatch.setattr(torch.cuda, "cudart", lambda: _Cudart())
-    monkeypatch.setattr(torch.cuda, "synchronize", lambda *a, **k: syncs.append(len(attempts)))
-
-    import mmap as _mmap
-
     bank = MappedBanks.__new__(MappedBanks)
-    bank._base, bank._libc = 0x1000, None
+    bank._base, bank._libc = 0x1000, libc
     bank._map = _mmap.mmap(-1, 1 << 20)  # a real mapping: _settle advises it before locking
-    bank.locked_bytes = bank.registered_bytes = 0
+    bank.locked_bytes = bank.requested_bytes = bank.registered_bytes = 0
+    bank.lock_errno = 0
     bank._registered = []
-    bank._settle(offset=0, nbytes=4096, block_bytes=4096, register=True)
+    return bank
 
-    assert bank.registered_bytes == 4096, "the read-only flag registers the prefix"
-    assert attempts and attempts[0] == 0x08, f"read-only first, got {attempts}"
-    # every refusal is cleared, whether or not a later flag went on to succeed
-    assert len(syncs) == sum(1 for f in attempts if f != 0x08), (attempts, syncs)
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_clear_cuda_error_really_clears_it():
+    """The mechanism, not the call.
+
+    A refused cudaHostRegister leaves its error in this thread's slot, and the next kernel
+    launch reports it -- OffloadMoeCache's 48 KB torch.full, in practice, which is where an
+    RTX 3060 pair died with "CUDA error: invalid argument" and the registration nowhere in
+    the traceback. torch.cuda.synchronize() does NOT clear that slot, which is exactly what
+    the previous version of this test could not see: it asserted that synchronize was called.
+    """
+    from freetoken.utils.torch_utils import clear_cuda_error
+
+    dev = torch.device("cuda:0")
+    torch.full((4, 4), -1, dtype=torch.int32, device=dev)  # make the context
+
+    # 0x1 is not a host allocation: the driver refuses with cudaErrorInvalidValue, and the
+    # error stands until something reads it.
+    assert int(torch.cuda.cudart().cudaHostRegister(0x1, 4096, 0)) != 0
+
+    torch.cuda.synchronize()  # the old clear: returns success, leaves the slot set
+    clear_cuda_error()
+    torch.full((24, 128), -1, dtype=torch.int32, device=dev)  # must not raise
+
+
+def test_every_refused_register_flag_is_cleared(monkeypatch):
+    """Clear after each refusal, not only when they all fail.
+
+    Two hosts to survive: one that refuses flags=0 and takes ReadOnly (the clear has to run
+    even though the bank ends up registered), and one that refuses both -- an RTX 3060 pair
+    whose cudaDevAttrHostRegisterReadOnlySupported is 0, where registering nothing at all is
+    a supported state and must not poison the context.
+    """
+    import freetoken.moe.mapped_bank as mb
+
+    for accepts in (0x08, None):
+        attempts, cleared = [], []
+
+        class _Cudart:
+            def cudaHostRegister(self, addr, nbytes, flags):
+                attempts.append(flags)
+                return 0 if flags == accepts else 1
+
+        monkeypatch.setattr(torch.cuda, "cudart", lambda: _Cudart())
+        monkeypatch.setattr(mb, "clear_cuda_error", lambda: cleared.append(len(attempts)))
+
+        bank = _bare_bank()
+        bank._settle(offset=0, nbytes=4096, block_bytes=4096, register=True)
+
+        assert attempts[0] == 0x08, f"read-only first, got {attempts}"
+        assert len(cleared) == sum(1 for f in attempts if f != accepts), (attempts, cleared)
+        assert bank.registered_bytes == (4096 if accepts is not None else 0)
+
+
+def test_a_short_mlock_is_reported_not_swallowed():
+    """RLIMIT_MEMLOCK stops the lock partway and the run keeps going on evictable pages.
+
+    The report this came from asked for 24 GiB per rank and got 7.8 (systemd's default limit
+    is MAX(64M, RAM/8)); the summary line said "7.8 GiB locked resident" and explained
+    nothing, so two thirds of the resident half was quietly page cache.
+    """
+    import ctypes as _ctypes
+
+    class _Libc:
+        def mlock(self, addr, span):
+            _ctypes.set_errno(12)  # ENOMEM, what the limit gives
+            return -1
+
+    bank = _bare_bank(libc=_Libc())
+    bank._settle(offset=0, nbytes=4096, block_bytes=4096, register=False)
+
+    assert bank.requested_bytes == 4096, "what the placement wanted"
+    assert bank.locked_bytes == 0, "what the OS gave"
+    assert bank.lock_errno == 12

@@ -10,6 +10,69 @@ import triton
 import triton.language as tl
 
 from freetoken.kernel.triton.attention import _dequant_tile
+from freetoken.utils import init_logger
+from freetoken.utils.torch_utils import clear_cuda_error
+
+logger = init_logger(__name__)
+
+try:  # triton >= 3.0
+    from triton.runtime.errors import OutOfResources as _OUT_OF_RESOURCES
+except ImportError:  # pragma: no cover - older triton raises a plain error
+
+    class _OUT_OF_RESOURCES(Exception):  # noqa: N801
+        pass
+
+
+# Shared memory per block, by what the profile asks for. Wider tiles and deeper pipelining
+# read more of the KV slab at once, so both are ways down. Order matters: BLOCK_N is worth
+# more than num_stages (it is what the profile was chosen for), so give up the pipelining
+# first and only then halve the tile.
+_LADDER_DESC = "BLOCK_N/num_stages: (n,2) -> (n,1) -> (n/2,2) -> (n/2,1) -> (16,2) -> (16,1)"
+
+# key -> the profile that was accepted, so the exception is paid once per shape and not once
+# per layer per token.
+_ACCEPTED: dict[tuple, tuple[int, int, int, int]] = {}
+_REFUSED: set[tuple] = set()
+
+
+def _profile_ladder(key, block_n: int, target_splits: int, partial_warps: int):
+    """The tuned profile first, then progressively cheaper ones."""
+    if key in _ACCEPTED:
+        yield _ACCEPTED[key]
+        return
+    seen = set()
+    for width in (block_n, block_n // 2, 16):
+        if width < 16 or width in seen:
+            continue
+        seen.add(width)
+        # the narrow tile is the tuned decode profile, which pairs 16 with four warps
+        warps = partial_warps if width == block_n else (4 if width == 16 else partial_warps)
+        for stages in (2, 1):
+            yield width, target_splits, warps, stages
+
+
+def _note_refusal(key, block_n, target_splits, warps, stages, exc) -> None:
+    seen = (key, block_n, stages)
+    if seen in _REFUSED:
+        return
+    _REFUSED.add(seen)
+    logger.warning_rank0(
+        f"qsa_sparse: BLOCK_N={block_n} num_stages={stages} does not fit this device's "
+        f"shared memory ({exc}); stepping the tile down"
+    )
+
+
+def _remember(key, block_n, target_splits, warps, stages) -> None:
+    if key in _ACCEPTED:
+        return
+    _ACCEPTED[key] = (block_n, target_splits, warps, stages)
+    tuned_block_n = key[-2]
+    if (block_n, stages) != (tuned_block_n, 2):
+        logger.info_rank0(
+            f"qsa_sparse: BLOCK_N={block_n} num_stages={stages} num_warps={warps} for "
+            f"{key[2]} heads x {key[3]} dim, top-k {key[5]}, QBITS={key[1]} "
+            f"(tuned profile was BLOCK_N={tuned_block_n} num_stages=2)"
+        )
 
 
 @triton.jit
@@ -351,77 +414,120 @@ def qsa_sparse_paged_attention(
     else:
         block_n, target_splits, partial_warps = 64, 1, 2
 
-    num_tiles = triton.cdiv(logical_indices.shape[1], block_n)
-    # Avoid empty splits when the selection width is smaller than the profile.
-    max_useful_splits = 1 << (num_tiles.bit_length() - 1)
-    num_splits = min(max_useful_splits, target_splits)
-
-    # Split=1 writes output directly and compiles out all workspace accesses.
-    if num_splits == 1:
-        partial_output = out
-        partial_lse = out
-    else:
-        # FP32 partials preserve accuracy when merging independently normalized
-        # splits.
-        partial_output = torch.empty(
-            (num_splits, *q.shape), dtype=torch.float32, device=q.device
-        )
-        partial_lse = torch.empty(
-            (num_splits, q.shape[0], q.shape[1]),
-            dtype=torch.float32,
-            device=q.device,
-        )
-
-    partial_grid = (q.shape[0], k_cache.shape[2], num_splits)
-    _qsa_sparse_paged_gqa_splitk_kernel[partial_grid](
-        q,
-        k_cache,
-        v_cache,
-        # unquantized: the slab stands in for the scale pointer (QBITS == 0 prunes every use)
-        k_scales if k_scales is not None else k_cache,
-        v_scales if v_scales is not None else v_cache,
-        logical_indices,
-        block_table,
-        token_to_req,
-        partial_output,
-        partial_lse,
-        out,
-        q.stride(0),
-        q.stride(1),
-        k_cache.stride(0),
-        k_cache.stride(1),
-        k_cache.stride(2),
-        v_cache.stride(0),
-        v_cache.stride(1),
-        v_cache.stride(2),
-        k_scales.stride(0) if k_scales is not None else 0,
-        k_scales.stride(1) if k_scales is not None else 0,
-        k_scales.stride(2) if k_scales is not None else 0,
-        v_scales.stride(0) if v_scales is not None else 0,
-        v_scales.stride(1) if v_scales is not None else 0,
-        v_scales.stride(2) if v_scales is not None else 0,
-        logical_indices.stride(0),
-        block_table.stride(0),
-        out.stride(0),
-        out.stride(1),
-        q.shape[0],
-        k_cache.shape[0],
-        block_table.shape[0],
-        QBITS=0 if kv_quant is None else kv_quant.bits,
-        QBLOCK=1 if kv_quant is None else kv_quant.block,
-        TOPK=logical_indices.shape[1],
-        PAGE_SIZE=k_cache.shape[1],
-        PAGE_TABLE_WIDTH=block_table.shape[1],
-        GROUP_SIZE=group_size,
-        HEAD_DIM=q.shape[2],
-        NUM_QUERY_HEADS=q.shape[1],
-        NUM_SPLITS=num_splits,
-        NUM_TILES=num_tiles,
-        BLOCK_M=block_m,
-        BLOCK_N=block_n,
-        num_warps=partial_warps,
-        num_stages=2,
+    # ...and GB300 has 227 KiB of shared memory per block. A 3060 has 99, and the prefill
+    # profile above wants more than that for some shapes: Triton refuses the launch with
+    # OutOfResources before it touches the GPU, which killed Qwen3.8-Flash-Next on two of
+    # them on the first request (the boot itself was clean, and the decode profile -- the
+    # narrow tile -- captures and replays fine, so nothing looks wrong until someone asks a
+    # question). The tuned profile cannot be the only one on offer.
+    #
+    # So: try it, and on a refusal step down and try again. The refusal is raised while
+    # loading the compiled module, so nothing has run and a retry is safe. Step-downs are
+    # remembered per (device, shape, profile) -- a decode step calls this once per layer, and
+    # paying an exception each time would cost more than the tile ever saved.
+    key = (
+        q.device.index,
+        0 if kv_quant is None else kv_quant.bits,
+        q.shape[1],
+        q.shape[2],
+        k_cache.shape[1],
+        logical_indices.shape[1],
+        block_m,
+        block_n,
+        target_splits,
     )
+    for block_n, target_splits, partial_warps, num_stages in _profile_ladder(
+        key, block_n, target_splits, partial_warps
+    ):
+        num_tiles = triton.cdiv(logical_indices.shape[1], block_n)
+        # Avoid empty splits when the selection width is smaller than the profile.
+        max_useful_splits = 1 << (num_tiles.bit_length() - 1)
+        num_splits = min(max_useful_splits, target_splits)
+
+        # Split=1 writes output directly and compiles out all workspace accesses.
+        if num_splits == 1:
+            partial_output = out
+            partial_lse = out
+        else:
+            # FP32 partials preserve accuracy when merging independently normalized
+            # splits.
+            partial_output = torch.empty(
+                (num_splits, *q.shape), dtype=torch.float32, device=q.device
+            )
+            partial_lse = torch.empty(
+                (num_splits, q.shape[0], q.shape[1]),
+                dtype=torch.float32,
+                device=q.device,
+            )
+
+        partial_grid = (q.shape[0], k_cache.shape[2], num_splits)
+        try:
+            _qsa_sparse_paged_gqa_splitk_kernel[partial_grid](
+                q,
+                k_cache,
+                v_cache,
+                # unquantized: the slab stands in for the scale pointer (QBITS == 0 prunes every use)
+                k_scales if k_scales is not None else k_cache,
+                v_scales if v_scales is not None else v_cache,
+                logical_indices,
+                block_table,
+                token_to_req,
+                partial_output,
+                partial_lse,
+                out,
+                q.stride(0),
+                q.stride(1),
+                k_cache.stride(0),
+                k_cache.stride(1),
+                k_cache.stride(2),
+                v_cache.stride(0),
+                v_cache.stride(1),
+                v_cache.stride(2),
+                k_scales.stride(0) if k_scales is not None else 0,
+                k_scales.stride(1) if k_scales is not None else 0,
+                k_scales.stride(2) if k_scales is not None else 0,
+                v_scales.stride(0) if v_scales is not None else 0,
+                v_scales.stride(1) if v_scales is not None else 0,
+                v_scales.stride(2) if v_scales is not None else 0,
+                logical_indices.stride(0),
+                block_table.stride(0),
+                out.stride(0),
+                out.stride(1),
+                q.shape[0],
+                k_cache.shape[0],
+                block_table.shape[0],
+                QBITS=0 if kv_quant is None else kv_quant.bits,
+                QBLOCK=1 if kv_quant is None else kv_quant.block,
+                TOPK=logical_indices.shape[1],
+                PAGE_SIZE=k_cache.shape[1],
+                PAGE_TABLE_WIDTH=block_table.shape[1],
+                GROUP_SIZE=group_size,
+                HEAD_DIM=q.shape[2],
+                NUM_QUERY_HEADS=q.shape[1],
+                NUM_SPLITS=num_splits,
+                NUM_TILES=num_tiles,
+                BLOCK_M=block_m,
+                BLOCK_N=block_n,
+                num_warps=partial_warps,
+                num_stages=num_stages,
+            )
+        except _OUT_OF_RESOURCES as exc:
+            # Nothing has run: Triton raises this from _init_handles, while it loads the
+            # compiled module, so the next profile starts from the same state -- except for
+            # the driver error the refused load leaves in this thread's slot. Left there it
+            # surfaces later and elsewhere: a tensor destructor rethrowing it as
+            # "terminate called after throwing c10::AcceleratorError" killed a whole pytest
+            # process two files after the refusal.
+            clear_cuda_error()
+            _note_refusal(key, block_n, target_splits, partial_warps, num_stages, exc)
+            continue
+        _remember(key, block_n, target_splits, partial_warps, num_stages)
+        break
+    else:
+        raise RuntimeError(
+            "qsa_sparse: no tile profile fits this device's shared memory "
+            f"(tried {_LADDER_DESC})"
+        )
     if num_splits == 1:
         return out
 

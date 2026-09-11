@@ -36,8 +36,12 @@ import threading
 import time
 import warnings
 
+from freetoken.utils.torch_utils import clear_cuda_error
+
 MAGIC = b"FTMB"
 VERSION = 1
+
+
 # A block this small per layer is kept whole rather than split hot/cold. The global-scale
 # blocks are 2.5 and 5 kB per expert row, so a fault on one reads a whole readahead window
 # (256 kB, the measured optimum) to use a few kilobytes -- about 13% of the I/O a cold expert
@@ -286,6 +290,8 @@ class MappedBanks:
         self._libc = ctypes.CDLL("libc.so.6", use_errno=True) if os.name == "posix" else None
         self._registered: list[int] = []
         self.locked_bytes = 0
+        self.requested_bytes = 0  # what the placement wanted locked; locked_bytes is what the OS gave
+        self.lock_errno = 0  # last mlock failure, 0 when every lock succeeded
         self.whole_blocks = 0
         self.registered_bytes = 0
         self.sources: dict[str, list] = {}
@@ -386,10 +392,17 @@ class MappedBanks:
         if nbytes:
             self._advise(getattr(mmap, "MADV_WILLNEED", None), offset, nbytes, limit)
             addr = self._base + offset
-            if self._libc is not None and self._libc.mlock(
-                ctypes.c_void_p(addr), ctypes.c_size_t(nbytes)
-            ) == 0:
+            self.requested_bytes += nbytes
+            if self._libc is None:
+                pass
+            elif self._libc.mlock(ctypes.c_void_p(addr), ctypes.c_size_t(nbytes)) == 0:
                 self.locked_bytes += nbytes
+            else:
+                # RLIMIT_MEMLOCK, near certainly: systemd's default is MAX(64M, RAM/8), so a
+                # 64 GB host stops at 8 GiB of the 24 GiB --moe-bank-ram asks for and the rest
+                # is evictable page cache. Silence here cost a bug report: the summary said
+                # "7.8 GiB locked resident" against a 24 GiB budget and explained nothing.
+                self.lock_errno = ctypes.get_errno()
         if not nbytes:
             return
         addr = self._base + offset
@@ -403,18 +416,26 @@ class MappedBanks:
         # cudaHostRegisterReadOnly (0x08) is the flag for exactly this case. Ask for it first
         # and keep plain as the fallback for a driver that does not know the flag.
         #
-        # Every failed attempt leaves a sticky cudaErrorMemoryAllocation on the context, and
-        # the next allocation of any size dies with "CUDA error: out of memory" -- a 48 KB
-        # tensor in OffloadMoeCache, in practice. Clear it after each failure, not only when
-        # they all fail: the path that mattered was flags=0 failing and 0x08 succeeding, which
-        # reported the bank as registered and then killed the boot.
+        # Every failed attempt leaves its error in this thread's slot, and the next kernel
+        # launch of any size reports it -- a 48 KB tensor in OffloadMoeCache, in practice,
+        # with the registration nowhere in the traceback. Clear it after each failure, and
+        # clear it with cudaGetLastError: torch.cuda.synchronize() does NOT reset that slot
+        # (measured), which is why a host that refuses BOTH flags still died here.
+        #
+        # A host can refuse both. cudaHostRegisterReadOnly needs
+        # cudaDevAttrHostRegisterReadOnlySupported, which is 0 on some driver/platform
+        # combinations (an RTX 3060 pair on native Ubuntu with the open kernel module, in the
+        # report this was found in), and flags=0 then fails with cudaErrorInvalidValue because
+        # read-write pinning is what a read-only file mapping cannot give. Registering nothing
+        # is a supported state -- attach() sends every miss to the CPU executor -- so this
+        # must return quietly, not poison the context.
         cudart = torch.cuda.cudart()
         for flags in (0x08, 0):
             if int(cudart.cudaHostRegister(addr, nbytes, flags)) == 0:
                 self.registered_bytes += nbytes
                 self._registered.append(addr)
                 return
-            torch.cuda.synchronize()  # clear the sticky error this attempt left
+            clear_cuda_error()
 
     def _advise(self, option, start: int, length: int, limit: int) -> None:
         if option is None or length <= 0:
@@ -449,11 +470,12 @@ class MappedTier:
     it is 31.7 GiB per rank, and a start that only changed the port should not pay it.
     """
 
-    def __init__(self, placement, path: str, layers, log=None):
+    def __init__(self, placement, path: str, layers, log=None, warn=None):
         self.placement = placement
         self.path = path
         self.layers = list(layers)
         self.log = log or (lambda _msg: None)
+        self.warn = warn or self.log
         self._writer: MappedBankWriter | None = None
         self._layout: MappedBankLayout | None = None
         self._reuse = False
@@ -534,6 +556,20 @@ class MappedTier:
             + (", whole file preloaded" if b.preloaded else "")
             + f" ({b.settle_seconds:.0f} s)"
         )
+        if b.lock_errno:
+            import resource
+
+            soft, hard = resource.getrlimit(resource.RLIMIT_MEMLOCK)
+            inf = resource.RLIM_INFINITY
+            shown = "unlimited" if soft == inf else f"{soft / 2**30:.2f} GiB"
+            self.warn(
+                f"--moe-bank-ram: only {b.locked_bytes / 2**30:.1f} of the "
+                f"{b.requested_bytes / 2**30:.1f} GiB this rank asked to keep resident is "
+                f"locked -- mlock: {os.strerror(b.lock_errno)}. RLIMIT_MEMLOCK is {shown} "
+                f"per process (`ulimit -l`); the rest stays evictable page cache and comes "
+                f"back from disk under pressure. Raise the limit to at least "
+                f"{b.requested_bytes / 2**30:.0f} GiB or lower --moe-bank-ram"
+            )
 
 
     @property

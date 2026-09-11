@@ -1958,10 +1958,23 @@ class Engine:
         try:
             per_token, free_before = self._measure_prefill_transient(probe)
         except Exception as exc:  # noqa: BLE001 -- a probe that fails must not stop the boot
-            logger.info_rank0(
+            note = (
                 f"--prefill-chunk-budget: probe failed ({type(exc).__name__}: {exc}); "
                 f"keeping --max-prefill-length {configured}"
             )
+            # Most probe failures cost only the measurement. OutOfResources does not: the
+            # probe runs a real prefill, so a kernel that cannot be launched here cannot be
+            # launched by the first request either, and the run will die the moment someone
+            # uses it. That was reported as "loads fine, no response ever comes", with this
+            # line sitting in the log at INFO an hour earlier.
+            if type(exc).__name__ == "OutOfResources":
+                logger.warning_rank0(
+                    f"{note}. This is not only the probe: the prefill it runs is a real "
+                    "forward, so the first request will fail the same way. The engine is "
+                    "starting anyway, but expect it to die on first use"
+                )
+            else:
+                logger.info_rank0(note)
             per_token, free_before, failed = 0.0, 0, 1.0
         if getattr(config, "is_pp", False):  # duck-typed test configs omit it
             # Every rank must chunk a prefill the same way: the residual a rank hands on is
@@ -2208,6 +2221,7 @@ class Engine:
             ),
             layers,
             log=logger.info_rank0,
+            warn=logger.warning_rank0,
         )
 
     def _write_moe_stats(self) -> None:
