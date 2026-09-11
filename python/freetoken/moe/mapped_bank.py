@@ -289,6 +289,8 @@ class MappedBanks:
         self._map = mmap.mmap(self._fd, 0, access=mmap.ACCESS_READ)
         self._libc = ctypes.CDLL("libc.so.6", use_errno=True) if os.name == "posix" else None
         self._registered: list[int] = []
+        self.hot_blocks = 0
+        self.registered_blocks = 0
         self.locked_bytes = 0
         self.requested_bytes = 0  # what the placement wanted locked; locked_bytes is what the OS gave
         self.lock_errno = 0  # last mlock failure, 0 when every lock succeeded
@@ -364,6 +366,23 @@ class MappedBanks:
         self.settle_seconds = time.perf_counter() - started
         self.preloaded = preload
 
+    @property
+    def fully_registered(self) -> bool:
+        """Whether prefix_pinned_rows can be believed.
+
+        It is one number for every layer and every block: rows [0, hot) are device
+        addressable, everywhere. A single block that failed to register makes it a lie, and
+        the hybrid path then fetches a row the GPU has no address for -- an illegal access
+        inside the decode graph, which is how the restriction was found in the first place.
+
+        Registration is all-or-nothing in the cases seen so far: a host either takes the
+        flag or does not. It stops being all-or-nothing as soon as a limit is reached
+        partway through 24 GiB of blocks, and there is nothing in the summary line to show
+        it -- the bytes look registered. Partly registered is not a state the cache can be
+        told about; attach() treats it as none.
+        """
+        return self.hot_blocks > 0 and self.registered_blocks == self.hot_blocks
+
     @staticmethod
     def _touch(buf, offset: int, span: int) -> None:
         """Fault one block in, a byte per page. The sum is only there to make the reads
@@ -393,6 +412,7 @@ class MappedBanks:
             self._advise(getattr(mmap, "MADV_WILLNEED", None), offset, nbytes, limit)
             addr = self._base + offset
             self.requested_bytes += nbytes
+            self.hot_blocks += 1
             if self._libc is None:
                 pass
             elif self._libc.mlock(ctypes.c_void_p(addr), ctypes.c_size_t(nbytes)) == 0:
@@ -433,6 +453,7 @@ class MappedBanks:
         for flags in (0x08, 0):
             if int(cudart.cudaHostRegister(addr, nbytes, flags)) == 0:
                 self.registered_bytes += nbytes
+                self.registered_blocks += 1
                 self._registered.append(addr)
                 return
             clear_cuda_error()
@@ -556,6 +577,14 @@ class MappedTier:
             + (", whole file preloaded" if b.preloaded else "")
             + f" ({b.settle_seconds:.0f} s)"
         )
+        if b.registered_bytes and not b.fully_registered:
+            self.warn(
+                f"--moe-bank-ram: only {b.registered_blocks} of {b.hot_blocks} resident "
+                f"blocks could be registered, and a bank registered in part cannot be told "
+                f"apart from an unregistered one by the cache -- every decode miss goes to "
+                f"the CPU executor. Lower --moe-bank-ram, or FREETOKEN_BANK_REGISTER=none "
+                f"to stop asking"
+            )
         if b.lock_errno:
             import resource
 
@@ -586,7 +615,7 @@ class MappedTier:
         ]
         if self.banks is None:
             return
-        if self.banks.registered_bytes:
+        if self.banks.fully_registered:
             # Only rows [0, hot) are cudaHostRegistered; the rest is host memory the device
             # has no address for, and a GPU fetch of one is an illegal access inside the
             # decode graph (which is how this was found). Telling the cache where the
@@ -600,7 +629,8 @@ class MappedTier:
                 f"per layer; the rest decode on the CPU"
             )
             return
-        # Nothing registered: no row has a device address, so every miss goes to the CPU.
+        # Nothing registered -- or not every block, which the cache has no way to express:
+        # no row can be assumed to have a device address, so every miss goes to the CPU.
         # BOTH knobs have to go to zero -- ensure_experts_hybrid fetches ``hybrid_max_fetch``
         # misses, OR ``~hybrid_fetch_fraction * misses`` when the fraction is set, and
         # --moe-hybrid-max-fetch auto sets the fraction.

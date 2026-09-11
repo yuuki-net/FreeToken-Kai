@@ -208,13 +208,18 @@ class _FakeCache:
         self.hybrid_fetch_fraction = 0.194
 
 
-def _tier(tmp_path, registered, hot=4):
+def _tier(tmp_path, registered, hot=4, blocks=6, registered_blocks=None):
     from freetoken.moe.mapped_bank import MappedTier
 
     _, p, _, path = _built(tmp_path, hot=hot)
     tier = MappedTier(p, path, list(range(3)))
     tier.banks = MappedBanks(path, register=False)
     tier.banks.registered_bytes = registered
+    tier.banks.hot_blocks = blocks
+    # every resident block registered unless the caller is asking for the partial case
+    tier.banks.registered_blocks = (
+        blocks if registered_blocks is None and registered else registered_blocks or 0
+    )
     return tier
 
 
@@ -231,6 +236,25 @@ def test_a_registered_prefix_keeps_the_pcie_fetch_and_bounds_it(tmp_path):
     assert cache.hybrid_fetch_fraction == pytest.approx(0.194)
     # ... but only rows the device can address are eligible
     assert cache.prefix_pinned_rows == 4
+
+
+def test_a_bank_registered_in_part_is_treated_as_not_registered(tmp_path):
+    """prefix_pinned_rows は層にもブロックにも 1 つしかない。
+
+    それは「行 [0, hot) はどこでもデバイスから触れる」という主張で、1 ブロックでも登録に
+    失敗していれば嘘になる。嘘になった先は decode graph の中の illegal access なので、
+    そこまで行かせない。いまのところ登録は全部通るか全部断られるかのどちらかだが、
+    24 GiB ぶんのブロックの途中で上限に当たればそうではなくなる。
+    """
+    tier = _tier(tmp_path, registered=1 << 20, blocks=6, registered_blocks=5)
+    cache = _FakeCache()
+    try:
+        tier.attach(cache, device="cpu")
+    finally:
+        tier.banks.close()
+    assert cache.prefix_pinned_rows is None
+    assert cache.hybrid_max_fetch == 0
+    assert cache.hybrid_fetch_fraction == 0.0
 
 
 def test_nothing_registered_falls_back_to_the_cpu_for_every_miss(tmp_path):
@@ -297,6 +321,7 @@ def _bare_bank(libc=None):
     bank.locked_bytes = bank.requested_bytes = bank.registered_bytes = 0
     bank.lock_errno = 0
     bank._registered = []
+    bank.hot_blocks = bank.registered_blocks = 0
     return bank
 
 
