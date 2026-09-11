@@ -17,8 +17,9 @@ Stores the paged KV cache as block-quantized codes instead of 16-bit floats.
 It buys VRAM. On an RTX 2060 6 GB serving Ornith-1.5-35B-A3B at 64k, the KV goes from
 1.25 GiB to 0.35 GiB, and `--moe-cache-auto` turns that into expert slots: 358 to 902.
 
-**It does not buy speed, and past a few thousand tokens of context it costs speed.** Measured
-on that card with `tools/longctx.py`, four configurations, two runs each:
+**It does not buy decode speed, and past a few thousand tokens of context it costs decode
+speed.** (Prefill is a separate story and it changed -- see below.) Measured on that card with
+`tools/longctx.py`, four configurations, two runs each:
 
 | context | 16-bit KV | `q4_0` |
 |---|---|---|
@@ -26,8 +27,22 @@ on that card with `tools/longctx.py`, four configurations, two runs each:
 | ~30k | **20.2 / 20.3 tok/s** | **13.6 / 13.5 tok/s** |
 
 Decode reads the whole KV every step, so at 30k it dequantizes 30k tokens of codes per step
-across every full-attention layer. Prefill pays too: 210 s against 242 s for the same 30k
-prompt. Both results reproduced on every run.
+across every full-attention layer. Both results reproduced on every run.
+
+**Prefill used to pay too -- it does not any more on a Turing card.** The old figure was 242 s
+against 210 s for the same 30k prompt; it was measured before the prefill attention was rewritten
+(`turing.md` §7), when a quantized cache also forced that path back to the fused kernel. Now the
+prefix is decoded as part of the gather, and on an RTX 2060 at 64k of context, seconds per 1k
+tokens of prompt:
+
+| prompt | 16-bit KV | `q8_0` | `q4_0` |
+|---|---|---|---|
+| ~4k | 2.39 | **2.08** | 2.59 |
+| ~20k | 2.59 | **2.13** | 2.38 |
+
+`q8_0` is now the fastest of the three at every length measured, and `q4_0` costs nothing against
+16-bit past a few thousand tokens. Ampere and later keep the fused kernel, where the older
+behaviour still applies.
 
 The deeper expert cache is real -- the VRAM hit rate went from 42.2% to 50.7% on a warm cache
 -- but on that machine it moved decode by about 2%, because most of the CPU expert work comes
@@ -70,11 +85,18 @@ when the desktop happened to be using 150 MB less VRAM. **On a machine you also 
 other things, a configuration that leaves half a gigabyte free will work some days and not
 others.**
 
+**The engine now does this for you on a single GPU.** It measures the transient per token at
+startup and solves the chunk before every prefill against the VRAM free at that moment, so the
+numbers above are what the flag used to decide and no longer what you have to. `--max-prefill-length`
+is the ceiling, not the chunk. See [prefill-chunk.md](prefill-chunk.md); with `--pp-size` the
+chunk is still fixed at startup, so the advice below still applies there. That is also what makes the
+day-to-day variation above survivable on one card: the chunk shrinks instead of the run breaking.
+
 So, if you raise the context:
 
-- pass `--max-prefill-length 4096` (or lower). On this card it is both faster and safer than
-  the 8192 default, and there is no reason to think 4096 is optimal -- it is the value that
-  worked, not a measured optimum.
+- with `--pp-size`, pass `--max-prefill-length 4096` (or lower). On this card it is both faster
+  and safer than the 8192 default, and there is no reason to think 4096 is optimal -- it is the
+  value that worked, not a measured optimum. On one GPU you can leave the ceiling alone.
 - leave real headroom. `--moe-cache-auto` hands the VRAM the KV gives back to the expert
   cache, right up to a small margin; on a desktop machine, set `--moe-cache-size` explicitly
   or lower `--memory-ratio` instead of letting it fill.

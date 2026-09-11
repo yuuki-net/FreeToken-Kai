@@ -131,10 +131,17 @@ cuBLAS, softmax in fp32, and matmul again. The whole key range is scored at once
 the plain one -- no running maximum, nothing to rescale. The query tile is sized from
 `FREETOKEN_ATTN_SCRATCH_MB` (48); `FREETOKEN_ATTN_SCRATCH=0/1` overrides the arch choice.
 
-Anything the path cannot express falls back to the fused kernel: a sliding window, attention sinks, a
-quantized cache (`--kv-cache-dtype`, whose slabs are decoded inside the kernel), the non-split call,
-an extend shorter than 128 rows (the gather would be paid for a handful of rows), and a context whose
-gathered K/V would exceed four times the score budget.
+Anything the path cannot express falls back to the fused kernel: a sliding window, attention sinks,
+the non-split call, an extend shorter than 128 rows (the gather would be paid for a handful of rows),
+and a context whose gathered K/V would exceed four times the score budget.
+
+A quantized cache (`--kv-cache-dtype`) is served here rather than handed back. The gather already
+builds a contiguous prefix matrix, so the packed rows are decoded into it once, with the same
+`dequantize_rows` the fused kernel uses tile by tile; the result is the fp16 matrix the unquantized
+path builds, and the transient does not grow (codes are smaller than what they decode to). This
+matters because on a 6 GB card `q8_0` is what buys 64k of context, and while the two were exclusive,
+taking the context gave up the attention rewrite. Codes without their scales are refused, not read
+as values.
 
 **Result.** 658 ms -> 51 ms per layer at those shapes, 6.51 TFLOPS. Attention is the prefill term
 that grows with context, so this is what flattens the curve: seconds per 1k tokens of prompt on the
@@ -195,7 +202,9 @@ Two things that look like failures but are not:
   parameters, NVFP4 experts; the CPU path reads about 0.5 GB per token at 50 GB/s). 13-14 tok/s
   for gpt-oss-20b.
 - Prefill (fp16, after changes 4-8): about 2.5 s per 1k tokens of prompt, near flat from 4k to 24k
-  (400 tok/s at 19k). Use `--dtype float16`: Turing has fp16 tensor cores but no bf16 ones (cuBLAS 19
+  (400 tok/s at 19k). With `--kv-cache-dtype q8_0` at 64k of context it is 2.1 s per 1k, flat from
+  4k to 27k (469 tok/s on a 27,061-token prompt) -- the configuration that keeps the context is also
+  the fastest one. Use `--dtype float16`: Turing has fp16 tensor cores but no bf16 ones (cuBLAS 19
   vs 3 TFLOPS). Ornith's output is unaffected by fp16.
 - Where a 2048-token chunk goes, measured with the profiler on a 6.4 s chunk before changes 7 and 8:
   GDN 2.20 s, expert streaming 1.51 s (16.93 GiB at 9.6-11.4 GB/s, which is the PCIe ceiling on this
