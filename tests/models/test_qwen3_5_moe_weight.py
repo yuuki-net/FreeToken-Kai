@@ -573,3 +573,100 @@ def test_a_checkpoint_disagreeing_with_its_quant_config_is_rejected(tmp_path, qu
     (tmp_path / "config.json").write_text(json.dumps(_config_json(True, quantization_config)))
     with pytest.raises(ValueError, match=match):
         _load(str(tmp_path))
+
+
+# --------------------------------------------------------------------------- the MTP draft head (--spec-mtp)
+
+
+def _with_mtp_head(raw: dict[str, torch.Tensor]) -> None:
+    """Add the draft head the MIXED_PRECISION exports carry: one full-attention layer with its own
+    routed experts, bf16 throughout because ``mtp*`` is on the quantizer's ignore list."""
+    raw.update({
+        "mtp.norm.weight": _bf16(H),
+        "mtp.pre_fc_norm_embedding.weight": _bf16(H),
+        "mtp.pre_fc_norm_hidden.weight": _bf16(H),
+        "mtp.fc.weight": _bf16(H, 2 * H),
+        "mtp.layers.0.input_layernorm.weight": _bf16(H),
+        "mtp.layers.0.post_attention_layernorm.weight": _bf16(H),
+        "mtp.layers.0.self_attn.q_proj.weight": _bf16(2 * QH * AHD, H),
+        "mtp.layers.0.self_attn.k_proj.weight": _bf16(KVH * AHD, H),
+        "mtp.layers.0.self_attn.v_proj.weight": _bf16(KVH * AHD, H),
+        "mtp.layers.0.self_attn.o_proj.weight": _bf16(H, QH * AHD),
+        "mtp.layers.0.self_attn.q_norm.weight": _bf16(AHD),
+        "mtp.layers.0.self_attn.k_norm.weight": _bf16(AHD),
+        "mtp.layers.0.mlp.gate.weight": _bf16(E, H),
+        "mtp.layers.0.mlp.shared_expert_gate.weight": _bf16(1, H),
+        "mtp.layers.0.mlp.shared_expert.gate_proj.weight": _bf16(I, H),
+        "mtp.layers.0.mlp.shared_expert.up_proj.weight": _bf16(I, H),
+        "mtp.layers.0.mlp.shared_expert.down_proj.weight": _bf16(H, I),
+    })
+    for expert in range(E):
+        pre = f"mtp.layers.0.mlp.experts.{expert}"
+        raw.update({f"{pre}.gate_proj.weight": _bf16(MI, H), f"{pre}.up_proj.weight": _bf16(MI, H),
+                    f"{pre}.down_proj.weight": _bf16(H, MI)})
+
+
+MTP_EXPERTS = [f"mtp.layers.0.mlp.experts.{e}.{p}_proj" for e in range(E) for p in ("gate", "up", "down")]
+
+
+def _mtp_checkpoint(tmp_path, *, quantize_experts=None) -> tuple[str, dict[str, torch.Tensor]]:
+    torch.manual_seed(len(LAYOUTS))
+    moe, quant, raw = _layout("modelopt_mixed")
+    _with_mtp_head(raw)
+    stored = dict(raw)
+    if quantize_experts is not None:
+        _quantize(raw, MTP_EXPERTS, quantize_experts)
+    return _write(tmp_path, moe, quant, raw), stored
+
+
+def test_the_draft_head_is_read_only_when_the_engine_asks_for_it(tmp_path):
+    """--spec-mtp: ``mtp.*`` is skipped exactly as upstream skips it, and yielded on request --
+    fused, (1+w)'d and stacked by the same reader that serves the decoder, because the head is off
+    the quantizer's list and so reads as stored."""
+    folder, raw = _mtp_checkpoint(tmp_path)
+    _install(folder)
+    kwargs = dict(include_moe_experts=False, include_non_moe=True)
+    assert not any(k.startswith("mtp.") for k in dict(iter_weights(folder, torch.device("cpu"), **kwargs)))
+
+    loaded = {n: t.clone() for n, t in iter_weights(folder, torch.device("cpu"), include_mtp=True, **kwargs)}
+    parts = [raw[f"mtp.layers.0.self_attn.{p}_proj.weight"] for p in "qkv"]
+    qkv = loaded["mtp.layers.0.self_attn.qkv_proj.weight"]
+    assert all(_same(p, s) for p, s in zip(parts, _slices(qkv, parts)))
+    merged = loaded["mtp.layers.0.mlp.shared_expert.gate_up_proj.weight"]
+    assert _same(merged[:I], raw["mtp.layers.0.mlp.shared_expert.gate_proj.weight"])
+    assert _same(merged[I:], raw["mtp.layers.0.mlp.shared_expert.up_proj.weight"])
+    assert torch.equal(loaded["mtp.norm.weight"], raw["mtp.norm.weight"] + 1.0)
+    assert torch.equal(loaded["mtp.pre_fc_norm_hidden.weight"], raw["mtp.pre_fc_norm_hidden.weight"] + 1.0)
+    assert _same(loaded["mtp.fc.weight"], raw["mtp.fc.weight"])  # not a Linear the reader knows: as stored
+
+    # the head's routed experts, stacked as the engine's bank quantizer takes them
+    gate_up, down = loaded["mtp.layers.0.mlp.experts.gate_up_proj"], loaded["mtp.layers.0.mlp.experts.down_proj"]
+    assert gate_up.shape == (E, 2 * MI, H) and down.shape == (E, H, MI)
+    for expert in range(E):
+        pre = f"mtp.layers.0.mlp.experts.{expert}"
+        assert _same(gate_up[expert, :MI], raw[f"{pre}.gate_proj.weight"])
+        assert _same(gate_up[expert, MI:], raw[f"{pre}.up_proj.weight"])
+        assert _same(down[expert], raw[f"{pre}.down_proj.weight"])
+    # the decoder's own experts stay with the offload cache, head or no head
+    assert not any(k.startswith("model.") and ".mlp.experts." in k for k in loaded)
+
+
+def test_a_checkpoint_without_a_draft_head_is_refused(tmp_path):
+    """The engine built the head because --spec-mtp asked for it; a checkpoint that has none must
+    say so rather than leave the head's bank layer unfilled."""
+    torch.manual_seed(len(LAYOUTS))
+    moe, quant, raw = _layout("modelopt_mixed")
+    raw.pop("mtp.layers.0.self_attn.q_proj.weight")  # the fixture's lone head tensor
+    folder = _write(tmp_path, moe, quant, raw)
+    _install(folder)
+    with pytest.raises(AssertionError, match="no mtp.layers.0.mlp.experts"):
+        list(iter_weights(folder, torch.device("cpu"), include_moe_experts=False, include_non_moe=True, include_mtp=True))
+
+
+def test_a_quantized_draft_head_is_refused(tmp_path):
+    """The engine quantizes the head's experts itself, so a pre-quantized head would be stacked
+    into the wrong format; refuse it where it is read."""
+    folder, _raw = _mtp_checkpoint(tmp_path, quantize_experts=lambda w: _nvfp4(w, ct=False))
+    _install(folder)
+    with pytest.raises(NotImplementedError, match="only an unquantized head"):
+        list(iter_weights(folder, torch.device("cpu"), include_moe_experts=False, include_non_moe=True, include_mtp=True))
