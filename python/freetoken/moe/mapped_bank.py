@@ -735,9 +735,22 @@ class MappedTier:
         """Hand over the renumbering, and keep the GPU off the rows it cannot address."""
         from freetoken.moe.bank_disk import permutation_tensor
 
-        cache.expert_perm = [
+        perm = [
             permutation_tensor(self.placement, layer, device=device) for layer in self.layers
         ]
+        # --spec-mtp appends the draft head's expert layer to the bank sources after the
+        # placement was solved (engine._append_mtp_bank), so the cache can hold one layer
+        # more than the placement has ever heard of. That layer is not renumbered -- its
+        # rows are the checkpoint's own order -- so identity is the right map for it, which
+        # is what None means to attach_offload_moe_cache.
+        #
+        # Without the padding the head's layer indexes past the end of this list and the
+        # boot dies in attach_offload_moe_cache, on whichever rank carries the head (the
+        # last one, so rank 0 of a --pp-size 2 run comes up and rank 1 does not).
+        banked = getattr(cache, "bank_sources", None)
+        if banked:
+            perm += [None] * max(len(next(iter(banked.values()))) - len(perm), 0)
+        cache.expert_perm = perm
         if self.banks is None:
             return
         if self.banks.fully_registered:

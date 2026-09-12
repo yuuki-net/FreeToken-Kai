@@ -238,6 +238,31 @@ def test_a_registered_prefix_keeps_the_pcie_fetch_and_bounds_it(tmp_path):
     assert cache.prefix_pinned_rows == 4
 
 
+def test_the_draft_head_layer_gets_the_identity_permutation(tmp_path):
+    """--spec-mtp はキャッシュのバンクをもう 1 層ぶん伸ばす（engine._append_mtp_bank）。
+
+    その層は配置が解かれたあとに足されるので再番号付けされておらず、行はチェックポイント
+    そのままの順。つまり identity が正しい写像で、attach_offload_moe_cache にとっての
+    identity は None である。
+
+    埋めないと、ドラフトヘッドの層がこのリストの終端を越えて索き、
+    **ヘッドを載せているランクだけが起動に失敗する**（`--pp-size 2` なら rank 1 だけ）。
+    2060 と 3060 の両方で `--moe-bank-ram` + `--spec-mtp` が
+    `IndexError: list index out of range` で死んでいた。
+    """
+    tier = _tier(tmp_path, registered=1 << 20)
+    cache = _FakeCache()
+    # 配置は 3 層、バンクは 4 層（末尾がドラフトヘッドの層）
+    cache.bank_sources = {"packed": [None] * 4, "scale": [None] * 4}
+    try:
+        tier.attach(cache, device="cpu")
+    finally:
+        tier.banks.close()
+    assert len(cache.expert_perm) == 4
+    assert all(p is not None for p in cache.expert_perm[:3])
+    assert cache.expert_perm[3] is None
+
+
 def test_a_bank_registered_in_part_is_treated_as_not_registered(tmp_path):
     """prefix_pinned_rows は層にもブロックにも 1 つしかない。
 
