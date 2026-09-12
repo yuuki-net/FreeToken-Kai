@@ -1,7 +1,7 @@
 # FreeToken Kai (改)
 
 An unofficial fork of [FlashML-org/FreeToken](https://github.com/FlashML-org/FreeToken),
-merged with upstream `main` at commit `fb7f732` (2026-09-10). It is not affiliated with, endorsed
+merged with upstream `main` at commit `9535656` (2026-09-12). It is not affiliated with, endorsed
 by, or supported by FlashML. The license is unchanged (Apache-2.0).
 
 The fork adds nine things upstream does not have:
@@ -249,9 +249,12 @@ head weights, and one more expert-bank layer -- the head's 256 bf16 experts (1.6
 checkpoint) are quantized to NVFP4 at load and appended to the offload cache (~0.43 GB of
 pinned host memory). Loading reads 1.6 GB of bf16 experts through host RAM once.
 
-Scope: single running request (`--max-running-req 1`); modelopt MIXED_PRECISION checkpoints
-only (fp8 attention + NVFP4 experts, the Ornith / Qwen3.6-35B-A3B-NVFP4 format). The `Spec
-decode` line in the decode status shows the mean accepted length.
+Scope: single running request (`--max-running-req 1`). The head is read the way the checkpoint
+stores it: every export that ships one leaves it off the quantizer's list, so it arrives
+unquantized and the engine quantizes its experts itself. A head the exporter did quantize is
+refused where it is read. Verified on modelopt MIXED_PRECISION (Ornith / Qwen3.6-35B-A3B-NVFP4)
+and on the Flash-Next NVFP4 export. The `Spec decode` line in the decode status shows the mean
+accepted length.
 
 CUDA graphs: the K+1-row verify window and the draft head (window pass + one chain step) are
 captured at startup and replayed per step, the way the decode step is; windows shorter than
@@ -324,8 +327,8 @@ vocabularies only (Ornith's is untied); Qwen3.5-MoE family.
 ## Known limitations
 
 - Video and the Anthropic / Responses adapters (still text-only) are not covered.
-- `--spec-mtp` serves one request at a time and reads the head from modelopt MIXED_PRECISION
-  checkpoints only; its CUDA graphs need the Triton attention backend (eager otherwise).
+- `--spec-mtp` serves one request at a time and needs a checkpoint that ships an MTP head; its
+  CUDA graphs need the Triton attention backend (eager otherwise).
 - Image prompts bypass the shared prefix cache (by upstream design), so a conversation with images
   is prefilled in full every turn.
 - `--pp-size`: the ranks run in sequence, so two cards are never faster than one card that

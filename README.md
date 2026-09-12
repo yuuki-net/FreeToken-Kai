@@ -4,7 +4,7 @@
 at the far end. A 125B MoE on two of them. A 35B MoE on an RTX 2060 6 GB.**
 
 > An unofficial fork of [FlashML-org/FreeToken](https://github.com/FlashML-org/FreeToken), merged
-> with upstream `main` at `fb7f732` (2026-09-10). Not affiliated with, endorsed by, or supported by
+> with upstream `main` at `9535656` (2026-09-12). Not affiliated with, endorsed by, or supported by
 > FlashML. The license is unchanged (Apache-2.0).
 >
 > **Please keep questions and bug reports about this fork in this repository.** The FreeToken
