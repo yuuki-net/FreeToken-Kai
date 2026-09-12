@@ -23,6 +23,12 @@ at the far end. A 125B MoE on two of them. A 35B MoE on an RTX 2060 6 GB.**
 > sparse-attention tile does not fit a GA10x card's shared memory, and nothing before that
 > request complained. See [docs/bank-ram.md](docs/bank-ram.md) and
 > [docs/kv-cache-quant.md](docs/kv-cache-quant.md). `q4_0` and 16-bit KV were never affected.
+>
+> Fixed the same day: **`--moe-bank-ram` and `--spec-mtp` could not be used together at
+> all.** The draft head's expert layer is appended to the banks after the resident placement
+> has been solved, and the renumbering list was never extended to cover it. The rank carrying
+> the head died on a bare `IndexError` -- while the other rank came up and reported its banks
+> mapped and registered.
 
 Upstream FreeToken serves one model on one GPU, on Ampere (RTX 30 series) or newer, text only.
 This fork adds nine things on top of it. They are independent — take one, ignore the rest.
@@ -30,7 +36,7 @@ This fork adds nine things on top of it. They are independent — take one, igno
 | | What it does | How you ask for it |
 |---|---|---|
 | 1 | **Two consumer GPUs, one model.** Layer split, one process per card, the residual stream handed over gloo — **no NCCL and no GPU-to-GPU peer access.** Uneven splits for cards of different sizes. | `--pp-size 2` |
-| 2 | **Half the host RAM** an offloaded MoE needs. Expert banks become a file mapping with a locked resident prefix, so 128 GB configurations run in 64 GB. | `--moe-bank-ram 48G` |
+| 2 | **Half the host RAM** an offloaded MoE needs. Expert banks become a file mapping with a locked resident prefix, so 128 GB configurations run in 64 GB. On a host whose driver will not register a read-only mapping -- and there are such hosts -- the resident rows are copied into private pages instead, so the GPU can still reach them and the VRAM expert cache still works. | `--moe-bank-ram 48G` |
 | 3 | **Turing (RTX 20 series, sm_75) support — and at the card's own speed.** Upstream requires Ampere or newer, and the assumption shows up as tiles and warp counts that a 64 KB shared-memory card cannot run: the prefill attention and the two GDN chunk kernels were at 1-3% of what the card does in fp16. Eight changes, each isolated to pre-Ampere. On an RTX 2060, prefill went from 192 to 469 tok/s on a 27k prompt and stopped falling off with context. | automatic |
 | 4 | **Image input over the OpenAI API** for checkpoints that ship a vision tower but were served text-only. The vision tower runs on the CPU, so it costs no VRAM. | send `image_url` parts |
 | 5 | **Speculative decoding with the checkpoint's own MTP head.** Verify window and draft head captured as CUDA graphs. Correctness-verified. It pays off only where a multi-row verify costs about what a single row costs: with the experts in host RAM that means long acceptance, so it wins on code and tool calls on two cards and loses on free prose and on one card. | `--spec-mtp 5` |

@@ -251,6 +251,14 @@ against a file that had fallen out of RAM. `smaps` said otherwise: both ranks ha
 110 GiB host the file never goes cold, so the disk-bound case this design was built for had not
 actually been reproduced there at all — a 64 GB host is the only place to confirm it.
 
+**Two lists that have to agree, and only one of them was extended.** `--spec-mtp` appends the
+draft head's expert layer to the bank sources *after* the resident placement has been solved.
+`layer_residency` is built from the bank sources and covered it; `expert_perm` is built from the
+placement's layers and did not. Nothing ties the two together but a comment, and the mismatch is
+invisible until an index runs off the end -- on one rank, in a traceback that names neither flag,
+while the other rank logs that everything mapped and registered. Anything added to the cache's
+banks after `MappedTier` has solved its placement has to grow the permutation list with it.
+
 The estimate that drove the design ("77% resident covers 87.5% of routes, which is fast enough")
 held up. The intermediate numbers along the way — +4 ms here, 31 ms there, "3-4x from madvise" —
 were worth about a factor of two, and should not have been quoted as if they were measurements.
