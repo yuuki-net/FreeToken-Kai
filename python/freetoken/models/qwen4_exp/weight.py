@@ -119,7 +119,7 @@ def _split_kind(name: str) -> tuple[str, str]:
 class _DenseFuser:
     """Concatenates checkpoint projection parts into the model's merged buffers, per kind (weight / block scale).
 
-    The part table is the family's packed_modules_mapping. The QuantConfig picks the GDN in_proj layout and validates each part against the scheme the model built its buffer from.
+    The part table is the family's packed_modules_mapping. The QuantConfig picks the GDN in_proj layout from the scheme the model built its buffer from, and validates each part against the scheme the checkpoint stores it under.
     """
 
     def __init__(self, quant, packed: tuple[tuple[str, tuple[str, ...]], ...]) -> None:
@@ -132,7 +132,16 @@ class _DenseFuser:
         self.buf: dict[tuple[str, str], dict[int, torch.Tensor]] = {}
 
     def scheme(self, module: str):
+        """The scheme the model builds ``module`` from -- which is what picks the GDN in_proj layout."""
         return None if self.quant is None else self.quant.scheme_for(module)
+
+    def stored(self, module: str):
+        """The scheme the checkpoint stores ``module`` under, which is not always the one above:
+        --dense-quant reports an unquantized projection as fp8 because that is what the layer
+        becomes, while the shard still holds bf16 and the engine converts it after the read."""
+        if self.quant is None:
+            return None
+        return self.quant.scheme_for_name(self.quant.name_map.to_checkpoint(module)[0])
 
     def _target(self, parent: str, leaf: str) -> tuple[str, int] | None:
         candidates = self.by_part.get(leaf)
@@ -151,8 +160,10 @@ class _DenseFuser:
         return f"{parent}.{fused}", idx
 
     def check(self, module: str, name: str, tensor: torch.Tensor) -> None:
-        """``tensor`` (checkpoint key ``name``) must match the scheme the model built ``module`` from."""
-        scheme = self.scheme(module)
+        """``tensor`` (checkpoint key ``name``) must match the scheme the checkpoint stores that
+        part under. Asking what the model built ``module`` from instead refuses every bf16
+        projection under --dense-quant, whose whole job is to report them as fp8."""
+        scheme = self.stored(_split_kind(name)[0])
         if name.endswith(".weight_scale_inv"):
             if scheme is None or not scheme.has("weight_scale_inv"):
                 raise ValueError(f"{name}: {module} has no block scale in the checkpoint's quant config ({scheme})")

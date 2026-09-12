@@ -543,3 +543,34 @@ def test_checkpoint_disagreeing_with_its_quant_config_is_rejected(tmp_path, quan
     (tmp_path / "config.json").write_text(json.dumps(_config_json(quantization_config)))
     with pytest.raises(ValueError, match=match):
         _load(str(tmp_path))
+
+
+def test_dense_quant_fp8_still_reads_the_checkpoints_own_dtypes(checkpoint_nvfp4):
+    """--dense-quant fp8 wraps the checkpoint's config and reports every projection it will convert
+    as fp8, because that is what the layer becomes. The shard still holds bf16 and the engine
+    converts after the reader hands it over, so the reader has to validate against what the
+    checkpoint stores -- while still taking the GDN layout from what the model built (split, the
+    same test gdn.py makes). Validating against the built scheme stops the boot of every
+    --dense-quant run: `in_proj_qkv.weight is torch.bfloat16 but ... declares in_proj_qkvz fp8`.
+    """
+    from freetoken.layers.quantization import LoadTimeFp8Config, get_quant_config, set_quant_config
+
+    folder, _raw = checkpoint_nvfp4
+    install_quant_config(folder)
+    inner = get_quant_config()
+    set_quant_config(LoadTimeFp8Config(inner))
+    try:
+        loaded = {
+            name: tensor
+            for name, tensor in iter_weights(
+                folder, torch.device("cpu"), include_moe_experts=True, include_non_moe=True
+            )
+        }
+    finally:
+        set_quant_config(inner)
+    gdn = "model.layers.0.linear_attn"
+    assert f"{gdn}.in_proj.weight" not in loaded  # the built layout is the split one
+    assert loaded[f"{gdn}.in_proj_qkvz.weight"].dtype is torch.bfloat16
+    assert loaded[f"{gdn}.in_proj_ba.weight"].dtype is torch.bfloat16
+    assert loaded["model.layers.1.self_attn.qkv_proj.weight"].dtype is torch.bfloat16
+    assert not any(k.endswith(".weight_scale_inv") for k in loaded)  # nothing is quantized yet
