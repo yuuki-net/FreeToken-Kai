@@ -64,7 +64,13 @@ class ModelOptConfig(QuantConfig):
         return None
 
     def _scheme_of(self, algo: str) -> QuantScheme:
-        if algo in ("NVFP4", "W4A16_NVFP4"):
+        if algo == "W4A16_NVFP4":
+            # Weight-only: the activations stay 16-bit, so there is no input scale to store and
+            # with_input_scale (a statement about the quantizer, not about this module) cannot add
+            # one. nvidia's own MIXED_PRECISION exports name W4A16_NVFP4 for the dense NVFP4
+            # modules and store weight / weight_scale / weight_scale_2 only.
+            return self.SCHEMES["NVFP4_NO_INPUT"]
+        if algo == "NVFP4":
             return self.SCHEMES["NVFP4" if self.with_input_scale else "NVFP4_NO_INPUT"]
         try:
             return self.SCHEMES[algo]

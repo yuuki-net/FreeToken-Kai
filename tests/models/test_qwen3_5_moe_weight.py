@@ -409,15 +409,17 @@ def test_modelopt_fp8_scales_broadcast_per_part_and_input_scale_is_the_max(check
     assert torch.equal(scale, expected)
     assert torch.equal(loaded["model.layers.1.self_attn.qkv_proj.input_scale"], torch.stack([raw[f"{attn}.{p}_proj.input_scale"] for p in "qkv"]).max())
     assert loaded["model.layers.1.self_attn.o_proj.input_scale"].shape == ()
-    # NVFP4 shared expert: each part keeps its own block scales and global; the input scale is the max of the parts
+    # NVFP4 shared expert: each part keeps its own block scales and global
     shared = f"{LM}.layers.0.mlp.shared_expert"
     fused = "model.layers.0.mlp.shared_expert.gate_up_proj"
     assert _same(loaded[f"{fused}.weight"][:I], raw[f"{shared}.gate_proj.weight"])
     assert _same(loaded[f"{fused}.weight_scale"][I:], raw[f"{shared}.up_proj.weight_scale"])
     glob = loaded[f"{fused}.weight_global"]
     assert glob.dtype is torch.float16 and torch.equal(glob[:I], raw[f"{shared}.gate_proj.weight_scale_2"].to(torch.float16).expand(I))
-    assert torch.equal(loaded[f"{fused}.input_scale"], torch.stack([raw[f"{shared}.{p}_proj.input_scale"] for p in ("gate", "up")]).max())
-    assert loaded["lm_head.input_scale"].shape == ()
+    # W4A16 is weight-only: this export stores an input_scale the algorithm has no use for (and
+    # nvidia's own exports store none), so it is dropped and the layer allocates no buffer for it
+    assert f"{fused}.input_scale" not in loaded
+    assert "lm_head.input_scale" not in loaded  # W4A16 too
     assert loaded["lm_head.weight"].dtype is torch.uint8 and loaded["lm_head.weight_global"].shape == (V,)
 
 
@@ -670,3 +672,19 @@ def test_a_quantized_draft_head_is_refused(tmp_path):
     _install(folder)
     with pytest.raises(NotImplementedError, match="only an unquantized head"):
         list(iter_weights(folder, torch.device("cpu"), include_moe_experts=False, include_non_moe=True, include_mtp=True))
+
+
+def test_a_w4a16_export_has_no_activation_scale_to_store(tmp_path):
+    """W4A16_NVFP4 is weight-only: the activations stay 16-bit, so the dense NVFP4 modules of
+    nvidia's MIXED_PRECISION exports carry weight / weight_scale / weight_scale_2 and nothing else.
+    Waiting for an input_scale there leaves every shared expert and lm_head unfilled, which is how
+    the real Ornith-1.5-35B-A3B-NVFP4 checkpoint stopped loading."""
+    torch.manual_seed(len(LAYOUTS) + 1)
+    moe, quant, raw = _layout("modelopt_mixed")
+    for module in SHARED + ["lm_head"]:
+        assert raw.pop(f"{module}.input_scale", None) is not None, module
+    folder = _write(tmp_path, moe, quant, raw)
+    loaded = _load(folder)
+    assert set(loaded) == set(_meta_state_dict(folder))
+    assert not any(k.endswith(".input_scale") for k in loaded if "shared_expert" in k or k.startswith("lm_head"))
+    assert loaded["model.layers.1.self_attn.qkv_proj.input_scale"].shape == ()  # the fp8 half still has one
