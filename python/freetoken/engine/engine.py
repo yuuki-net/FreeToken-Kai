@@ -821,6 +821,103 @@ class Engine:
             self._premap_vram()
         if config.is_pp:
             self._resettle_pipeline_prefill_chunk(config)
+        self._prefill_group = self._init_prefill_group(config)
+
+    def _init_prefill_group(self, config: EngineConfig):
+        """--pp-prefill-group (engine/prefill_group.py): the holder of deferred chunks on the
+        rank that groups them, else None."""
+        from freetoken.engine.prefill_group import PrefillGroup, unusable_reason
+
+        size = int(getattr(config, "pp_prefill_group", 1) or 1)
+        reason = unusable_reason(
+            size=size, pp_comm=self.pp_comm, max_running_req=config.max_running_req,
+            model=self.model, offload_cache=self.moe_offload_cache,
+        )
+        if reason is None:
+            logger.info(f"--pp-prefill-group: up to {size} prefill chunks per expert-bank pass on this rank")
+            return PrefillGroup(size)
+        if size > 1 and not (self.pp_comm is not None and self.pp_comm.is_first):
+            logger.warning(f"--pp-prefill-group {size} is off on this rank: {reason}")
+        return None
+
+    def flush_deferred_prefill(self) -> None:
+        """Run the prefill chunks --pp-prefill-group is holding, if any: every local layer over
+        every chunk in order, then the draft head over each chunk. Call on the engine stream."""
+        group = getattr(self, "_prefill_group", None)
+        if group is None or not group.chunks:
+            return
+        chunks = group.take()
+        logger.info(
+            f"grouped prefill: {len(chunks)} chunks, {sum(c.rows for c in chunks)} tokens, "
+            f"from position {chunks[0].batch.reqs[0].cached_len - chunks[0].rows}"
+        )
+        hiddens = self.model.forward_prefill_group(chunks)
+        mtp = getattr(self.model, "mtp", None) if self.spec_k > 0 else None
+        if mtp is not None:
+            for k, (chunk, hidden) in enumerate(zip(chunks, hiddens)):
+                # The head's successor id for the chunk's last row. A chunk's own ids end at its
+                # last row (ChunkedReq keeps the prompt only up to the chunk), so the forward path
+                # uses the rank's sample there; a held chunk has no sample. The next held chunk's
+                # first id is the true next token; past the group's last chunk it is not scheduled
+                # yet, so the target's greedy token stands in. Either way it is one row of the
+                # head's KV: it moves draft acceptance, never the output.
+                if k + 1 < len(chunks):
+                    successor = int(chunks[k + 1].batch.input_ids[0].item())
+                else:
+                    successor = self.model.prefill_group_next_token(hidden)
+                self.model.set_last_hidden(hidden)
+                # a non-final chunk only extends the head's KV (no drafting)
+                self._mtp_draft(chunk.batch, chunk.rows, row=chunk.rows - 1, next_token=successor, draft=False)
+        if self.cpu_moe_executor is not None:
+            self.cpu_moe_executor.raise_if_unhealthy()
+
+    @property
+    def holds_deferred_prefill(self) -> bool:
+        group = getattr(self, "_prefill_group", None)
+        return group is not None and bool(group.chunks)
+
+    def _maybe_defer_prefill(self, batch: Batch) -> ForwardOutput | None:
+        """--pp-prefill-group, before a forward: hold ``batch`` when it is a chunk the group may
+        take (its output), else run what is held first and return None -- the held chunks are
+        older than ``batch`` and anything else may read their state."""
+        group = getattr(self, "_prefill_group", None)
+        if group is None:
+            return None
+        from freetoken.engine.prefill_group import groupable
+        from freetoken.layers.moe import cpu_prefill_max_tokens
+
+        deferrable = groupable(batch, cpu_prefill_max_tokens=cpu_prefill_max_tokens())
+        if not (deferrable and group.accepts(batch)):
+            self.flush_deferred_prefill()
+        return self._defer_prefill_chunk(batch) if deferrable else None
+
+    def _defer_prefill_chunk(self, batch: Batch) -> ForwardOutput:
+        """Hold a prefill chunk for --pp-prefill-group: everything a forward does at its step
+        except the model -- take the residual stream, plan the pieces from the request as it is
+        now, advance the request -- and a no-token output, which the scheduler does not read for
+        a chunk. Runs the group once it is full."""
+        from freetoken.engine.prefill_group import DeferredChunk
+        from freetoken.models.prefill_pieces import plan_prefill_pieces
+
+        rows = int(batch.input_ids.numel())
+        hidden = self.pp_comm.recv_hidden(rows)  # the previous rank is blocked sending it
+        pieces = None
+        if getattr(self.model, "pp_prefill_pieces", False) and self.ctx.prefill_mixer_pieces >= 2:
+            pieces = plan_prefill_pieces(
+                batch, self.ctx.prefill_mixer_pieces, self.ctx.attn_backend, self.device,
+                self.ctx.linear_state_pool,
+            )
+        if self.spec_k > 0:
+            batch.spec_all_rows = False
+        for req in batch.reqs:
+            req.complete_one()
+        if self._prefill_group.add(DeferredChunk(batch, hidden, rows, pieces)):
+            self.flush_deferred_prefill()
+        tokens_cpu = torch.zeros(batch.size, dtype=torch.int32)
+        done = torch.cuda.Event()
+        done.record(self.stream)
+        spec_res = SpecResult([0], []) if self.spec_k > 0 else None
+        return ForwardOutput(tokens_cpu.to(self.device), tokens_cpu, done, spec_res)
 
     @staticmethod
     def _premap_enabled() -> bool:
@@ -1760,6 +1857,9 @@ class Engine:
 
     def _forward_batch(self, batch: Batch, args: BatchSamplingArgs) -> ForwardOutput:
         assert torch.cuda.current_stream() == self.stream
+        deferred = self._maybe_defer_prefill(batch)
+        if deferred is not None:
+            return deferred
         if batch.mm_gather_plan and self.encoder_cache is not None:
             self._run_mm_encoder(batch)
         use_graph = self.graph_runner.can_use_cuda_graph(batch)

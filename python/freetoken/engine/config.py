@@ -51,6 +51,10 @@ class EngineConfig:
     # The mixers set the transient that caps the chunk width, so the probe measures less and
     # the solver picks wider chunks: fewer chunks, fewer expert-bank transfers. 1 = off.
     prefill_mixer_pieces: int = 1
+    # --pp-prefill-group: the last of two pipeline ranks runs up to this many consecutive prefill
+    # chunks of one request layer by layer, streaming each offloaded expert bank once per group
+    # (engine/prefill_group.py). 1 = off.
+    pp_prefill_group: int = 1
     # --prefill-profile: log where each prefill forward's wall time goes, on every rank
     # (utils/prefill_profile.py)
     prefill_profile: bool = False

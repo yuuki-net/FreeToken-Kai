@@ -833,6 +833,20 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--pp-prefill-group",
+        type=int,
+        default=ServerArgs.pp_prefill_group,
+        help=(
+            "Qwen3.8-Flash-Next with --pp-size 2 and offloaded experts: the second rank holds up to this many "
+            "consecutive prefill chunks of a prompt and runs them layer by layer, so each layer's "
+            "expert bank is copied to its GPU once per group instead of once per chunk "
+            "(default 1 = off). For a rank on a slow link (a PCIe x4 slot copies a Flash-Next "
+            "rank's banks in about 5.6 s per chunk). Costs one residual stream of VRAM per held "
+            "chunk on that rank. Needs --max-running-req 1."
+        ),
+    )
+
+    parser.add_argument(
         "--prefill-mixer-pieces",
         type=int,
         default=ServerArgs.prefill_mixer_pieces,
@@ -1088,6 +1102,13 @@ def parse_args(
             kwargs["pp_split"] = split
     elif pp_layers:
         parser.error("--pp-layers needs --pp-size > 1")
+    if kwargs["pp_prefill_group"] < 1:
+        parser.error("--pp-prefill-group must be >= 1")
+    if kwargs["pp_prefill_group"] > 1:
+        if pp_size != 2:
+            parser.error("--pp-prefill-group needs --pp-size 2")
+        if kwargs["max_running_req"] != 1:
+            parser.error("--pp-prefill-group needs --max-running-req 1")
 
     if kwargs["prefix_disk_cache"]:
         if kwargs["tensor_parallel_size"] > 1:

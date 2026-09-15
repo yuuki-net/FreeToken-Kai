@@ -464,7 +464,9 @@ class OffloadMoELayer(MoELayer):
         bank registration order; buffer position == expert id, so routing ids pass
         through unmapped). The caller runs ``release_prefill_layer`` after its GEMMs.
         """
-        if self.layer_id == 0:
+        if self.layer_id == 0 and not _prefill_group_continuation():
+            # a grouped prefill (--pp-prefill-group) fences the copy stream once per group: a
+            # second begin would drop the prefetched buffers and copy layers 0 and 1 again
             cache.begin_prefill()
         cache.prefetch_prefill_layer(self.layer_id)
         cache.prefetch_prefill_layer(self.layer_id + 1)
@@ -508,6 +510,15 @@ class OffloadMoELayer(MoELayer):
                 hidden_states, gate_up, down, topk_weights, topk_ids, self.activation
             )
         raise AssertionError(f"offload experts without a quant method only serve q4_0 banks, got {fmt!r}")
+
+
+def _prefill_group_continuation() -> bool:
+    """--pp-prefill-group: a grouped prefill is running a layer for a later chunk of its group.
+    False without a global context (layer-level callers that never set one)."""
+    from freetoken import core
+
+    ctx = core._GLOBAL_CTX
+    return ctx is not None and ctx.prefill_group_continuation
 
 
 # Short-extend prefill on the CPU executor (see OffloadMoELayer._prefill_on_cpu): the piece

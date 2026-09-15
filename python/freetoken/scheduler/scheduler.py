@@ -692,10 +692,26 @@ class Scheduler(SchedulerIOMixin):
         pool = self.engine.linear_state_pool
         if pool is None or not batch.is_prefill:
             return
+        if getattr(self.engine, "holds_deferred_prefill", False) is True and any(
+            req.mamba_restore_src is not None for req in batch.reqs
+        ):
+            # the snapshot may be a checkpoint a held chunk has not written yet (--pp-prefill-group)
+            self._flush_deferred_prefill()
         for req in batch.reqs:
             if req.mamba_restore_src is not None:
                 pool.copy_from(req.mamba_restore_src, req.linear_slot_idx)
                 req.mamba_restore_src = None  # consumed: restore exactly once
+
+    def _flush_deferred_prefill(self) -> None:
+        """Run the prefill chunks the engine holds under --pp-prefill-group before anything that
+        reads or frees their state (engine/prefill_group.py). On the engine stream, ordered
+        after this stream's pending writes; this stream then waits for it."""
+        if getattr(self.engine, "holds_deferred_prefill", False) is not True:
+            return  # (a stand-in engine without the property holds nothing)
+        with torch.cuda.stream(self.engine.stream):
+            self.engine.stream.wait_stream(self.stream)
+            self.engine.flush_deferred_prefill()
+        self.stream.wait_stream(self.engine.stream)
 
     def _free_req_resources(self, req: Req) -> None:
         # Idempotent: an EOS-finished request can stay in running_reqs (output budget left), so an
@@ -704,6 +720,9 @@ class Scheduler(SchedulerIOMixin):
         # slots to two later requests. table_idx == -1 marks an already-freed request.
         if req.table_idx == -1:
             return
+        # --pp-prefill-group: a held chunk writes into these pages and slots
+        if getattr(getattr(self, "engine", None), "holds_deferred_prefill", False) is True:
+            self._flush_deferred_prefill()
         # Polymorphic free: the DSV4 manager returns the request's window pages + cmp/idx blocks
         # to their tier free-lists; the generic manager frees its KV pages (it reads
         # page_table[req.table_idx], so free the table entry after).
@@ -736,6 +755,7 @@ class Scheduler(SchedulerIOMixin):
         msg = self._pending_rebuild
         assert msg is not None
         self._pending_rebuild = None
+        self._flush_deferred_prefill()
         requested = {
             "moe_cache_size": msg.moe_cache_size,
             "num_pages": msg.num_pages,

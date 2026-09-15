@@ -167,6 +167,23 @@ for a model whose experts mostly fit, `hybrid` for one whose experts mostly do n
 (gpt-oss-120b). A machine with a slower bus or fewer cores would see more from the second
 cache than this one did.
 
+### Grouping chunks on the second rank (`--pp-prefill-group`)
+
+An offloaded MoE copies a layer's whole expert bank to the GPU for every prefill chunk, however
+many tokens the chunk holds. On the machine above the second rank's slot moves those copies at
+about 5.9 GiB/s: 33 GiB of Flash-Next banks per chunk, 5.6 s, where the rank's compute for a
+3,072-token chunk takes about 3 s. Timed part by part, that rank spent half of its prefill
+waiting for banks, and the first rank spent half of its prefill waiting for it.
+
+For Qwen3.8-Flash-Next, `--pp-prefill-group N` (with `--max-running-req 1`) makes the second rank take up to N
+consecutive chunks of a prompt before running them, then run them layer by layer: every chunk
+through a layer before the next layer, so the layer's bank is copied once for all of them. The
+first rank is not held up -- it hands over each chunk as before and moves on. The arithmetic is
+the same as one chunk per forward (unit-tested bit for bit on Flash-Next's GDN and QSA layers).
+Held chunks run before anything that could read or free their state: the next request, a
+prefix-cache restore, an abort. The price is one residual stream of VRAM per held chunk on that
+rank. Experimental: not yet measured on the two-GPU machine.
+
 ## Limits and caveats
 
 - The ranks run in sequence: two GPUs are not faster than one GPU that could hold everything.

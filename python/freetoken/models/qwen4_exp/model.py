@@ -440,6 +440,43 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
         streams ``[T, hc*hidden]`` (head-owning rank)."""
         return self.model._last_residual
 
+    # --pp-prefill-group plans a deferred chunk's mixer pieces as the forward would
+    pp_prefill_pieces = True
+
+    def prefill_group_next_token(self, hidden: torch.Tensor) -> int:
+        """The target's greedy token after a grouped chunk's last row, from its final residual
+        streams (the draft head's successor id where the next prompt token is not known yet)."""
+        x = self.model.hyper_connection_mixer.mix(hidden[-1:])[0]
+        return int(self.lm_head.logits(x).argmax(dim=-1).item())
+
+    def set_last_hidden(self, hidden: torch.Tensor) -> None:
+        """Point the draft head's input at a grouped prefill chunk's final residual streams."""
+        self.model._last_residual = hidden
+
+    def forward_prefill_group(self, chunks) -> list:
+        """--pp-prefill-group (engine/prefill_group.py): this rank's layers over several prefill
+        chunks of one request, layer by layer -- every chunk through a layer before the next
+        layer, each under its own batch and with the pieces planned when it was deferred.
+        Returns each chunk's final residual streams (the draft head's input). The last of two
+        pipeline ranks only: no embedding, no PLE, and no chunk of a group needs logits."""
+        m = self.model
+        assert not m.pp_first and not m._ple, "a grouped prefill runs on the last pipeline rank"
+        ctx = get_global_ctx()
+        layers = m.layers.op_list
+        hiddens = [c.hidden for c in chunks]
+        try:
+            for i in m._local_ids:
+                for k, c in enumerate(chunks):
+                    ctx.prefill_group_continuation = k > 0
+                    with ctx.forward_batch(c.batch):
+                        if c.pieces is not None:
+                            hiddens[k] = layers[i].forward_pieces(hiddens[k], c.batch, c.pieces, ctx)
+                        else:
+                            hiddens[k] = layers[i].forward(hiddens[k], c.batch)
+        finally:
+            ctx.prefill_group_continuation = False
+        return hiddens
+
     def spec_rollback(self, batch: Batch, accepted: int, ctx) -> None:
         """Roll this rank's per-request state back to the first ``accepted`` rows of the verify
         window: GDN recurrent + conv states (from the layers' stashes) and the PLE n-gram

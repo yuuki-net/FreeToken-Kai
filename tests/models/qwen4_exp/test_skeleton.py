@@ -502,3 +502,25 @@ def test_decoder_stack_prefill_and_decode(monkeypatch):
         decode_logits = model.forward()
     assert decode_logits.shape == (len(prompts), config.vocab_size)
     assert torch.isfinite(decode_logits.float()).all()
+
+
+@requires_cuda
+def test_prefill_group_next_token_is_the_heads_greedy_token_for_the_last_row(monkeypatch):
+    """--pp-prefill-group scores a held chunk's last row through the real stream mixer and head."""
+    from freetoken.models.qwen4_exp import model as model_module
+    from freetoken.utils.torch_utils import torch_dtype
+
+    torch.manual_seed(18)
+    config = _config()
+    device, dtype = torch.device("cuda"), torch.bfloat16
+    monkeypatch.setattr(model_module, "build_linear_mixer", _StubLinearMixer)
+    with torch.device(device), torch_dtype(dtype):
+        model = model_module.Qwen4ExpForCausalLM(config)
+    _fill(model, torch.Generator(device=device).manual_seed(19))
+    width = config.qwen4_args.hc_count * config.hidden_size
+    hidden = torch.randn(5, width, device=device, dtype=dtype)
+    want = int(model.lm_head.logits(model.model.hyper_connection_mixer.mix(hidden)[0])[-1].argmax().item())
+    assert model.prefill_group_next_token(hidden) == want
+    model.set_last_hidden(hidden)
+    assert model.last_hidden is hidden
+

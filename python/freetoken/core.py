@@ -248,6 +248,9 @@ class Context:
     debug_layer_outs: list | None = None
     # --prefill-mixer-pieces (models/prefill_pieces.py); set by the engine, 1 = off
     prefill_mixer_pieces: int = 1
+    # --pp-prefill-group (engine/prefill_group.py): True while a grouped prefill runs a layer for
+    # the second or later chunk of its group -- the layer's expert bank is already prefetched
+    prefill_group_continuation: bool = False
     _batch: Batch | None = field(default=None, init=False)
 
     @property
