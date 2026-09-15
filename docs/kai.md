@@ -331,7 +331,7 @@ vocabularies only (Ornith's is untied); Qwen3.5-MoE family.
 | `FT_IMAGE_EMBED_CACHE` | `32` | `--mm-encoder-weights cpu`: images whose embeddings the tokenizer worker keeps, by content hash (chat clients resend every image each turn); `0` disables |
 | `FREETOKEN_FP8_SCRATCH_GEMM` | arch (on below Ampere) | fp8 W8A16 prefill GEMM as dequant + cuBLAS instead of the inline-dequant Triton kernel |
 | `FREETOKEN_NVFP4_MOE_SCRATCH` | arch (on below Ampere) | NVFP4 prefill MoE as chunked dequant + per-expert cuBLAS instead of the inline-dequant kernel |
-| `FREETOKEN_NVFP4_MOE_ARITH` | arch (on below Ampere) | Arithmetic (gather-free) e2m1 dequant in the prefill MoE kernel; bit-identical, speed knob only |
+| `FREETOKEN_NVFP4_MOE_ARITH` | arch (on up to Ampere) | Arithmetic (gather-free) e2m1 dequant in the prefill MoE kernel; bit-identical, speed knob only |
 | `FREETOKEN_CPU_PREFILL_MAX_TOKENS` | `256` | Prefill extends up to this many rows compute their routed experts on the CPU executor (offload/hybrid) instead of streaming every layer's bank; `0` disables |
 | `FREETOKEN_STAGED_COPY` / `FREETOKEN_STAGED_COPY_MB` | on / `32` | Whole-layer prefill copies of non-pinned bank layers go through two pinned staging buffers of this size |
 | `FREETOKEN_BANK_PREAD` | `buffered` | With `--moe-bank-ram`: how a prefill chunk reads the non-resident rows. `buffered` reads them from the file on several threads through the page cache; `direct` with `O_DIRECT` (about 5% more prefill where the page cache is far short of the rows; where it nearly holds them, decode loses the rows a prefill would have cached, -15% measured); `0` faults them in through the mapping as before |

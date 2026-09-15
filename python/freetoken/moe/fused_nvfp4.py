@@ -376,16 +376,20 @@ def _fused_experts_nvfp4_scratch(
 
 @functools.cache
 def _arith_dequant() -> bool:
-    """Prefill MoE kernel dequant: arithmetic (no LUT gathers) below Ampere by default --
-    measured 0.56 TFLOPS for the LUT path on an RTX 2060 against 16 TFLOPS for the dense
-    NVFP4 kernels that already use the arithmetic form. ``FREETOKEN_NVFP4_MOE_ARITH=0/1``
-    overrides anywhere (the two forms are bit-identical, so this is purely a speed knob)."""
+    """Prefill MoE kernel dequant: arithmetic (no LUT gathers) by default up to Ampere. On an
+    RTX 3060 the expert GEMMs of a Qwen3.8-Flash-Next prefill took 0.96 s per 1k tokens with
+    the LUT gathers and 0.56 s with the arithmetic form (per-part timings over two 20k-token
+    prompts per rank); below Ampere the prefill MoE normally runs the dequant + cuBLAS scratch
+    path instead, where this knob does not apply. Newer cards are unmeasured and keep the LUT.
+    ``FREETOKEN_NVFP4_MOE_ARITH=0/1`` overrides anywhere (the two forms are bit-identical, so
+    this is purely a speed knob)."""
     env = os.environ.get("FREETOKEN_NVFP4_MOE_ARITH")
     if env is not None:
         return env == "1"
-    from freetoken.utils import is_pre_ampere
+    from freetoken.utils.arch import _get_torch_cuda_version
 
-    return is_pre_ampere()
+    arch = _get_torch_cuda_version()
+    return arch is not None and tuple(arch) < (8, 9)
 
 
 def _prefill_config(M: int) -> Dict[str, int]:
