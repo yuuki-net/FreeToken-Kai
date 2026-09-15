@@ -1057,7 +1057,10 @@ class Engine:
             )
             tp_cpu_group = torch.distributed.group.WORLD
             assert tp_cpu_group is not None
-            self.pp_comm = PipelineComm(get_pp_info(), tp_cpu_group, self.device)
+            self.pp_comm = PipelineComm(
+                get_pp_info(), tp_cpu_group, self.device,
+                send_ahead=int(getattr(config, "pp_send_ahead", 1) or 1),
+            )
             return tp_cpu_group
         if config.tp_info.size == 1 or config.use_pynccl:
             torch.distributed.init_process_group(

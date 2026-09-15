@@ -55,6 +55,9 @@ class EngineConfig:
     # chunks of one request layer by layer, streaming each offloaded expert bank once per group
     # (engine/prefill_group.py). 1 = off.
     pp_prefill_group: int = 1
+    # --pp-send-ahead: residual streams the first pipeline rank may have in flight to the next
+    # rank at once (distributed/pipeline.py). 1 = the send waits for the peer's receive.
+    pp_send_ahead: int = 1
     # --prefill-profile: log where each prefill forward's wall time goes, on every rank
     # (utils/prefill_profile.py)
     prefill_profile: bool = False

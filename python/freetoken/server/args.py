@@ -833,6 +833,18 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--pp-send-ahead",
+        type=int,
+        default=ServerArgs.pp_send_ahead,
+        help=(
+            "With --pp-size: how many residual streams the first rank may have in flight to the "
+            "next rank at once (default 1 = the send waits for the peer's receive, so the rank "
+            "stays one chunk ahead). Above 1 it keeps prefilling chunks while the next rank works "
+            "through what it has, at one chunk's residual stream of pinned host memory per slot."
+        ),
+    )
+
+    parser.add_argument(
         "--pp-prefill-group",
         type=int,
         default=ServerArgs.pp_prefill_group,
@@ -1102,6 +1114,10 @@ def parse_args(
             kwargs["pp_split"] = split
     elif pp_layers:
         parser.error("--pp-layers needs --pp-size > 1")
+    if kwargs["pp_send_ahead"] < 1:
+        parser.error("--pp-send-ahead must be >= 1")
+    if kwargs["pp_send_ahead"] > 1 and pp_size < 2:
+        parser.error("--pp-send-ahead needs --pp-size > 1")
     if kwargs["pp_prefill_group"] < 1:
         parser.error("--pp-prefill-group must be >= 1")
     if kwargs["pp_prefill_group"] > 1:
