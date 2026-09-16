@@ -87,6 +87,36 @@ A profile is a model, a port and the flags for `ft serve`, kept in `~/.freetoken
 - A profile row shows start for a stopped profile, and stop and restart for the running one. A
   profile edited after its server started is marked, and restarting applies the edit.
 
+## Benchmark
+
+**Benchmark** in the header measures this PC with a model and settles the flags on the numbers,
+drawn live on a speedometer while it runs. It needs the GPU: the server `ft mgr` runs is stopped
+first and started again with its own settings at the end, whether the run finished, failed or was
+cancelled. A server started outside `ft mgr` is not touched, and the benchmark refuses to start
+while one holds the GPU.
+
+1. **Hardware** (a few minutes, `webui/hwbench.py` in a child process): PCIe transfer per GPU
+   against the link's theoretical rate, the memory read rate, reading the model's own file from the
+   SSD with its page cache dropped, the model's experts computed on the CPU at each thread count,
+   the experts moved to each GPU, and both at once. These are upstream's `ft bench bw` kernels
+   driven with the model's own expert geometry.
+   - `--moe-strategy`: `hybrid` when computing on the CPU is more than twice the transfer to the
+     slowest GPU, `offload` otherwise (upstream's rule).
+   - `--moe-cpu-threads`: the fewest threads within 95% of the best, not the maximum.
+   - The figures are also merged into the GPU's `ft bench bw` profile, which the engine reads for
+     the hybrid fetch split (`--moe-hybrid-max-fetch -1`, the default).
+2. **Real runs** (optional, 5-20 minutes): `ft serve` is started with the recommended settings
+   plus the above, and measured with a prompt of 8,192 random token ids (exact length, nothing
+   reused from the prefix cache) and 200 generated tokens (`ignore_eos`). If the free VRAM, or at
+   most a quarter of an auto-sized expert cache, holds a longer context tier, the model is started
+   again with it, and the longer context is kept only when generation stays within 5% and prompt
+   processing within 10%. A pre-Ampere card that cannot load the model in float16 is retried
+   without `--dtype`.
+
+The result lists each flag as **measured** or **rule** with its reason, and can be saved as a new
+profile, merged into a profile for the same model, or started directly. The last result per model
+is kept in `~/.freetoken/mgr/tune/`.
+
 ## How experts are served
 
 ![Expert heatmap](../assets/kai-console-heatmap.png)

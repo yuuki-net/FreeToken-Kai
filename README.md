@@ -24,7 +24,7 @@ This fork adds ten things on top of it. They are independent — take one, ignor
 | 7 | **A KV cache 1.9x or 3.6x smaller**, stored as block-quantized codes: 1.25 GiB down to 0.35 GiB at 64k on a 6 GB card. It buys VRAM, not speed — past a few thousand tokens of context it costs about a third of the decode rate. Plain paged-attention models and gpt-oss on the Triton backend, and Qwen3.8-Flash-Next on its own sparse backend — where the cost above does not apply: measured on two RTX 3060s, `q4_0` decode is flat from 8k to 125k of context (−1.4%) while the KV drops 1.55 GiB to 0.47 GiB per rank, because its attention reads a fixed budget of tokens however long the context is. On gpt-oss use `q8_0`: it runs gpt-oss-120b at 128k of context on two RTX 3060s, and `q4_0` breaks its answers. | `--kv-cache-dtype q4_0` (gpt-oss: `q8_0`) |
 | 8 | **The checkpoint's bf16 dense weights served as fp8.** Attention, GDN, shared expert, lm_head and the embedding are quantized per output row at load and read W8A16; the router, hyper-connection, QSA indexer, PLE and GDN gates stay bf16. Qwen3.8-Flash-Next's resident dense weights go from 4.9 GB per card to 2.9 GB, and the freed VRAM goes to the expert cache. | `--dense-quant fp8` |
 | 9 | **A prefill chunk sized to the VRAM that is actually free.** Upstream's fixed 8192 needs 0.97 GiB of transient on a 35B MoE; a 6 GB card does not have it, so long prompts crawled and sometimes died. The transient is measured at startup; the chunk itself is solved before every prefill, against the VRAM free at that moment, with `--max-prefill-length` left as the ceiling. Running the GDN and attention over pieces of a chunk, and the MoE over all of it, makes the chunk wider still: a 20k-token prompt went 490 → 722 tok/s on a 2060 and 437 → 546 on two 3060s. | automatic, `--prefill-chunk-budget`; `--prefill-mixer-pieces 2` |
-| 10 | **A browser console instead of the desktop app.** Upstream's desktop app is built for upstream's engine and does not know these flags. `ft mgr` serves a dashboard (speed, VRAM per GPU, host RAM, the expert cache per layer), launch profiles with every `ft serve` flag explained, settings recommended for the PC it runs on, and changes suggested from the running server's own measurements. Other PCs on the LAN can watch; operating from them takes a token. | `ft mgr`, then `http://127.0.0.1:1901/ui/` |
+| 10 | **A browser console instead of the desktop app.** Upstream's desktop app is built for upstream's engine and does not know these flags. `ft mgr` serves a dashboard (speed, VRAM per GPU, host RAM, the expert cache per layer), launch profiles with every `ft serve` flag explained, settings recommended for the PC it runs on, a benchmark that measures the PC with the model and picks the flags from the numbers, and changes suggested from the running server's own measurements. Other PCs on the LAN can watch; operating from them takes a token. | `ft mgr`, then `http://127.0.0.1:1901/ui/` |
 
 Everything else is upstream FreeToken.
 
@@ -174,6 +174,13 @@ what a bigger cache would hold.
 
 ![Expert heatmap](assets/kai-console-heatmap.png)
 
+**Benchmark** measures this PC with the model and picks the flags from the numbers: PCIe, memory
+and SSD rates, the model's experts computed on the CPU at each thread count and moved to the GPU,
+then, optionally, the model itself started twice to see whether a longer context costs speed.
+Every reading is drawn as it arrives; the result is a profile in one click.
+
+![Benchmark running](assets/kai-console-benchmark.png)
+
 Other PCs on the LAN can watch everything; starting, stopping and editing from them needs the token
 the console shows on this PC. `ft serve` serves the same dashboard read-only on its own port.
 English or Japanese, following the browser. See [docs/web-console.md](docs/web-console.md).
@@ -197,7 +204,7 @@ CUDA kernels are JIT-compiled on first use (CUDA 13 toolkit with `nvcc`, as upst
 | | |
 |---|---|
 | [docs/kai.md](docs/kai.md) | What the fork adds, tested configurations, Ampere and newer, every flag |
-| [docs/web-console.md](docs/web-console.md) | The browser console (`ft mgr`): dashboard, launch profiles, recommended settings, the expert heatmap, operating from another PC |
+| [docs/web-console.md](docs/web-console.md) | The browser console (`ft mgr`): dashboard, launch profiles, recommended settings, the benchmark, the expert heatmap, operating from another PC |
 | [docs/pipeline.md](docs/pipeline.md) | Two GPUs, one model (`--pp-size`) |
 | [docs/bank-ram.md](docs/bank-ram.md) | Half the host RAM (`--moe-bank-ram`), and the `read_ahead_kb` that is worth 2.5x |
 | [docs/prefill-chunk.md](docs/prefill-chunk.md) | The prefill chunk: sized to free VRAM (`--prefill-chunk-budget`), and made wider (`--prefill-mixer-pieces`) |
