@@ -21,17 +21,22 @@ from .version import DAEMON_VERSION
 logger = logging.getLogger("freetoken.daemon")
 
 DEFAULT_PORT = 1900  # distinct from the serve default (1919)
+# kai's manager (`ft mgr`) is the same supervisor plus the web console, on its own port and state dir.
+# Not 1900: Windows' SSDP Discovery service holds that port, and under WSL's mirrored networking a
+# listener there is unreachable even from inside WSL.
+MGR_PORT = 1901
+MGR_STATE_DIR = "mgr"
 DEFAULT_SERVE_PORT = 1919
 
 
-def _default_state_dir() -> str:
+def _default_state_dir(console: bool = False) -> str:
     env = os.environ.get("FREETOKEN_DAEMON_DIR")
     if env:
         return env
-    return os.path.join(os.path.expanduser("~"), ".freetoken", "daemon")
+    return os.path.join(os.path.expanduser("~"), ".freetoken", MGR_STATE_DIR if console else "daemon")
 
 
-def _build_parser(prog: str) -> argparse.ArgumentParser:
+def _build_parser(prog: str, console: bool = False) -> argparse.ArgumentParser:
     from .client import CLIENT_VERBS
 
     p = argparse.ArgumentParser(
@@ -46,8 +51,9 @@ def _build_parser(prog: str) -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     p.add_argument("--host", default="127.0.0.1", help="Control-plane bind host (default loopback)")
-    p.add_argument("--port", type=int, default=DEFAULT_PORT, help=f"Control port (default {DEFAULT_PORT})")
-    p.add_argument("--state-dir", default=_default_state_dir(), help="Lock/pidfile/log directory")
+    port = MGR_PORT if console else DEFAULT_PORT
+    p.add_argument("--port", type=int, default=port, help=f"Control port (default {port})")
+    p.add_argument("--state-dir", default=_default_state_dir(console), help="Lock/pidfile/log directory")
     p.add_argument("--token", default=os.environ.get("FREETOKEN_DAEMON_TOKEN"), help="Optional X-FT-Token shared secret")
     p.add_argument("--default-serve-port", type=int, default=DEFAULT_SERVE_PORT, help="Port used when /engine/start omits one")
     p.add_argument("--serve-python", default=sys.executable, help="Interpreter used to launch ft serve")
@@ -101,8 +107,10 @@ def _start_oom_reaper(manager, interval: float, stop: threading.Event) -> thread
     return t
 
 
-def main(argv: Sequence[str] | None = None, *, prog: str = "ft daemon") -> int:
-    args = _build_parser(prog).parse_args(list(argv) if argv is not None else None)
+def main(argv: Sequence[str] | None = None, *, prog: str = "ft daemon", console: bool = False) -> int:
+    """``console=True`` is ``ft mgr``: the same supervisor with kai's web console (/ui/) and the
+    profile store on top. Plain ``ft daemon`` stays what upstream ships."""
+    args = _build_parser(prog, console).parse_args(list(argv) if argv is not None else None)
     logging.basicConfig(
         level=getattr(logging, args.log_level.upper(), logging.INFO),
         format="%(asctime)s [ft-daemon] %(levelname)s %(message)s",
@@ -112,6 +120,7 @@ def main(argv: Sequence[str] | None = None, *, prog: str = "ft daemon") -> int:
     from .logring import LogRing
     from .metrics import FootprintCache
     from .pidfile import AlreadyRunning, ServeStateStore, SingleInstance
+    from .profiles import ProfileStore
     from .proxy import ServeProbe
     from .serve_manager import ServeManager
     from .tailer import LogTailer
@@ -197,6 +206,10 @@ def main(argv: Sequence[str] | None = None, *, prog: str = "ft daemon") -> int:
         checkpoints=checkpoints,
         started_wall=time.time(),
         shutdown_hook=shutdown_hook,
+        profiles=ProfileStore(os.path.join(state_dir, "profiles.json")) if console else None,
+        console=console,
+        console_cache_dir=os.path.join(state_dir, "console"),
+        serve_python=args.serve_python,
     )
 
     import uvicorn
@@ -220,7 +233,8 @@ def main(argv: Sequence[str] | None = None, *, prog: str = "ft daemon") -> int:
     )
     app.state.request_shutdown = lambda: setattr(server, "should_exit", True)
 
-    logger.info("ft daemon %s listening on %s:%s (state-dir=%s)", DAEMON_VERSION, args.host, args.port, state_dir)
+    logger.info("%s %s listening on %s:%s (state-dir=%s)%s", prog, DAEMON_VERSION, args.host, args.port, state_dir,
+                f" — web console: http://{args.host}:{args.port}/ui/" if console else "")
     try:
         server.run()
     finally:

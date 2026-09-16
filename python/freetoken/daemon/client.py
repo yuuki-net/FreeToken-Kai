@@ -16,7 +16,8 @@ import urllib.request
 from collections.abc import Sequence
 from typing import Any
 
-DEFAULT_URL = "http://127.0.0.1:1900"
+DEFAULT_URL = "http://127.0.0.1:1900"       # server.DEFAULT_PORT
+MGR_URL = "http://127.0.0.1:1901"          # server.MGR_PORT: kai's manager
 DEFAULT_TIMEOUT = 10.0
 # prepare-stop (15s transport budget) + default SIGTERM grace (10s) + reap wait (10s),
 # with enough HTTP scheduling slack that a valid lifecycle transaction does not look failed.
@@ -113,12 +114,13 @@ def _stream_logs(url, since, token, timeout) -> None:
             pass
 
 
-def _build_parser(prog: str) -> argparse.ArgumentParser:
+def _build_parser(prog: str, console: bool = False) -> argparse.ArgumentParser:
     # The package dispatcher routes to the client only when a verb is argv[0], so --url/--token/
     # --timeout live on each verb (`ft daemon status --url X`), not before it.
     common = argparse.ArgumentParser(add_help=False)
-    common.add_argument("--url", default=os.environ.get("FREETOKEN_DAEMON_URL", DEFAULT_URL),
-                        help=f"daemon URL (default {DEFAULT_URL})")
+    url = MGR_URL if console else DEFAULT_URL
+    common.add_argument("--url", default=os.environ.get("FREETOKEN_DAEMON_URL", url),
+                        help=f"control-plane URL (default {url})")
     common.add_argument("--token", default=os.environ.get("FREETOKEN_DAEMON_TOKEN"), help="X-FT-Token shared secret")
     common.add_argument(
         "--timeout",
@@ -127,7 +129,7 @@ def _build_parser(prog: str) -> argparse.ArgumentParser:
         help="HTTP timeout (default 10s; stop/switch 40s)",
     )
 
-    p = argparse.ArgumentParser(prog=prog, description="Control a running ft daemon")
+    p = argparse.ArgumentParser(prog=prog, description=f"Control a running {prog.split()[-1]}")
     sub = p.add_subparsers(dest="verb", required=True)
     sub.add_parser("self", parents=[common], help="Daemon self-health (GET /health)")
     sub.add_parser("status", parents=[common], help="Engine status (GET /engine/status)")
@@ -158,8 +160,8 @@ def _build_parser(prog: str) -> argparse.ArgumentParser:
     return p
 
 
-def main(argv: Sequence[str] | None = None, *, prog: str = "ft daemon") -> int:
-    args = _build_parser(prog).parse_args(list(argv) if argv is not None else None)
+def main(argv: Sequence[str] | None = None, *, prog: str = "ft daemon", console: bool = False) -> int:
+    args = _build_parser(prog, console).parse_args(list(argv) if argv is not None else None)
     timeout = _effective_timeout(args.verb, args.timeout)
     try:
         if args.verb == "logs":

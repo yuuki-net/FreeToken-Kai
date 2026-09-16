@@ -6,7 +6,7 @@ speaks HTTP is a thin client. This file is the design reference.
 
 ```
 client (ft ctl / curl / any HTTP client)             chat traffic → serve DIRECTLY
-        │ HTTP control plane (loopback :1900)                     │
+        │ HTTP control plane (loopback :1901)                     │
         ▼                                                         ▼
    ft daemon  ──spawn / signal / tail──▶  ft serve  (model · inference · MAY crash)
    (no torch)                              └─ /health /v1/stats  (per-serve control API)
@@ -27,7 +27,7 @@ sentinel.
 ## Run the server
 
 ```bash
-ft daemon --host 127.0.0.1 --port 1900         # bare/flags = run the daemon server
+ft daemon --host 127.0.0.1 --port 1901         # bare/flags = run the daemon server
 # or as a service (survives logout, auto-restarts): see ft-daemon.service
 ```
 
@@ -52,7 +52,7 @@ ft daemon stop
 ft daemon stop --force
 ```
 
-Target a non-default daemon with `--url http://host:1900` (or `$FREETOKEN_DAEMON_URL`) and
+Target a non-default daemon with `--url http://host:1901` (or `$FREETOKEN_DAEMON_URL`) and
 `--token`/`$FREETOKEN_DAEMON_TOKEN`.
 
 ## HTTP API (camelCase JSON, loopback by default)

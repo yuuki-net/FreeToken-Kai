@@ -19,6 +19,12 @@ class SchedulerStatusReporter:
     _spec_step_count: int = field(default=0, init=False)
     _spec_accepted_tokens: int = field(default=0, init=False)
     _last_spec_time: float = field(init=False)
+    # Lifetime totals, never reset (the log-line counters above are): the web console diffs them.
+    total_prefill_new_tokens: int = field(default=0, init=False)
+    total_prefill_cached_tokens: int = field(default=0, init=False)
+    total_decode_tokens: int = field(default=0, init=False)
+    total_spec_steps: int = field(default=0, init=False)
+    total_spec_accepted: int = field(default=0, init=False)
 
     def __post_init__(self) -> None:
         now = self.clock()
@@ -91,6 +97,8 @@ class SchedulerStatusReporter:
         # decode-state values (#new-token == #reqs, #cached-token == full prompt).
         new_tokens = batch.log_new_tokens
         cached_tokens = batch.log_cached_tokens
+        self.total_prefill_new_tokens += new_tokens
+        self.total_prefill_cached_tokens += cached_tokens
         input_throughput = new_tokens / gap if gap > 0 else 0.0
         self.log(
             f"Prefill batch, "
@@ -119,6 +127,7 @@ class SchedulerStatusReporter:
     ) -> None:
         self._decode_forward_count += 1
         self._decode_generated_tokens += len(batch.reqs)
+        self.total_decode_tokens += len(batch.reqs)
         if self._decode_forward_count % self.decode_log_interval != 0:
             return
 
@@ -154,6 +163,9 @@ class SchedulerStatusReporter:
         accepted length, which is the whole point of the draft head."""
         self._spec_step_count += 1
         self._spec_accepted_tokens += accepted
+        self.total_spec_steps += 1
+        self.total_spec_accepted += accepted
+        self.total_decode_tokens += accepted
         if self._spec_step_count % self.decode_log_interval != 0:
             return
         now = self.clock()

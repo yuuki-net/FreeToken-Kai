@@ -24,7 +24,7 @@ After=network.target
 [Service]
 Type=simple
 # Point this at your checkout's venv-installed entrypoint:
-ExecStart=%h/FreeToken/.venv/bin/ft daemon --host 127.0.0.1 --port 1900
+ExecStart=%h/FreeToken/.venv/bin/ft daemon --host 127.0.0.1 --port 1901
 Restart=always
 RestartSec=1
 # Do not give up restarting after N fast failures — the control plane must always come back.

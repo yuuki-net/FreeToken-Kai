@@ -116,7 +116,7 @@ version = {attr = "freetoken.version.__version__"}
 where = ["python"]
 
 [tool.setuptools.package-data]
-"*" = ["csrc/**/*", "moe/configs/**/*.json"]
+"*" = ["csrc/**/*", "moe/configs/**/*.json", "webui/static/*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

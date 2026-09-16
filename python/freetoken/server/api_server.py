@@ -39,6 +39,8 @@ from .args import ServerArgs
 from .anthropic_api import register_anthropic_routes
 from .accounting import AdmissionClosedError, register_accounting_routes
 from .control_api import register_control_routes
+from .kai_api import register_kai_routes
+from freetoken.webui import register_webui
 from .openai_api import register_openai_routes
 from . import request_ring
 from .access_log_filter import install_polling_access_log_filter
@@ -423,6 +425,8 @@ register_anthropic_routes(app, get_global_state, lambda: _MODEL_SAMPLING)
 register_responses_routes(app, get_global_state, lambda: _MODEL_SAMPLING)
 register_control_routes(app, get_global_state, lambda: _MODEL_SAMPLING)
 register_accounting_routes(app, get_global_state)
+register_kai_routes(app, get_global_state)
+register_webui(app, "serve", __version__)
 
 
 # Paths the HTTP middleware logs into the request ring. The three chat protocols funnel through

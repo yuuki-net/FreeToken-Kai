@@ -77,4 +77,15 @@ def register_control_routes(
         # metadata) so clients can seed their sampling controls per-model instead of guessing.
         if get_model_sampling is not None:
             doc["model"]["sampling"] = get_model_sampling() or {}
+        # kai: per-rank engine snapshots for the web console (None when no rank has written one)
+        from .kai_api import kai_block
+
+        try:
+            doc["kai"] = kai_block(get_state())
+        except Exception:  # noqa: BLE001 -- a malformed snapshot must not break /v1/stats
+            doc["kai"] = None
+        # host RAM for the console; the engine's share is this process tree's PSS
+        from freetoken.webui.hostmem import engine_root, host_memory
+
+        doc["host"] = host_memory(engine_root())
         return doc

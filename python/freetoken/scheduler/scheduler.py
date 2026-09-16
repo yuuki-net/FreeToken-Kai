@@ -61,6 +61,13 @@ class ForwardInput(NamedTuple):
 ForwardData: TypeAlias = "Tuple[ForwardInput, ForwardOutput]"
 
 
+def _webstats_tick(scheduler, idle: bool = False) -> None:
+    # unit-test stubs build a Scheduler without __init__
+    ws = getattr(scheduler, "webstats", None)
+    if ws is not None:
+        ws.tick(idle=idle)
+
+
 class Scheduler(SchedulerIOMixin):
     def __init__(self, config: SchedulerConfig):
         from freetoken.engine import Engine
@@ -186,9 +193,15 @@ class Scheduler(SchedulerIOMixin):
             self.prefix_disk = build_prefix_disk_cache(config, self.engine, self.cache_manager)
             self.prefill_manager.prefix_disk = self.prefix_disk
 
+        # Per-rank numbers for the web console (/ui/): a JSON file every couple of seconds.
+        from .webstats import WebStatsPublisher
+
+        self.webstats = WebStatsPublisher(self)
+
     def run_when_idle(self) -> None:
         """Called when the scheduler is idle to perform background tasks."""
         logger.info_rank0("Scheduler is idle, waiting for new reqs...")
+        _webstats_tick(self, idle=True)
         self.cache_manager.check_integrity()
         if getattr(self, "prefix_disk", None) is not None:
             self.prefix_disk.persist_idle()
@@ -262,6 +275,7 @@ class Scheduler(SchedulerIOMixin):
         # before the message loop is what makes the check airtight: the batch launched later
         # this iteration can only be probed by messages of the NEXT iteration, which sees it here.
         self._last_data = last_data
+        _webstats_tick(self)
         blocking = not (
             last_data is not None  # don't block if we have a batch to be processed
             or self.prefill_manager.runnable
@@ -310,6 +324,7 @@ class Scheduler(SchedulerIOMixin):
         return ongoing_data
 
     def normal_loop(self) -> None:
+        _webstats_tick(self)
         blocking = not (
             self.prefill_manager.runnable
             or self.decode_manager.runnable

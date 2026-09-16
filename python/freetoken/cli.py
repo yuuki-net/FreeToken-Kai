@@ -14,6 +14,7 @@ Commands:
   shell       Chat with a FreeToken server in the terminal
   ctl         Query and manage a running FreeToken server
   daemon      Run the FreeToken supervisor (persistent engine service)
+  mgr         kai: the same supervisor plus the web console at /ui/ (profiles, advice)
   launch      Configure and launch an agent against a FreeToken server
   checkpoint  Convert an HF safetensors checkpoint to FTW
   bank        Inspect, pack, verify or reorder the --moe-bank-ram bank file
@@ -61,6 +62,12 @@ def _run_ctl(argv: list[str]) -> int:
     from freetoken.control_cli import main
 
     return main(argv, prog="ft ctl")
+
+
+def _run_mgr(argv: list[str]) -> int:
+    from freetoken.daemon import main  # torch-free supervisor; console=True adds kai's web console
+
+    return main(argv, prog="ft mgr", console=True)
 
 
 def _run_daemon(argv: list[str]) -> int:
@@ -133,6 +140,7 @@ COMMANDS = {
     "shell": "_run_shell",
     "ctl": "_run_ctl",
     "daemon": "_run_daemon",
+    "mgr": "_run_mgr",
     "launch": "_run_launch",
     "checkpoint": "_run_checkpoint",
     "bank": "_run_bank",

@@ -16,6 +16,7 @@ import os
 import sys
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable
+from urllib.parse import quote, urlsplit
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -51,6 +52,12 @@ class CheckpointBody(BaseModel):
 
 class CancelBody(BaseModel):
     id: str
+
+
+class ProfileBody(BaseModel):
+    model: str
+    port: int | None = None
+    args: list[str] = []
 
 
 class BenchBody(BaseModel):
@@ -127,6 +134,10 @@ def build_app(
     started_wall: float = 0.0,
     wall_now: Callable[[], float] | None = None,
     shutdown_hook: Callable[[], None] | None = None,
+    profiles=None,
+    console: bool = False,
+    console_cache_dir: str | None = None,
+    serve_python: str | None = None,
 ) -> FastAPI:
     import time as _time
 
@@ -144,6 +155,22 @@ def build_app(
                 await loop.run_in_executor(None, shutdown_hook)
             except Exception:  # noqa: BLE001
                 pass
+
+    @app.middleware("http")
+    async def _refuse_cross_site_writes(request: Request, call_next):
+        # The web console (/ui/) makes this control plane reachable from a browser, and a CORS
+        # preflight does not stop a body-less cross-site POST such as /engine/stop. Refuse writes a
+        # page from another http(s) origin sends; clients that send no Origin (ft daemon, curl) pass.
+        if request.method not in ("GET", "HEAD", "OPTIONS"):
+            origin = urlsplit(request.headers.get("origin") or "")
+            if origin.scheme in ("http", "https") and origin.hostname != "tauri.localhost" and (
+                origin.netloc != request.headers.get("host")
+            ):
+                return JSONResponse(
+                    status_code=403,
+                    content={"error": "cross-origin write refused", "code": "cross_origin"},
+                )
+        return await call_next(request)
 
     def require_token(x_ft_token: str | None = Header(default=None)) -> None:
         if token is not None and x_ft_token != token:
@@ -190,9 +217,19 @@ def build_app(
 
     # ---- engine lifecycle ----
 
+    def resolve_model_arg(model: str) -> str:
+        """Fail a start with a readable message instead of letting the engine die on a hub 401."""
+        from freetoken.webui.models import resolve_model
+
+        try:
+            return resolve_model(model)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+
     @app.post("/engine/start", dependencies=auth)
     async def engine_start(body: StartBody):
         port = resolve_port(body.port)
+        body.model = resolve_model_arg(body.model)
         try:
             return await run(lifecycle_pool, manager.start, body.model, port, list(body.args))
         except Conflict as exc:
@@ -237,6 +274,7 @@ def build_app(
     @app.post("/engine/switch", dependencies=auth)
     async def engine_switch(body: SwitchBody):
         port = resolve_port(body.port)
+        body.model = resolve_model_arg(body.model)
         try:
             return await run(
                 lifecycle_pool,
@@ -400,6 +438,112 @@ def build_app(
 
         return await run(proxy_pool, read)
 
+    def _register_console() -> None:
+        # ---- kai's manager (ft mgr): everything the web console needs. Plain ft daemon has none of it.
+        # A serve started outside the daemon (a launch script, a terminal) still answers on the default
+        # serve port. The daemon cannot stop or restart it, but the console can show it: these console-only
+        # routes fall back to that port whenever the daemon itself runs nothing. The upstream
+        # /engine/health and /engine/stats keep reporting only the daemon's own engine.
+
+        @app.get("/engine/config", dependencies=auth)
+        async def engine_config():
+            st = manager.status()
+            return {"model": st.get("model"), "port": st.get("port"), "args": manager.serve_args()}
+
+        def _view_port() -> int:
+            st = manager.status()
+            return (st.get("port") or default_serve_port) if st.get("running") else default_serve_port
+
+        async def _proxied(path: str):
+            return await run(proxy_pool, probe.get, path, _view_port())
+
+        @app.get("/engine/external", dependencies=auth)
+        async def engine_external():
+            if manager.status().get("running"):
+                return {"external": False}
+            doc = await run(proxy_pool, probe.health, default_serve_port)
+            found = bool(doc.get("reachable")) and doc.get("status") in ("ok", "loading", "error")
+            return {"external": found, "port": default_serve_port, "health": doc if found else None}
+
+        @app.get("/engine/view/stats", dependencies=auth)
+        async def engine_view_stats():
+            if manager.status().get("running"):
+                return await engine_stats()
+            return await _proxied("/v1/stats")
+
+        @app.get("/engine/requests", dependencies=auth)
+        async def engine_requests(since: int = 0, limit: int = 100):
+            return await _proxied(f"/v1/requests?since={int(since)}&limit={int(limit)}")
+
+        @app.get("/engine/cache", dependencies=auth)
+        async def engine_cache():
+            return await _proxied("/v1/cache/status")
+
+        @app.get("/engine/kai/experts", dependencies=auth)
+        async def engine_kai_experts(window: str = "300"):
+            return await _proxied(f"/v1/kai/experts?window={quote(window)}")
+
+        @app.get("/host", dependencies=auth)
+        async def host():
+            from freetoken.webui.hostmem import host_memory
+
+            st = manager.status()
+            return {"memory": await run(proxy_pool, host_memory, st.get("pid") if st.get("running") else None)}
+
+        @app.get("/models", dependencies=auth)
+        async def models_list():
+            from freetoken.webui.models import list_models
+
+            return {"models": await run(proxy_pool, list_models)}
+
+        @app.get("/recommend", dependencies=auth)
+        async def recommend(model: str):
+            # reads nvidia-smi, /proc and the checkpoint's config; no GPU work, so the proxy pool is fine
+            from freetoken.webui.recommend import recommend as build
+
+            try:
+                return await run(proxy_pool, build, model)
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc))
+            except Exception as exc:  # noqa: BLE001
+                raise HTTPException(status_code=500, detail=f"could not build a recommendation: {exc}")
+
+        @app.get("/serve-flags", dependencies=auth)
+        async def serve_flags():
+            # built in a child process (the parser imports torch); cached per args.py version
+            from freetoken.webui.serve_flags import load
+
+            cache = console_cache_dir or os.path.join(os.path.expanduser("~"), ".freetoken", "daemon", "console")
+            try:
+                return {"flags": await run(lifecycle_pool, load, cache, serve_python or sys.executable)}
+            except Exception as exc:  # noqa: BLE001
+                raise HTTPException(status_code=500, detail=f"could not read ft serve flags: {exc}")
+
+        if profiles is not None:
+
+            @app.get("/profiles", dependencies=auth)
+            async def profiles_list():
+                return {"profiles": await run(lifecycle_pool, profiles.list)}
+
+            @app.put("/profiles/{name}", dependencies=auth)
+            async def profiles_put(name: str, body: ProfileBody):
+                try:
+                    return await run(lifecycle_pool, profiles.put, name, body.model, body.port, list(body.args))
+                except ValueError as exc:
+                    raise HTTPException(status_code=400, detail=str(exc))
+
+            @app.delete("/profiles/{name}", dependencies=auth)
+            async def profiles_delete(name: str):
+                if not await run(lifecycle_pool, profiles.delete, name):
+                    raise HTTPException(status_code=404, detail="no such profile")
+                return {"deleted": name}
+
+
+    if console:
+        from freetoken.webui import register_webui
+
+        _register_console()
+        register_webui(app, "mgr", DAEMON_VERSION)
     return app
 
 

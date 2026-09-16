@@ -66,6 +66,10 @@ class ServeProbe:
     def stats(self, port: int) -> dict:
         return self._cached("stats", "/v1/stats", port)
 
+    def get(self, path: str, port: int) -> dict:
+        """Any other read-only serve document (the web console's requests / cache / experts)."""
+        return self._cached(path, path, port)
+
     def fresh_stats(self, port: int) -> dict:
         """Fetch uncached stats for a legacy stop receipt."""
         return self._fetch("/v1/stats", port)

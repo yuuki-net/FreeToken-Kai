@@ -32,6 +32,13 @@ DAEMON_MODULES = [
     "freetoken.daemon.app",
     "freetoken.daemon.client",
     "freetoken.daemon.server",
+    "freetoken.daemon.profiles",
+    "freetoken.webui",
+    "freetoken.webui.stats_path",
+    "freetoken.webui.models",
+    "freetoken.webui.serve_flags",
+    "freetoken.webui.recommend",
+    "freetoken.webui.hostmem",
 ]
 
 # Runs in the child interpreter. FORBIDDEN / DAEMON_MODULES are prepended as literals so the
