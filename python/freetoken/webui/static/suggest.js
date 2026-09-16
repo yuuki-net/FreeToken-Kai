@@ -15,7 +15,8 @@ const FTSuggest = (() => {
   }
 
   // -> {state, facts, suggestions[]}; state says why there is nothing to suggest
-  function compute({ exp, stats, geo }) {
+  // modelMax: the checkpoint's own context limit (max_position_embeddings), when known
+  function compute({ exp, stats, geo, modelMax }) {
     const { fmt, t } = FT;
     const ranks = exp.ranks || [];
     if (!ranks.length) return { state: "no_data", suggestions: [] };
@@ -85,6 +86,38 @@ const FTSuggest = (() => {
           detail: t("tun_sug_ctx_d", { freed: fmt.gib(halfKv), slots: fmt.num(slots), cur: fmt.num(cached), all: fmt.num(allExperts) }),
           flag: "--max-seq-len-override",
           set: [{ flag: "--max-seq-len-override", value: String(half) }, { flag: "--kv-reserve-tokens", value: String(half) }],
+        });
+      }
+    }
+    // The recommended context is a value that starts, sized by the card. Once the server runs, the
+    // free VRAM is measured: grow the KV pool into it, or, when the expert cache sizes itself
+    // (--moe-cache-auto), give up at most a tenth of that cache for it and say so.
+    const halving = out.some((s) => s.flag === "--max-seq-len-override");
+    if (!halving && geo.num_pages && ub.kv_per_token) {
+      const now = geo.num_pages * (geo.page_size || 1);
+      const cap = Math.min(modelMax || 262144, geo.limits?.kv_tokens?.max || Infinity);
+      const measured = Math.min(...ranks.map((r) => r.gpu?.free_bytes || 0));
+      const free = Math.max(0, measured - 0.6 * GiB);
+      const autoCache = isMoe && !exp.config?.moe_cache_size && geo.moe_cache_size > 0 && ub.moe_per_expert > 0;
+      let best = null;
+      for (const ctx of [32768, 65536, 131072, 262144]) {
+        if (ctx < now * 1.5 || ctx > cap) continue;
+        const need = (ctx - now) * ub.kv_per_token;
+        const lost = need <= free ? 0 : autoCache ? Math.ceil((need - free) / ub.moe_per_expert) : null;
+        if (lost == null) continue;
+        // experts the GPU already misses are not worth trading away
+        if (lost > 0 && (lost > geo.moe_cache_size * 0.1 || (hit != null && hit < 0.9))) continue;
+        best = { ctx, need, lost };
+      }
+      if (best) {
+        const vars = { ctx: fmt.num(best.ctx), now: fmt.num(now), need: fmt.gib(best.need), free: fmt.gib(measured) };
+        out.push({
+          impact: best.lost ? 1 : 2, title: t("tun_sug_ctx_up", vars),
+          detail: best.lost
+            ? t("tun_sug_ctx_up_trade", { ...vars, lost: fmt.num(best.lost), pct: fmt.pct(best.lost / geo.moe_cache_size, 0), hit: hit != null ? fmt.pct(hit) : "—" })
+            : t("tun_sug_ctx_up_free", vars) + (out.some((s) => s.flag === "--moe-cache-size") ? " " + t("tun_sug_ctx_up_or") : ""),
+          flag: "--kv-reserve-tokens",
+          set: [{ flag: "--kv-reserve-tokens", value: String(best.ctx) }, { flag: "--max-seq-len-override", value: String(best.ctx) }],
         });
       }
     }

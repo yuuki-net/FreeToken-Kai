@@ -15,15 +15,15 @@
         <div class="small muted" data-i18n="dash_model"></div>
         <div id="eng-model" style="font-weight:600;font-size:16px;word-break:break-all">—</div>
       </div>
-      <div id="eng-load" hidden style="min-width:220px;flex:1">
-        <div class="small muted" id="eng-load-l"></div>
-        <div class="bar"><div id="eng-load-bar" style="width:0;background:var(--accent)"></div></div>
-      </div>
       <span class="grow"></span>
       <div style="display:flex;gap:20px;align-items:flex-start">
         <div><div class="small muted" data-i18n="dash_state"></div><div id="eng-state">—</div></div>
         <div><div class="small muted" data-i18n="dash_uptime"></div><div id="eng-uptime">—</div></div>
       </div>
+    </div>
+    <div id="eng-load" hidden style="margin-top:10px">
+      <div class="small muted" id="eng-load-l"></div>
+      <div class="bar"><div id="eng-load-bar" style="width:0;background:var(--accent)"></div></div>
     </div>
     <div id="eng-msg" class="small" style="margin-top:6px" hidden></div>
   </section>
@@ -78,6 +78,12 @@
     </div>
   </section>
 
+  <section class="card" id="heat-card" hidden>
+    <h2 data-i18n="heat_title"></h2>
+    <p class="hint" data-i18n="heat_hint"></p>
+    <div id="heat"></div>
+  </section>
+
   <section class="grid g2" id="daemon-only" hidden>
     <div class="card">
       <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
@@ -96,6 +102,7 @@
 </main>
 <script src="i18n.js"></script>
 <script src="suggest.js"></script>
+<script src="heatmap.js"></script>
 <script src="common.js"></script>
 <script src="demo.js"></script>
 <script src="profile-editor.js"></script>

@@ -6,7 +6,7 @@
   FT.header("dash");
   const managed = FT.mode === "mgr";
 
-  const hist = []; // [t, decode, prefill], last 10 minutes
+  const hist = FT.demoHistory ? FT.demoHistory() : []; // [t, decode, prefill], last 10 minutes
   let geometry = null, reqCursor = 0, requests = [], engineConfig = null, lastStatsHost = false;
   let engineRunning = null;  // the manager's own engine: drives which buttons a profile row shows
 
@@ -31,12 +31,13 @@
     $("#eng-state").innerHTML = `<span class="pill ${label[0]}"><span class="dot"></span>${esc(label[1])}</span>`;
     $("#eng-uptime").textContent = status === "ok" ? fmt.dur(health.uptime_s) : t("none");
 
+    // the state pill already says "loading": a bar only when the serve reports bytes to count
+    const { done_bytes: done = 0, total_bytes: tot = 0 } = health.progress || {};
     const load = $("#eng-load");
-    load.hidden = status !== "loading";
-    if (status === "loading" && health.progress) {
-      const { done_bytes: d, total_bytes: tot } = health.progress;
-      $("#eng-load-bar").style.width = tot ? (100 * d / tot).toFixed(1) + "%" : "0";
-      $("#eng-load-l").textContent = t("dash_load_phase", { phase: health.phase || "", sizes: tot ? `${fmt.gib(d)} / ${fmt.gib(tot)}` : "" });
+    load.hidden = !(status === "loading" && tot > 0);
+    if (!load.hidden) {
+      $("#eng-load-bar").style.width = Math.min(100, 100 * done / tot).toFixed(1) + "%";
+      $("#eng-load-l").textContent = t("dash_load_bytes", { done: fmt.gib(done), total: fmt.gib(tot), pct: fmt.pct(done / tot, 0) });
     }
     const msg = $("#eng-msg");
     msg.hidden = !(external || status === "error" || (status === "stopped" && health.last_exit_code != null));
@@ -227,6 +228,19 @@
     }).join("");
   }
 
+  // ---------------------------------------------------------------- experts heatmap
+  let heatBusy = false;
+  async function pollHeat() {
+    if (heatBusy || $("#eng-uptime").textContent === t("none")) return;
+    heatBusy = true;
+    try {
+      const doc = await FT.serveGet("/v1/kai/experts", "?window=300&freq=true");
+      const card = $("#heat-card");
+      card.hidden = !(doc.ranks || []).some((r) => r.moe);
+      if (!card.hidden) FTHeatmap.render($("#heat"), doc);
+    } catch {} finally { heatBusy = false; }
+  }
+
   async function pollGeometry() { try { geometry = (await FT.serveGet("/v1/cache/status")).geometry; } catch {} }
 
   // ---------------------------------------------------------------- ft mgr: lifecycle, profiles, logs
@@ -278,7 +292,7 @@
           <div class="small muted" style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis"
                title="${esc(homePath((p.args || []).join(" ")))}">${esc(modelName(p.model))} · ${esc(p.port ? t("dash_port", { port: p.port }) : t("dash_port_default"))}${flags.length ? ` · ${esc(shown + more)}` : ""}</div>
         </div>
-        <div style="display:flex;gap:4px;flex-shrink:0;align-self:center">
+        <div style="display:flex;gap:4px;flex-shrink:0;align-self:center" ${FT.canWrite ? "" : "hidden"}>
           ${sameServer
             ? iconBtn("stop", i, t("dash_stop")) + iconBtn("restart", i, t(stale ? "dash_restart_apply" : "dash_restart"))
             : iconBtn("apply", i, t("dash_apply_tip"))}
@@ -287,18 +301,18 @@
           ${iconBtn("del", i, t("dash_delete"))}
         </div></div>`;
     }).join("") : `<div class="empty small">${esc(t("dash_profiles_none"))}</div>`;
-    $("#profiles").onclick = (ev) => {
+    $("#profiles").onclick = async (ev) => {
       const b = ev.target.closest("button[data-act]"); if (!b) return;
       const p = list[+b.dataset.i];
       if (b.dataset.act === "apply") {
-        if (!confirm(t("dash_confirm_apply", { name: p.name }))) return;
+        if (!await FT.ask(t("dash_confirm_apply", { name: p.name }), { title: t("dash_apply_tip"), ok: t("dash_ok_start") })) return;
         lifecycle(t("dash_lc_apply"), () => FT.raw("/engine/switch", { method: "POST", json: { model: p.model, port: p.port, args: p.args } }));
       } else if (b.dataset.act === "stop") {
-        if (!confirm(t("dash_confirm_stop"))) return;
+        if (!await FT.ask(t("dash_confirm_stop"), { title: t("dash_stop"), ok: t("dash_stop"), danger: true })) return;
         lifecycle(t("dash_lc_stop"), () => FT.raw("/engine/stop", { method: "POST", json: {} }));
       } else if (b.dataset.act === "restart") {
         // restarting from the row uses the profile's flags, so an edited profile is applied here
-        if (!confirm(t("dash_confirm_restart"))) return;
+        if (!await FT.ask(t("dash_confirm_restart"), { title: t("dash_restart"), ok: t("dash_restart") })) return;
         lifecycle(t("dash_lc_restart"), () => FT.raw("/engine/switch", { method: "POST", json: { model: p.model, port: p.port, args: p.args } }));
       } else if (b.dataset.act === "edit") editProfile(p);
       else if (b.dataset.act === "copy") {
@@ -308,8 +322,8 @@
         editProfile({ name, model: p.model, port: p.port, args: p.args, _new: true });
       }
       else if (b.dataset.act === "del") {
-        if (!confirm(t("dash_confirm_delete", { name: p.name }))) return;
-        FT.raw(`/profiles/${encodeURIComponent(p.name)}`, { method: "DELETE" }).then(loadProfiles, (e) => alert(e.body?.detail || e.message));
+        if (!await FT.ask(t("dash_confirm_delete", { name: p.name }), { title: t("dash_delete"), ok: t("dash_delete"), danger: true })) return;
+        FT.raw(`/profiles/${encodeURIComponent(p.name)}`, { method: "DELETE" }).then(loadProfiles, (e) => FT.notice(e.body?.detail || e.body?.error || e.message, t("dash_delete")));
       }
     };
   }
@@ -340,6 +354,7 @@
 
   if (managed) {
     $("#daemon-only").hidden = false;
+    $("#btn-save-profile").hidden = !FT.canWrite;
     $("#btn-save-profile").onclick = () => editProfile(engineConfig?.model ? { model: engineConfig.model, port: engineConfig.port, args: engineConfig.args } : {});
     await loadConfig();
     $("#btn-save-profile").textContent = t(engineConfig?.model ? "dash_profile_save_current" : "dash_profile_add");
@@ -352,6 +367,8 @@
   setInterval(tick, 2000);
   setInterval(pollRequests, 5000);
   setInterval(pollGeometry, 15000);
+  setTimeout(pollHeat, 1500);
+  setInterval(pollHeat, 10000);
   pollHost();
   setInterval(pollHost, 3000);
   addEventListener("resize", drawChart);

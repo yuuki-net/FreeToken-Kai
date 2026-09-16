@@ -45,7 +45,14 @@ if (FT.demo) {
       { ts: new Date(t0 - 240e3).toISOString(), path: "/v1/chat/completions", status: 200, duration_ms: 69800, ttft_ms: 1200, prompt_tokens: 38560, completion_tokens: 1204 },
       { ts: new Date(t0 - 5e3).toISOString(), path: "/v1/chat/completions", status: 200, duration_ms: 3000, ttft_ms: 3000, prompt_tokens: 41208, completion_tokens: null },
     ] }),
-    "/v1/kai/experts": () => ({
+    "/v1/kai/experts": (q) => ({
+      expert_freq: /freq=(1|true)/.test(q || "") ? [0, 1].map((r) => ({ rank: r, layer_range: r ? [24, 48] : [0, 24], seconds: 300,
+        freq: Array.from({ length: L }, (_, i) => {
+          const order = Array.from({ length: E }, (_, k) => k).sort(() => rnd() - 0.5);
+          const row = new Array(E).fill(0);
+          order.forEach((id, k) => { row[id] = Math.round(2400 / Math.pow(k + 1, 1.35 + 0.15 * Math.sin(i + r)) * (0.8 + rnd() * 0.4)); });
+          return row;
+        }) })) : null,
       window: "300", layers, host_memory: { mem_total: 128 * GiB, mem_available: 41 * GiB },
       config: { moe_bank_ram: "24G", kv_cache_dtype: "q8_0", pp_size: 2, spec_mtp: 2 },
       ranks: [0, 1].map((r) => ({
@@ -55,6 +62,12 @@ if (FT.demo) {
       })),
     }),
   };
+  // ten minutes of made-up samples, so the chart is not empty when the page opens
+  FT.demoHistory = () => Array.from({ length: 300 }, (_, i) => {
+    const ts = t0 - (300 - i) * 2000, x = i / 300;
+    const busy = x < 0.35 || (x > 0.55 && x < 0.8) || x > 0.9;
+    return [ts, busy ? 18.4 + Math.sin(i / 5) * 1.2 + (rnd() - 0.5) : 0, busy && (i % 60 < 12) ? 380 + rnd() * 120 : 0];
+  });
   FT.serveGet = async (path, query) => {
     const f = docs[path];
     if (!f) throw new FT.HttpError(404, null);

@@ -339,7 +339,7 @@ const FTProfileEditor = (() => {
           : `<button type="button" style="flex-shrink:0" data-set='${esc(JSON.stringify(pair(n)))}'>${esc(t(n.state === "change" ? "pe_rec_do_change" : "pe_apply"))}</button>`;
         return `<div class="kv" style="align-items:flex-start;gap:12px;padding:6px 0;${n.state === "set" ? "opacity:.6" : ""}">
             <span style="flex:1;min-width:0"><span style="display:flex;gap:8px;align-items:center;flex-wrap:wrap"><code>${flagText(n)}</code>${pill}</span>
-              ${change}<div class="small muted" style="margin-top:2px">${esc(n.why)}</div></span>${action}
+              ${change}<div class="small muted" style="margin-top:2px">${esc(FTI18N.lang === "en" && n.why_en ? n.why_en : n.why)}</div></span>${action}
           </div>`;
       };
       const summary = todo.length
@@ -362,7 +362,10 @@ const FTProfileEditor = (() => {
     $("#pe-tune", d).onclick = async () => {
       advice(t("pe_tune"), `<div class="small muted">${esc(t("pe_working"))}</div>`);
       let data;
-      try { data = await FTSuggest.load(); }
+      try {
+        data = await FTSuggest.load();
+        data.modelMax = meta?.models.find((x) => x.value === modelValue())?.max_context || null;
+      }
       catch (e) { return advice(t("pe_tune"), `<div class="small" style="color:var(--bad)">${esc(e.body?.detail || e.message)}</div>`); }
       const { state, facts, suggestions } = FTSuggest.compute(data);
       const v = FTSuggest.verdict(state, facts);

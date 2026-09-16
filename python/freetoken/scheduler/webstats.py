@@ -10,7 +10,11 @@ buffer with ``non_blocking=True`` behind a CUDA event and read back on a later t
 has fired. Host-side numbers (VRAM, page faults, bank reads, token totals) are plain reads.
 
 The file also carries windowed deltas (last 60 s / 300 s / since start) of every counter, so the
-page does not have to stay open for rates to exist."""
+page does not have to stay open for rates to exist.
+
+With ``--moe-stats-out`` the cache also counts how often each expert is routed (``decode_freq``,
+layers x experts). That goes to ``rank<N>.experts.json`` every 10 s instead: it is 10k+ numbers,
+too big to rewrite every 2 s or to keep 150 copies of for the windows."""
 
 from __future__ import annotations
 
@@ -30,6 +34,7 @@ logger = init_logger(__name__)
 
 INTERVAL_S = 2.0
 WINDOWS_S = (60, 300)
+FREQ_INTERVAL_S = 10.0
 
 
 class WebStatsPublisher:
@@ -39,6 +44,9 @@ class WebStatsPublisher:
         self.rank, self.size = cfg.tp_info.rank, cfg.tp_info.size
         self.dir = stats_dir(getattr(cfg, "server_port", None))
         self.path = os.path.join(self.dir, f"rank{self.rank}.json") if self.dir else None
+        self.freq_path = os.path.join(self.dir, f"rank{self.rank}.experts.json") if self.dir else None
+        self._freq_history: deque[tuple[float, torch.Tensor]] = deque()
+        self._freq_last = -FREQ_INTERVAL_S
         self.started = time.time()
         self._last = 0.0
         self._pending: tuple[Any, dict, dict] | None = None  # (event, host_bufs, host_snapshot)
@@ -48,8 +56,9 @@ class WebStatsPublisher:
         if self.path:
             try:
                 os.makedirs(self.dir, exist_ok=True)
-                if os.path.exists(self.path):
-                    os.remove(self.path)  # a previous run's file must not pass for this one
+                for stale in (self.path, self.freq_path):
+                    if os.path.exists(stale):
+                        os.remove(stale)  # a previous run's file must not pass for this one
             except OSError as exc:
                 logger.warning("web console stats disabled: %s", exc)
                 self.path = None
@@ -97,6 +106,10 @@ class WebStatsPublisher:
                     "active": cache.lru_stats[:, Stat.ACTIVE], "miss": cache.lru_stats[:, Stat.MISS],
                     "calls": cache.lru_stats[:, Stat.CALLS],
                 }
+        now = time.monotonic()
+        if cache is not None and getattr(cache, "collect_decode_freq", False) and now - self._freq_last >= FREQ_INTERVAL_S:
+            self._freq_last = now
+            dev_tensors["expert_freq"] = cache.decode_freq
         ev = None
         if dev_tensors:
             with torch.cuda.stream(eng.stream):
@@ -159,6 +172,10 @@ class WebStatsPublisher:
     def _finish(self) -> None:
         _ev, bufs, snap = self._pending
         self._pending = None
+        bufs = dict(bufs)
+        freq = bufs.pop("expert_freq", None)
+        if freq is not None:
+            self._write_freq(snap["t_mono"], freq.clone())
         cum = dict(snap["counters"])
         for k, b in bufs.items():
             cum["layer_" + k] = [int(x) for x in b.tolist()]
@@ -183,10 +200,31 @@ class WebStatsPublisher:
             "prefill_chunk": snap.get("prefill_chunk"),
             "cumulative": cum, "windows": windows,
         }
-        tmp = f"{self.path}.tmp"
-        with open(tmp, "w") as fh:
-            json.dump(doc, fh, separators=(",", ":"))
-        os.replace(tmp, self.path)
+        _write_json(self.path, doc)
+
+    def _write_freq(self, now: float, freq: torch.Tensor) -> None:
+        self._freq_history.append((now, freq))
+        while self._freq_history and now - self._freq_history[0][0] > max(WINDOWS_S) + 2 * FREQ_INTERVAL_S:
+            self._freq_history.popleft()
+        windows = {}
+        for w in WINDOWS_S:
+            base = next((h for h in self._freq_history if now - h[0] <= w + FREQ_INTERVAL_S / 2), None)
+            if base is not None and base[0] < now:
+                windows[str(w)] = {"seconds": now - base[0], "freq": (freq - base[1]).tolist()}
+        cfg = self.s.config
+        _write_json(self.freq_path, {
+            "v": 1, "rank": self.rank, "time": time.time(),
+            "layer_range": list(getattr(cfg, "pp_layer_range", None) or []) or None,
+            "cumulative": {"seconds": now - self._freq_history[0][0], "freq": freq.tolist()},
+            "windows": windows,
+        })
+
+
+def _write_json(path: str, doc: dict) -> None:
+    tmp = f"{path}.tmp"
+    with open(tmp, "w") as fh:
+        json.dump(doc, fh, separators=(",", ":"))
+    os.replace(tmp, path)
 
 
 def _delta(cur: dict, base: dict) -> dict:

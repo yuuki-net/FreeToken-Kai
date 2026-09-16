@@ -164,39 +164,58 @@ def recommend(model: str, *, extra_dirs: list[str] | None = None) -> dict:
     flags: list[str] = []
     notes: list[dict] = []
 
-    def add(flag: str, value: str | None, why: str) -> None:
+    def add(flag: str, value: str | None, why: str, why_en: str) -> None:
         flags.append(flag)
         if value is not None:
             flags.append(value)
-        notes.append({"flag": flag, "value": value, "why": why})
+        notes.append({"flag": flag, "value": value, "why": why, "why_en": why_en})
 
     # --- bf16 is emulated before Ampere: measured 592 -> 285 tok/s of prompt processing on a 2060
     caps = [g.get("compute_cap") for g in cards if g.get("compute_cap")]
     if caps and max(caps) < 8.0:
+        sm = int(min(caps) * 10)
         add("--dtype", "float16",
-            f"この GPU（sm_{int(min(caps) * 10)}）は bfloat16 を持たないので、float16 で動かします。"
+            f"この GPU（sm_{sm}）は bfloat16 を持たないので、float16 で動かします。"
             "指定しないとプロンプト処理が半分程度まで落ちます（2060・Ornith で 592 → 285 tok/s の実測）。"
-            "ただし読み込み時に変換のコピーが増えるので、VRAM がぎりぎりのモデルでは起動できないことがあります（その場合はこの行を外します）。")
+            "ただし読み込み時に変換のコピーが増えるので、VRAM がぎりぎりのモデルでは起動できないことがあります（その場合はこの行を外します）。",
+            f"This GPU (sm_{sm}) has no bfloat16, so run in float16. Without it prompt processing drops to about half "
+            "(592 -> 285 tok/s measured on a 2060 with Ornith). The conversion needs an extra copy while loading, so a model "
+            "that barely fits in VRAM may not start with it (drop this line then).")
 
     # --- how many cards, and does the model fit on one?
     if len(cards) > 1 and resident and resident > vram * 0.75:
-        add("--pp-size", str(len(cards)), f"エキスパート以外の重みが約 {resident / GiB:.1f} GiB で 1 枚（{vram / GiB:.0f} GiB）に収まらないので、層を {len(cards)} 枚に分けます。")
-        add("--gpu", ",".join(str(g["index"]) for g in cards), "pp のランク順に GPU を並べます。")
+        add("--pp-size", str(len(cards)),
+            f"エキスパート以外の重みが約 {resident / GiB:.1f} GiB で 1 枚（{vram / GiB:.0f} GiB）に収まらないので、層を {len(cards)} 枚に分けます。",
+            f"The weights other than the experts are about {resident / GiB:.1f} GiB and do not fit one {vram / GiB:.0f} GiB card, "
+            f"so the layers are split across {len(cards)}.")
+        add("--gpu", ",".join(str(g["index"]) for g in cards), "pp のランク順に GPU を並べます。", "The GPUs in pipeline rank order.")
     elif len(cards) > 1:
-        add("--gpu", "0", "モデルは 1 枚に収まるので、GPU 0 だけを使います。")
+        add("--gpu", "0", "モデルは 1 枚に収まるので、GPU 0 だけを使います。", "The model fits one card, so only GPU 0 is used.")
 
     # --- experts: where they run, and how much RAM they may take
     if is_moe:
         if vram <= 8 * GiB:
-            add("--moe-strategy", "hybrid", f"VRAM が {vram / GiB:.0f} GiB と小さいので、GPU に載らないエキスパートは CPU で計算します。")
-            add("--moe-cpu-layers", "auto", "CPU に回す層を実測から決めます（WSL では GPU に固定できる RAM に上限があります）。")
-            add("--moe-cpu-threads", str(max(2, min(cores - 2, 8))), f"物理コア {cores} 個から、ほかの処理のぶんを残した数です。")
-        add("--moe-cache-auto", None, "空いている VRAM から、GPU に載せるエキスパートの枠を自動で決めます。")
+            add("--moe-strategy", "hybrid",
+                f"VRAM が {vram / GiB:.0f} GiB と小さいので、GPU に載らないエキスパートは CPU で計算します。",
+                f"With {vram / GiB:.0f} GiB of VRAM, experts that are not on the GPU are computed on the CPU.")
+            add("--moe-cpu-layers", "auto",
+                "CPU に回す層を実測から決めます（WSL では GPU に固定できる RAM に上限があります）。",
+                "Which layers run on the CPU is decided from measurements (under WSL the RAM that can be pinned for the GPU is capped).")
+            add("--moe-cpu-threads", str(max(2, min(cores - 2, 8))),
+                f"物理コア {cores} 個から、ほかの処理のぶんを残した数です。",
+                f"{cores} physical cores, leaving some for everything else.")
+        add("--moe-cache-auto", None,
+            "空いている VRAM から、GPU に載せるエキスパートの枠を自動で決めます。",
+            "The number of experts kept on the GPU is sized from the free VRAM.")
         if weights and mem.get("total") and weights > mem["total"]:
             cap = max(8, int((mem["total"] * 0.7) / GiB))
-            add("--moe-bank-ram", f"{cap}G", f"重み {weights / GiB:.0f} GiB が RAM {mem['total'] / GiB:.0f} GiB に収まらないので、入る分だけ RAM に置き、残りは SSD から読みます。")
+            add("--moe-bank-ram", f"{cap}G",
+                f"重み {weights / GiB:.0f} GiB が RAM {mem['total'] / GiB:.0f} GiB に収まらないので、入る分だけ RAM に置き、残りは SSD から読みます。",
+                f"{weights / GiB:.0f} GiB of weights do not fit {mem['total'] / GiB:.0f} GiB of RAM: keep what fits in RAM and read the rest from the SSD.")
         if vram - resident < 2 * GiB and vram <= 8 * GiB:
-            add("--disable-moe-prefill-overlap", None, "プロンプト処理の 2 バッファ分の VRAM が残らないので、重ね合わせを切ります。")
+            add("--disable-moe-prefill-overlap", None,
+                "プロンプト処理の 2 バッファ分の VRAM が残らないので、重ね合わせを切ります。",
+                "There is no VRAM left for prompt processing's second buffer, so the overlap is turned off.")
 
     # --- context: what fits in what is left after the weights
     # Context: a value that starts, not a prediction. What actually fits depends on buffers this
@@ -207,21 +226,31 @@ def recommend(model: str, *, extra_dirs: list[str] | None = None) -> dict:
         tier = 16384 if vram <= 8 * GiB else 65536 if vram <= 16 * GiB else 131072
         ctx = min(max_ctx, tier)
         if is_moe:
-            add("--kv-cache-dtype", "q8_0", "KV を量子化して、空いた VRAM をエキスパートに回します。")
-        size = f"{ctx * per_token / GiB:.1f} GiB" if per_token else "不明"
+            add("--kv-cache-dtype", "q8_0", "KV を量子化して、空いた VRAM をエキスパートに回します。",
+                "Quantize the KV cache and give the VRAM it frees to the experts.")
+        size = f"{ctx * per_token / GiB:.1f} GiB" if per_token else None
         add("--kv-reserve-tokens", str(ctx),
-            f"まず起動できる長さです（KV {size}、VRAM {vram / GiB:.0f} GiB のカード向け）。起動後に GPU の空きを見て増やせます。")
-        add("--max-seq-len-override", str(ctx), "宣伝する長さと実際に入る長さをそろえます。")
+            f"まず起動できる長さです（KV {size or '不明'}、VRAM {vram / GiB:.0f} GiB のカード向け）。起動後に「改善提案」が GPU の空きを見て伸ばす値を出します。",
+            f"A length that starts (KV {size or 'unknown'}, for a {vram / GiB:.0f} GiB card). Once the server runs, "
+            "“From measurements” proposes a longer one from the free VRAM.")
+        add("--max-seq-len-override", str(ctx), "宣伝する長さと実際に入る長さをそろえます。",
+            "The advertised context matches what actually fits.")
     if facts.get("model_type") in ("qwen3_5_moe", "qwen4_exp") and vram <= 8 * GiB:
-        add("--host-embedding", None, "埋め込み表を RAM に置いて、その分の VRAM を KV に回します。")
+        add("--host-embedding", None, "埋め込み表を RAM に置いて、その分の VRAM を KV に回します。",
+            "Keep the embedding table in RAM and give its VRAM to the KV cache.")
 
     # --- the rest
-    add("--memory-ratio", "0.85", "画面表示やほかのアプリが使う VRAM の余地を残します。")
-    add("--max-running-req", "1", "1 リクエストずつ処理します（小さいカードでは同時実行より安定します）。")
+    add("--memory-ratio", "0.85", "画面表示やほかのアプリが使う VRAM の余地を残します。",
+        "Leave VRAM for the display and other applications.")
+    add("--max-running-req", "1", "1 リクエストずつ処理します（小さいカードでは同時実行より安定します）。",
+        "One request at a time (steadier than concurrency on small cards).")
     if facts.get("vision"):
-        add("--mm-encoder-weights", "cpu", "画像の処理を CPU で行い、VRAM を使いません。")
-    add("--host", "0.0.0.0", "同じ LAN のほかの PC や Docker からつながるようにします。")
-    add("--decode-log-interval", "5", "生成中の速度をログで追えるようにします。")
+        add("--mm-encoder-weights", "cpu", "画像の処理を CPU で行い、VRAM を使いません。",
+            "Images are encoded on the CPU, using no VRAM.")
+    add("--host", "0.0.0.0", "同じ LAN のほかの PC や Docker からつながるようにします。",
+        "Reachable from other PCs on the LAN and from Docker.")
+    add("--decode-log-interval", "5", "生成中の速度をログで追えるようにします。",
+        "Generation speed shows up in the log while it runs.")
 
     return {
         "model": path,

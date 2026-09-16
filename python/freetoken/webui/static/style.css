@@ -81,6 +81,9 @@ pre.log { font-family: var(--mono); font-size: 12px; line-height: 1.5; backgroun
 canvas { display: block; width: 100%; }
 svg text { fill: var(--fg3); font-size: 11px; }
 dialog { border: 1px solid var(--line2); border-radius: 12px; background: var(--card); color: var(--fg); max-width: min(520px, 92vw); }
+dialog.ask { width: min(440px, 92vw); box-sizing: border-box; padding: 18px 20px; }
+dialog.ask .ask-msg { font-size: 14px; line-height: 1.6; white-space: pre-wrap; }
+button.danger-fill { background: var(--bad); color: var(--card); border-color: var(--bad); }
 dialog::backdrop { background: rgba(0,0,0,.4); }
 dialog.pe { max-width: none; width: min(1040px, 96vw); box-sizing: border-box; }
 .pe-split { display: grid; grid-template-columns: minmax(0, 1.35fr) minmax(0, 1fr); gap: 12px; align-items: start; }
@@ -102,6 +105,10 @@ dialog.pe { max-width: none; width: min(1040px, 96vw); box-sizing: border-box; }
 @media (max-width: 720px) { .pe-split { grid-template-columns: minmax(0, 1fr); } .pe-right { position: static; } }
 dialog.pe form { width: 100% !important; }
 dialog.pe input, dialog.pe select, dialog.pe textarea { box-sizing: border-box; max-width: 100%; }
+.heat-strip { display: flex; gap: 1px; height: 28px; border-radius: 4px; overflow: hidden; }
+.heat-cell { flex: 1; min-width: 0; }
+.heat-ticks { display: flex; gap: 1px; font-size: 10px; color: var(--fg3); height: 14px; white-space: nowrap; }
+.heat-scale { display: inline-block; width: 120px; height: 10px; border-radius: 2px; background: linear-gradient(90deg, var(--tile), var(--c-ssd)); box-shadow: inset 0 0 0 1px var(--line); }
 .legend.one-line { flex-wrap: nowrap; gap: 10px; white-space: nowrap; overflow: hidden; }
 .icon-btn { width: 30px; height: 30px; padding: 0; display: inline-flex; align-items: center; justify-content: center; }
 .icon-btn svg { width: 16px; height: 16px; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }

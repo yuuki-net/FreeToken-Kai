@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import time
 from typing import Any, Callable
 
@@ -16,13 +17,38 @@ from fastapi import FastAPI
 from freetoken.webui.stats_path import stats_dir
 
 
+_RANK_FILE = re.compile(r"rank\d+\.json")
+_FREQ_FILE = re.compile(r"rank\d+\.experts\.json")
+
+
+def read_expert_freq(port: int | None, window: str) -> list[dict] | None:
+    """Per-rank routing counts (layers x experts) over the window, or None when not collected."""
+    d = stats_dir(port)
+    if not d or not os.path.isdir(d):
+        return None
+    out = []
+    for name in sorted(os.listdir(d)):
+        if not _FREQ_FILE.fullmatch(name):
+            continue
+        try:
+            with open(os.path.join(d, name)) as fh:
+                doc = json.load(fh)
+        except (OSError, ValueError):
+            continue
+        src = (doc.get("windows") or {}).get(window) or doc.get("cumulative") or {}
+        if src.get("freq"):
+            out.append({"rank": doc.get("rank"), "layer_range": doc.get("layer_range"),
+                        "seconds": src.get("seconds"), "freq": src["freq"]})
+    return sorted(out, key=lambda r: r.get("rank") or 0) or None
+
+
 def read_ranks(port: int | None) -> list[dict]:
     d = stats_dir(port)
     if not d or not os.path.isdir(d):
         return []
     out = []
     for name in sorted(os.listdir(d)):
-        if not (name.startswith("rank") and name.endswith(".json")):
+        if not _RANK_FILE.fullmatch(name):
             continue
         try:
             with open(os.path.join(d, name)) as fh:
@@ -114,7 +140,7 @@ def kai_block(state: Any) -> dict | None:
     }
 
 
-def experts_doc(state: Any, window: str = "300") -> dict:
+def experts_doc(state: Any, window: str = "300", freq: bool = False) -> dict:
     config = getattr(state, "config", None)
     ranks = read_ranks(getattr(config, "server_port", None))
     layers = []
@@ -145,6 +171,8 @@ def experts_doc(state: Any, window: str = "300") -> dict:
     model = getattr(config, "model_config", None)
     return {
         "window": window,
+        # only on request: 10k+ numbers the suggestions do not need
+        "expert_freq": read_expert_freq(getattr(config, "server_port", None), window) if freq else None,
         "ranks": per_rank,
         "layers": layers,
         "host_memory": _meminfo(),
@@ -163,5 +191,5 @@ def experts_doc(state: Any, window: str = "300") -> dict:
 
 def register_kai_routes(app: FastAPI, get_state: Callable[[], Any]) -> None:
     @app.get("/v1/kai/experts")
-    async def kai_experts(window: str = "300"):
-        return experts_doc(get_state(), window if window in ("60", "300") else "300")
+    async def kai_experts(window: str = "300", freq: bool = False):
+        return experts_doc(get_state(), window if window in ("60", "300") else "300", freq)

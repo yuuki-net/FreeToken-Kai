@@ -124,6 +124,7 @@ def main(argv: Sequence[str] | None = None, *, prog: str = "ft daemon", console:
     from .proxy import ServeProbe
     from .serve_manager import ServeManager
     from .tailer import LogTailer
+    from freetoken.webui.auth import load_or_create_token
 
     state_dir = args.state_dir
     log_dir = os.path.join(state_dir, "logs")
@@ -202,7 +203,8 @@ def main(argv: Sequence[str] | None = None, *, prog: str = "ft daemon", console:
         lifecycle_pool=lifecycle_pool,
         proxy_pool=proxy_pool,
         default_serve_port=args.default_serve_port,
-        token=args.token,
+        # ft mgr keeps reads open to the network, so its --token only guards operations (write_token)
+        token=None if console else args.token,
         checkpoints=checkpoints,
         started_wall=time.time(),
         shutdown_hook=shutdown_hook,
@@ -210,6 +212,8 @@ def main(argv: Sequence[str] | None = None, *, prog: str = "ft daemon", console:
         console=console,
         console_cache_dir=os.path.join(state_dir, "console"),
         serve_python=args.serve_python,
+        # ft mgr: operating from another PC needs this (--token when given, else one kept in the state dir)
+        write_token=(args.token or load_or_create_token(state_dir)) if console else None,
     )
 
     import uvicorn
@@ -235,6 +239,8 @@ def main(argv: Sequence[str] | None = None, *, prog: str = "ft daemon", console:
 
     logger.info("%s %s listening on %s:%s (state-dir=%s)%s", prog, DAEMON_VERSION, args.host, args.port, state_dir,
                 f" — web console: http://{args.host}:{args.port}/ui/" if console else "")
+    if console:
+        logger.info("other PCs may watch; operating from them needs the token shown in the console on this PC")
     try:
         server.run()
     finally:

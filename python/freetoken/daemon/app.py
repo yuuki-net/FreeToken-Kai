@@ -138,6 +138,7 @@ def build_app(
     console: bool = False,
     console_cache_dir: str | None = None,
     serve_python: str | None = None,
+    write_token: str | None = None,
 ) -> FastAPI:
     import time as _time
 
@@ -170,6 +171,16 @@ def build_app(
                     status_code=403,
                     content={"error": "cross-origin write refused", "code": "cross_origin"},
                 )
+            # ft mgr: anyone may look, only this PC or a token holder may act (webui/auth.py)
+            if console:
+                from freetoken.webui.auth import may_write
+
+                client = request.client.host if request.client else None
+                if not may_write(client, request.headers.get("host"), request.headers.get("x-ft-token"), write_token):
+                    return JSONResponse(
+                        status_code=403,
+                        content={"error": "operating ft mgr from another PC needs its token", "code": "write_needs_token"},
+                    )
         return await call_next(request)
 
     def require_token(x_ft_token: str | None = Header(default=None)) -> None:
@@ -445,6 +456,23 @@ def build_app(
         # routes fall back to that port whenever the daemon itself runs nothing. The upstream
         # /engine/health and /engine/stats keep reporting only the daemon's own engine.
 
+        @app.get("/auth", dependencies=auth)
+        async def console_auth(request: Request):
+            # what this browser may do; the token itself only goes to a browser on this PC
+            from freetoken.webui.auth import is_local, token_matches
+
+            client = request.client.host if request.client else None
+            local = is_local(client, request.headers.get("host"))
+            given = request.headers.get("x-ft-token")
+            valid = token_matches(given, write_token)
+            return {
+                "local": local,
+                "write": local or valid,
+                "token_given": bool(given),
+                "token_valid": valid,
+                "token": write_token if local else None,
+            }
+
         @app.get("/engine/config", dependencies=auth)
         async def engine_config():
             st = manager.status()
@@ -480,8 +508,8 @@ def build_app(
             return await _proxied("/v1/cache/status")
 
         @app.get("/engine/kai/experts", dependencies=auth)
-        async def engine_kai_experts(window: str = "300"):
-            return await _proxied(f"/v1/kai/experts?window={quote(window)}")
+        async def engine_kai_experts(window: str = "300", freq: bool = False):
+            return await _proxied(f"/v1/kai/experts?window={quote(window)}&freq={str(freq).lower()}")
 
         @app.get("/host", dependencies=auth)
         async def host():

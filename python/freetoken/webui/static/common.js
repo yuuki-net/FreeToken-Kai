@@ -6,6 +6,8 @@ const FT = (() => {
   const demo = new URLSearchParams(location.search).has("demo");
   const t = FTI18N.t;
   let mode = "serve";
+  // ft mgr: anyone may look; this PC or a token holder may operate (webui/auth.py)
+  let auth = { local: false, write: false, token_given: false, token_valid: false, token: null };
 
   // serve path -> manager path. ft mgr proxies the serve and camelCases keys; snake() undoes that.
   const DAEMON_PATHS = {
@@ -63,6 +65,11 @@ const FT = (() => {
     FTI18N.applyStatic();
     if (demo) { mode = "demo"; return mode; }
     try { mode = (await raw("/ui/env.json")).mode || "serve"; } catch { mode = "serve"; }
+    if (mode === "mgr") {
+      try { auth = await raw("/auth"); }
+      // a manager from before the check: it takes any write, so do not hide what it would accept
+      catch (e) { if (e.status === 404) auth = { ...auth, write: true }; }
+    }
     return mode;
   }
 
@@ -127,28 +134,80 @@ const FT = (() => {
     el.innerHTML = `<div class="wrap">
       <span class="brand">FreeToken-Kai</span>
       <span class="grow"></span>
-      <span id="hdr-state" class="pill mute"><span class="dot"></span>${esc(t("state_connecting"))}</span>
+      <span id="hdr-state" class="pill mute" hidden><span class="dot"></span>${esc(t("state_connecting"))}</span>
       <span id="hdr-mode" class="pill mute"></span>
       <select id="hdr-lang" aria-label="language" style="width:auto">
         <option value="en" ${FTI18N.lang === "en" ? "selected" : ""}>English</option>
         <option value="ja" ${FTI18N.lang === "ja" ? "selected" : ""}>日本語</option>
       </select>
+      <span id="hdr-auth" class="pill warn" hidden></span>
       <button id="hdr-token" hidden>${esc(t("token"))}</button>
     </div>`;
     document.body.prepend(el);
     const m = $("#hdr-mode");
-    if (mode === "mgr") { m.className = "pill info"; m.textContent = t("mode_daemon"); $("#hdr-token").hidden = false; }
+    if (mode === "mgr") {
+      m.hidden = true; $("#hdr-token").hidden = false;
+      if (!auth.write) {
+        const a = $("#hdr-auth");
+        a.hidden = false;
+        a.className = "pill " + (auth.token_given ? "bad" : "warn");
+        a.textContent = t(auth.token_given ? "auth_wrong" : "auth_view_only");
+        $("#hdr-token").textContent = t("auth_enter");
+        $("#hdr-token").className = "primary";
+      }
+    }
     else if (mode === "demo") { m.className = "pill warn"; m.textContent = t("mode_demo"); }
     else m.hidden = true;  // served by ft serve: read-only is the only thing it could be
-    $("#hdr-token").onclick = askToken;
+    $("#hdr-token").onclick = () => (auth.local ? showToken() : askToken());
     $("#hdr-lang").onchange = (ev) => FTI18N.set(ev.target.value);
   }
 
   function setState(kind, text) {
     const s = $("#hdr-state");
     if (!s) return;
+    // the engine card already shows the state: the header speaks up only when something is wrong
+    s.hidden = kind !== "bad";
     s.className = "pill " + kind;
     s.innerHTML = `<span class="dot"></span>${esc(text)}`;
+  }
+
+  // confirm() and alert() in the page's own look; resolve to true only on the OK button
+  function ask(message, { title = "", ok = t("ok"), danger = false, cancel = true } = {}) {
+    return new Promise((resolve) => {
+      const d = document.createElement("dialog");
+      d.className = "ask";
+      d.innerHTML = `<form method="dialog" class="stack">
+        ${title ? `<b>${esc(title)}</b>` : ""}
+        <div class="ask-msg">${esc(message)}</div>
+        <div style="display:flex;gap:8px;justify-content:flex-end">
+          ${cancel ? `<button value="cancel">${esc(t("cancel"))}</button>` : ""}
+          <button value="ok" class="${danger ? "danger-fill" : "primary"}" autofocus>${esc(ok)}</button></div>
+      </form>`;
+      document.body.append(d);
+      d.addEventListener("close", () => { resolve(d.returnValue === "ok"); d.remove(); });
+      d.showModal();
+    });
+  }
+  const notice = (message, title = "") => ask(message, { title, cancel: false });
+
+  // on this PC: show the token so it can be typed into a browser on another PC
+  function showToken() {
+    const d = document.createElement("dialog");
+    d.innerHTML = `<form method="dialog" class="stack">
+      <b>${esc(t("token_local_title"))}</b>
+      <span class="small muted">${esc(t("token_local_hint"))}</span>
+      <div style="display:flex;gap:8px"><input type="text" id="tok" readonly value="${esc(auth.token || "")}" style="flex:1;font-family:var(--mono)">
+        <button type="button" id="tok-copy">${esc(t("copy"))}</button></div>
+      <div style="display:flex;justify-content:flex-end"><button value="close">${esc(t("close"))}</button></div>
+    </form>`;
+    document.body.append(d);
+    $("#tok-copy", d).onclick = async (ev) => {
+      const input = $("#tok", d);
+      try { await navigator.clipboard.writeText(input.value); } catch { input.select(); document.execCommand("copy"); }
+      ev.target.textContent = t("copied");
+    };
+    d.addEventListener("close", () => d.remove());
+    d.showModal();
   }
 
   let asking = false;
@@ -173,8 +232,9 @@ const FT = (() => {
   }
 
   return {
-    init, raw, serveGet, sse, fmt, esc, $, header, setState, askToken, HttpError, homePath, modelName, t,
+    init, raw, serveGet, ask, notice, sse, fmt, esc, $, header, setState, askToken, HttpError, homePath, modelName, t,
     get mode() { return mode; }, demo,
+    get canWrite() { return mode !== "mgr" || auth.write; },
     onUnauthorized: () => { setState("bad", t("token_needed")); },
   };
 })();
