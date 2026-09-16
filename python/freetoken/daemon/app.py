@@ -60,6 +60,12 @@ class ProfileBody(BaseModel):
     args: list[str] = []
 
 
+class TuneBody(BaseModel):
+    model: str
+    trials: bool = True
+    port: int | None = None
+
+
 class BenchBody(BaseModel):
     # Raw `ft bench bw` args (e.g. ["--dtype", "nvfp4", "--threshold", "2.5"]); empty = all dtypes.
     args: list[str] = []
@@ -450,6 +456,7 @@ def build_app(
         return await run(proxy_pool, read)
 
     def _register_console() -> None:
+        console_pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="ft-mgr-console")
         # ---- kai's manager (ft mgr): everything the web console needs. Plain ft daemon has none of it.
         # A serve started outside the daemon (a launch script, a terminal) still answers on the default
         # serve port. The daemon cannot stop or restart it, but the console can show it: these console-only
@@ -516,13 +523,13 @@ def build_app(
             from freetoken.webui.hostmem import host_memory
 
             st = manager.status()
-            return {"memory": await run(proxy_pool, host_memory, st.get("pid") if st.get("running") else None)}
+            return {"memory": await run(console_pool, host_memory, st.get("pid") if st.get("running") else None)}
 
         @app.get("/models", dependencies=auth)
         async def models_list():
             from freetoken.webui.models import list_models
 
-            return {"models": await run(proxy_pool, list_models)}
+            return {"models": await run(console_pool, list_models)}
 
         @app.get("/recommend", dependencies=auth)
         async def recommend(model: str):
@@ -530,7 +537,7 @@ def build_app(
             from freetoken.webui.recommend import recommend as build
 
             try:
-                return await run(proxy_pool, build, model)
+                return await run(console_pool, build, model)
             except ValueError as exc:
                 raise HTTPException(status_code=400, detail=str(exc))
             except Exception as exc:  # noqa: BLE001
@@ -546,6 +553,56 @@ def build_app(
                 return {"flags": await run(lifecycle_pool, load, cache, serve_python or sys.executable)}
             except Exception as exc:  # noqa: BLE001
                 raise HTTPException(status_code=500, detail=f"could not read ft serve flags: {exc}")
+
+        # ---- the benchmark: measure this PC with a model, settle the flags on the numbers (webui/tuner.py)
+        from freetoken.webui.tuner import Busy, TuneJob
+
+        def _recommend_quiet(model: str) -> dict:
+            from freetoken.webui.recommend import recommend as build
+
+            return build(model)
+
+        tune = TuneJob(
+            manager,
+            state_dir=os.path.dirname(console_cache_dir) if console_cache_dir else os.path.join(os.path.expanduser("~"), ".freetoken", "mgr"),
+            python=serve_python or sys.executable, default_port=default_serve_port, recommend=_recommend_quiet,
+        )
+        app.state.tune = tune
+
+        @app.post("/tune/start", dependencies=auth)
+        async def tune_start(body: TuneBody):
+            from freetoken.webui.models import resolve_model
+
+            try:
+                model = resolve_model(body.model)
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc))
+            if not manager.status().get("running"):
+                # a serve this manager did not start holds the GPU and cannot be stopped from here
+                doc = await run(proxy_pool, probe.health, default_serve_port)
+                if doc.get("reachable") and doc.get("status") in ("ok", "loading"):
+                    return JSONResponse(status_code=409, content={"error": "a server started outside ft mgr is running", "code": "external_serve"})
+            try:
+                return tune.start(model, body.trials, body.port)
+            except Busy as exc:
+                return JSONResponse(status_code=409, content={"error": str(exc), "code": "busy"})
+
+        @app.post("/tune/cancel", dependencies=auth)
+        async def tune_cancel():
+            return tune.cancel()
+
+        @app.get("/tune/status", dependencies=auth)
+        async def tune_status(since: int = 0):
+            return tune.status(since)
+
+        @app.get("/tune/last", dependencies=auth)
+        async def tune_last(model: str):
+            from freetoken.webui.models import resolve_model
+
+            try:
+                return {"result": tune.last(resolve_model(model))}
+            except ValueError:
+                return {"result": None}
 
         if profiles is not None:
 

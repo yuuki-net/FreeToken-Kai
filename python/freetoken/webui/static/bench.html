@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>FreeToken-Kai Benchmark</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<main class="wrap stack">
+
+  <section class="card" id="bm-setup">
+    <h2 data-i18n="bm_title"></h2>
+    <p class="hint" data-i18n="bm_hint"></p>
+    <div class="stack" style="gap:10px;max-width:720px">
+      <label class="small"><span data-i18n="pe_model"></span>
+        <select id="bm-model" style="width:100%;margin-top:2px"></select></label>
+      <label class="small" style="display:flex;gap:8px;align-items:flex-start">
+        <input type="checkbox" id="bm-trials" checked style="margin-top:4px">
+        <span><b data-i18n="bm_trials"></b><br><span class="muted" data-i18n="bm_trials_hint"></span></span></label>
+      <div id="bm-warn" class="small" hidden></div>
+      <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+        <button id="bm-start" class="primary" style="font-size:15px;padding:8px 22px" data-i18n="bm_start"></button>
+        <button id="bm-last" hidden data-i18n="bm_last"></button>
+        <span class="small muted" id="bm-last-when"></span>
+      </div>
+    </div>
+  </section>
+
+  <section id="bm-run" hidden class="stack">
+    <div class="card" style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">
+      <div><div class="small muted" data-i18n="bm_running_title"></div><div id="bm-phase" style="font-weight:600;font-size:15px"></div></div>
+      <span class="grow"></span>
+      <div class="small muted" id="bm-elapsed"></div>
+      <button id="bm-cancel" class="danger" data-i18n="bm_cancel"></button>
+    </div>
+    <div class="bm-hero">
+      <div class="card bm-gauge-wrap">
+        <canvas id="bm-gauge" style="display:block;margin:0 auto;width:100%;max-width:460px;height:290px"></canvas>
+        <div class="bm-now" id="bm-now"></div>
+        <canvas id="bm-spark" style="width:100%;height:70px;margin-top:6px"></canvas>
+      </div>
+      <div class="card">
+        <ul class="bm-steps" id="bm-steps"></ul>
+      </div>
+    </div>
+  </section>
+
+  <section id="bm-result" hidden class="stack"></section>
+
+</main>
+<script src="i18n.js"></script>
+<script src="suggest.js"></script>
+<script src="common.js"></script>
+<script src="demo.js"></script>
+<script src="profile-editor.js"></script>
+<script src="bench.js"></script>
+</body>
+</html>

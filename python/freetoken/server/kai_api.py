@@ -165,6 +165,8 @@ def experts_doc(state: Any, window: str = "300", freq: bool = False) -> dict:
         per_rank.append({
             "rank": r.get("rank"), "gpu": r.get("gpu"), "layer_range": lr, "moe": moe,
             "window": {k: v for k, v in w.items() if not k.startswith("layer_")},
+            # lifetime totals: a client timing one request diffs these (the windows slide under it)
+            "counters": {k: v for k, v in cum.items() if not k.startswith("layer_")},
             "kv": r.get("kv"), "prefill_chunk": r.get("prefill_chunk"),
             "age_s": round(time.time() - r.get("time", time.time()), 1),
         })

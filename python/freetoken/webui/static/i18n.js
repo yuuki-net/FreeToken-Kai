@@ -39,7 +39,7 @@ const I18N = {
     auth_view_only: "閲覧のみ", auth_wrong: "トークンが違います", auth_enter: "操作するには",
     copy: "コピー", copied: "コピーしました",
     token_needed: "トークンが必要です",
-    ok: "OK", dash_ok_start: "起動する",
+    ok: "OK", dash_ok_start: "起動する", nav_dash: "ダッシュボード", nav_bench: "ベンチマーク", dash_bench: "ベンチマークで作る",
     clear: "消す", save: "保存", cancel: "やめる", close: "閉じる", none: "—",
 
     dash_model: "モデル", dash_state: "状態", dash_uptime: "稼働時間",
@@ -231,7 +231,7 @@ const I18N = {
     auth_view_only: "view only", auth_wrong: "wrong token", auth_enter: "Operate",
     copy: "Copy", copied: "Copied",
     token_needed: "a token is required",
-    ok: "OK", dash_ok_start: "Start",
+    ok: "OK", dash_ok_start: "Start", nav_dash: "Dashboard", nav_bench: "Benchmark", dash_bench: "Build with a benchmark",
     clear: "Clear", save: "Save", cancel: "Cancel", close: "Close", none: "—",
 
     dash_model: "Model", dash_state: "State", dash_uptime: "Uptime",
@@ -409,6 +409,7 @@ const I18N = {
 
   window.FTI18N = {
     t, applyStatic,
+    add(ja, en) { Object.assign(I18N.ja, ja); Object.assign(I18N.en, en); },
     get lang() { return lang; },
     set(next) {
       if (next !== "ja" && next !== "en") return;

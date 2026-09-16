@@ -133,6 +133,10 @@ const FT = (() => {
     el.className = "top";
     el.innerHTML = `<div class="wrap">
       <span class="brand">FreeToken-Kai</span>
+      <nav class="tabs" id="hdr-nav" hidden>
+        <a href="./${demo ? "?demo" : ""}" class="${active === "dash" ? "on" : ""}">${esc(t("nav_dash"))}</a>
+        <a href="bench.html${demo ? "?demo" : ""}" class="${active === "bench" ? "on" : ""}">${esc(t("nav_bench"))}</a>
+      </nav>
       <span class="grow"></span>
       <span id="hdr-state" class="pill mute" hidden><span class="dot"></span>${esc(t("state_connecting"))}</span>
       <span id="hdr-mode" class="pill mute"></span>
@@ -145,6 +149,7 @@ const FT = (() => {
     </div>`;
     document.body.prepend(el);
     const m = $("#hdr-mode");
+    $("#hdr-nav").hidden = !(mode === "mgr" || mode === "demo");
     if (mode === "mgr") {
       m.hidden = true; $("#hdr-token").hidden = false;
       if (!auth.write) {

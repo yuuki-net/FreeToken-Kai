@@ -354,7 +354,7 @@
 
   if (managed) {
     $("#daemon-only").hidden = false;
-    $("#btn-save-profile").hidden = !FT.canWrite;
+    $("#btn-save-profile").hidden = $("#btn-bench").hidden = !FT.canWrite;
     $("#btn-save-profile").onclick = () => editProfile(engineConfig?.model ? { model: engineConfig.model, port: engineConfig.port, args: engineConfig.args } : {});
     await loadConfig();
     $("#btn-save-profile").textContent = t(engineConfig?.model ? "dash_profile_save_current" : "dash_profile_add");

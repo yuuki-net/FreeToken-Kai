@@ -38,6 +38,29 @@ def to_camel(obj: Any) -> Any:
     return obj
 
 
+def local_listener(port: int) -> bool | None:
+    """Whether something LISTENs on ``port`` here, from the kernel's socket tables; None when they
+    cannot be read (not Linux). Under WSL's mirrored networking a connect to a closed loopback
+    port gets no reset and waits out the whole timeout, and the probe holds its lock meanwhile."""
+    readable = False
+    for table in ("/proc/net/tcp", "/proc/net/tcp6"):
+        try:
+            with open(table) as fh:
+                rows = fh.read().splitlines()[1:]
+        except OSError:
+            continue
+        readable = True
+        for row in rows:
+            cols = row.split()
+            if len(cols) > 3 and cols[3] == "0A":  # LISTEN
+                try:
+                    if int(cols[1].rsplit(":", 1)[1], 16) == port:
+                        return True
+                except ValueError:
+                    continue
+    return False if readable else None
+
+
 class ServeProbe:
     def __init__(
         self,
@@ -49,6 +72,7 @@ class ServeProbe:
         now: Callable[[], float] = time.monotonic,
         opener: Callable[[str, float], dict] | None = None,
         prepare_opener: Callable[[str, float], dict] | None = None,
+        listening: Callable[[int], bool | None] | None = None,
     ) -> None:
         self._host = host
         self._ttl = ttl_s
@@ -57,6 +81,10 @@ class ServeProbe:
         self._now = now
         self._opener = opener or self._urlopen
         self._prepare_opener = prepare_opener or self._urlopen_prepare
+        # only the real opener talks to sockets; an injected one (tests) is asked as it is
+        if listening is None and opener is None and host in ("127.0.0.1", "localhost", "::1"):
+            listening = local_listener
+        self._listening = listening
         self._lock = threading.Lock()
         self._cache: dict[tuple[str, int], tuple[float, dict]] = {}
 
@@ -102,6 +130,8 @@ class ServeProbe:
             return val
 
     def _fetch(self, path: str, port: int) -> dict:
+        if self._listening is not None and self._listening(port) is False:
+            return {"reachable": False, "status": "unreachable"}
         url = f"http://{self._host}:{port}{path}"
         try:
             doc = self._opener(url, self._timeout)
