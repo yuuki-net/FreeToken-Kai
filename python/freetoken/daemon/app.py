@@ -64,6 +64,8 @@ class TuneBody(BaseModel):
     model: str
     trials: bool = True
     port: int | None = None
+    mode: str = "standard"  # "thorough" adds the candidates that rarely win
+    use: str = "both"  # which generation decides: "prose", "code" or "both"
 
 
 class BenchBody(BaseModel):
@@ -592,7 +594,7 @@ def build_app(
                 if doc.get("reachable") and doc.get("status") in ("ok", "loading"):
                     return JSONResponse(status_code=409, content={"error": "a server started outside ft mgr is running", "code": "external_serve"})
             try:
-                return tune.start(model, body.trials, body.port)
+                return tune.start(model, body.trials, body.port, mode=body.mode, use=body.use)
             except Busy as exc:
                 return JSONResponse(status_code=409, content={"error": str(exc), "code": "busy"})
 

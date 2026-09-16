@@ -6,7 +6,7 @@ FTI18N.add({
   bm_title: "ベンチマークで設定を決める",
   bm_hint: "この PC とモデルで実際に測り、その結果から ft serve のフラグを決めます。PCIe・メモリ・SSD の速さ、CPU と GPU でのエキスパート処理の速さを測り、必要ならモデルを起動して、効きそうな設定を 1 つずつ実測で比べます。終わったら結果をそのままプロファイルにできます。",
   bm_trials: "モデルを起動して実測する（おすすめ）",
-  bm_trials_hint: "プロンプト処理と生成の速さを実際に測り、プリフィルのチャンク予算やコンテキスト長を 1 つずつ変えて比べます。モデルの読み込みが 2〜4 回あるので、全体で 10〜25 分ほどかかります。外すとハードウェアだけ測ります（数分）。",
+  bm_trials_hint: "モデルを何度も起動して、カーネル・エキスパートの置き方・KV・プロンプト処理・MTP・コンテキスト長などを 1 つずつ変え、速くなったものだけを残します。外すとハードウェアだけ測ります（数分）。",
   bm_start: "測定を始める", bm_last: "前回の結果を見る", bm_last_when: "前回: {when}",
   bm_running_title: "測定中", bm_cancel: "中止",
   bm_confirm: "測定を始めます。GPU を使うので、動いているサーバ（{model}）は止まり、終わったら同じ設定で起動し直します。",
@@ -36,19 +36,29 @@ FTI18N.add({
   bm_overlap: "同時に動かしたとき", bm_overlap_sub: "足りないエキスパートの {pct} を GPU に送り、残りを CPU で計算",
   bm_sweep_title: "スレッド数ごとの CPU 計算速度",
   bm_trials_title: "実測（モデルを起動して）", bm_col_setting: "設定", bm_col_ctx: "コンテキスト長", bm_col_slots: "GPU のエキスパート枠",
-  bm_col_load: "起動", bm_col_prefill: "プロンプト処理", bm_col_decode: "生成", bm_col_hit: "GPU で足りた割合", bm_chosen: "採用",
+  bm_col_load: "起動", bm_col_prefill: "プロンプト処理", bm_col_decode: "生成（文章）", bm_col_hit: "GPU で足りた割合", bm_chosen: "最終",
   bm_trial_failed: "起動か測定に失敗", bm_col_change: "変えたところ", bm_rejected: "試して不採用",
-  bm_trials_hint2: "設定 A から 1 つずつ変えて測り、速くなったものだけを次に引き継ぎます。",
+  bm_trials_hint2: "設定 A から 1 つずつ変えて測り、採用したものだけを次に引き継ぎます。生成は文章とコードで測り、主な使い方で判定します。",
   bm_change_base: "基本の設定", bm_change_ctx: "コンテキスト長 {n}", bm_change_without: "{flag} なし",
   bm_flags_title: "決まったフラグ", bm_src_measured: "実測", bm_src_rule: "目安", bm_removed: "外した",
   bm_flags_note: "「実測」はこの測定の数字から、「目安」は GPU・RAM・モデルの構成から決めた値です。",
   bm_saved: "プロファイルを保存しました。",
   bm_empty_hint: "モデルを選んで「測定を始める」を押してください。", bm_loading_models: "モデルを読み込み中…",
+  bm_mode: "測り方", bm_mode_standard: "標準（これまでに効いたことがある設定を全部。3060×2 で 1 時間前後）",
+  bm_mode_thorough: "徹底（効いたことがない設定も全部。2 時間前後）",
+  bm_use: "主な使い方（MTP のように、文章の種類で効き方が変わる設定の採否に使います）",
+  bm_use_both: "両方", bm_use_code: "コード・ツール呼び出し（エージェント）", bm_use_prose: "文章・会話",
+  bm_time_standard: "30 分〜1 時間", bm_time_thorough: "1〜2 時間",
+  bm_planned: "予定", bm_fig_prefill: "プロンプト", bm_fig_prose: "文章", bm_fig_code: "コード", bm_row_loading: "読み込み", bm_row_prefill: "プロンプト処理", bm_row_decode: "生成（文章）", bm_row_decode_code: "生成（コード）",
+  bm_dec_kept: "採用", bm_dec_rejected: "不採用", bm_dec_failed: "失敗", bm_dec_base: "基準",
+  bm_col_decode_code: "生成（コード）", bm_col_decision: "判定",
+  bm_skipped_title: "測らなかった項目と理由",
+  bm_plan_note: "{n} 個の候補を 1 つずつ試します（採用したものによって、あとの候補が増減します）。",
 }, {
   bm_title: "Benchmark to pick the settings",
   bm_hint: "Measure this PC with the model and pick ft serve's flags from the numbers: PCIe, memory and SSD rates, how fast experts are computed on the CPU and moved to the GPU, and, if you like, the model itself started to compare the settings that matter one at a time. The result becomes a profile in one click.",
   bm_trials: "Start the model and measure it (recommended)",
-  bm_trials_hint: "Measures prompt processing and generation for real and changes the prefill chunk budget and the context length one at a time. The model loads two to four times, so this takes about 10-25 minutes. Unticked, only the hardware is measured (a few minutes).",
+  bm_trials_hint: "Starts the model again and again, changing one thing at a time (kernels, where experts run, the KV cache, prefill, MTP, context) and keeps only what measured faster. Unticked, only the hardware is measured (a few minutes).",
   bm_start: "Start", bm_last: "Show the last result", bm_last_when: "Last: {when}",
   bm_running_title: "Measuring", bm_cancel: "Cancel",
   bm_confirm: "The measurement uses the GPU, so the running server ({model}) stops and is started again with the same settings afterwards.",
@@ -78,14 +88,24 @@ FTI18N.add({
   bm_overlap: "Both at once", bm_overlap_sub: "fetch {pct} of the missing experts, compute the rest on the CPU",
   bm_sweep_title: "CPU compute by thread count",
   bm_trials_title: "Measured with the model", bm_col_setting: "Setting", bm_col_ctx: "Context", bm_col_slots: "Experts on the GPU",
-  bm_col_load: "Start", bm_col_prefill: "Prompt processing", bm_col_decode: "Generation", bm_col_hit: "Served from the GPU", bm_chosen: "chosen",
+  bm_col_load: "Start", bm_col_prefill: "Prompt processing", bm_col_decode: "Generation (prose)", bm_col_hit: "Served from the GPU", bm_chosen: "final",
   bm_trial_failed: "failed to start or measure", bm_col_change: "Changed", bm_rejected: "tried, not kept",
-  bm_trials_hint2: "Each run changes one thing from the best so far; only what measured faster is carried on.",
+  bm_trials_hint2: "Each run changes one thing from the best so far; only what is kept is carried on. Generation is measured on prose and code, and the main use decides.",
   bm_change_base: "base settings", bm_change_ctx: "context {n}", bm_change_without: "without {flag}",
   bm_flags_title: "The flags", bm_src_measured: "measured", bm_src_rule: "rule", bm_removed: "dropped",
   bm_flags_note: "“measured” values come from this run's numbers, “rule” values from the GPU, RAM and the model's config.",
   bm_saved: "The profile was saved.",
   bm_empty_hint: "Pick a model and press Start.", bm_loading_models: "Loading models…",
+  bm_mode: "How much to try", bm_mode_standard: "Standard (every setting that has helped somewhere; about an hour on two 3060s)",
+  bm_mode_thorough: "Thorough (also the settings that have never helped here; about two hours)",
+  bm_use: "Main use (decides settings like MTP whose effect depends on the text)",
+  bm_use_both: "Both", bm_use_code: "Code and tool calls (agents)", bm_use_prose: "Prose and chat",
+  bm_time_standard: "30 minutes to an hour", bm_time_thorough: "one to two hours",
+  bm_planned: "planned", bm_fig_prefill: "prompt", bm_fig_prose: "prose", bm_fig_code: "code", bm_row_loading: "loading", bm_row_prefill: "prompt", bm_row_decode: "generation (prose)", bm_row_decode_code: "generation (code)",
+  bm_dec_kept: "kept", bm_dec_rejected: "not kept", bm_dec_failed: "failed", bm_dec_base: "base",
+  bm_col_decode_code: "Generation (code)", bm_col_decision: "Verdict",
+  bm_skipped_title: "Not measured, and why",
+  bm_plan_note: "{n} candidates, one at a time (what is kept can open or close later ones).",
 });
 
 (async () => {
@@ -105,15 +125,36 @@ FTI18N.add({
     $("#bm-steps").innerHTML = "";
   }
 
-  function addStep(id, label, unit, max) {
+  function addStep(id, label, unit, max, hidden = false) {
     if (steps.has(id)) { const s = steps.get(id); s.label = label; renderSteps(); return s; }
     const s = { id, label, unit, max, state: "wait", value: null, samples: [], note: "" };
-    steps.set(id, s); order.push(id);
+    steps.set(id, s);
+    if (!hidden) order.push(id);
     renderSteps();
     return s;
   }
 
-  const unitOf = (id) => /\.(prefill|decode)$/.test(id) ? "tok/s" : /\.load$/.test(id) ? "%" : "GB/s";
+  const unitOf = (id) => /\.(prefill|decode|decode_code)$/.test(id) ? "tok/s" : /\.load$/.test(id) ? "%" : "GB/s";
+  const SUBS = ["load", "prefill", "decode", "decode_code"];
+  // a run's row: what it changed, where it is, and at the end its figures and verdict
+  function runNote(row) {
+    const T = row.id;
+    if (row.decision) {
+      const p = steps.get(`${T}.prefill`)?.value, d = steps.get(`${T}.decode`)?.value, c = steps.get(`${T}.decode_code`)?.value;
+      const figs = [[p, "bm_fig_prefill"], [d, "bm_fig_prose"], [c, "bm_fig_code"]].filter(([v]) => v != null)
+        .map(([v, k]) => `${t(k)} ${v >= 100 ? Math.round(v) : v.toFixed(1)}`).join(" · ") + (p != null || d != null ? " tok/s" : "");
+      return figs || t(`bm_dec_${row.decision}`);
+    }
+    for (const k of [...SUBS].reverse()) {
+      const s = steps.get(`${T}.${k}`);
+      if (!s || s.state === "wait") continue;
+      if (k === "load") return s.note || `${t("bm_row_loading")} ${s.since ? Math.floor((Date.now() - s.since) / 1000) + " s" : ""}`;
+      if (k === "prefill" && s.progress) return `${t("bm_row_prefill")} ${fmt.num(s.progress.done)} / ${fmt.num(s.progress.total)}`;
+      const v = s.samples.length ? s.samples[s.samples.length - 1].v : s.value;
+      return `${t(`bm_row_${k}`)}${v != null ? " " + fmtVal(v, "tok/s") : ""}`;
+    }
+    return "";
+  }
   const fmtVal = (v, unit) => v == null ? "—" : unit === "%" ? `${Math.round(v)}%` : unit === "tok/s" ? `${v >= 100 ? Math.round(v) : v.toFixed(1)} tok/s` : `${v.toFixed(1)} GB/s`;
 
   function hwLabel(id) {
@@ -126,9 +167,17 @@ FTI18N.add({
       const s = steps.get(id);
       const ico = { wait: "", run: "●", done: "✓", skip: "!", failed: "!" }[s.state];
       const running = s.state === "run" && s.since ? `${Math.floor((Date.now() - s.since) / 1000)} s` : "";
-      const val = s.state === "done" && s.value != null ? fmtVal(s.value, s.unit) : (s.note || running);
-      return `<li class="${s.state}"><span class="ico">${ico}</span><span>${esc(s.label)}</span><span class="val">${esc(val || "")}</span></li>`;
+      const val = s.run ? runNote(s) : s.planned ? t("bm_planned") : s.state === "done" && s.value != null ? fmtVal(s.value, s.unit) : (s.note || running);
+      const cls = s.decision === "rejected" || s.decision === "failed" ? "skip" : s.state;
+      if (s.run || s.planned) {
+        const mark = s.decision ? ` <span class="pill ${{ kept: "ok", base: "info", rejected: "mute", failed: "bad" }[s.decision]}">${esc(t(`bm_dec_${s.decision}`))}</span>` : "";
+        return `<li class="${cls} two${s.planned ? " planned" : ""}"><span class="ico">${ico}</span><span class="grow"><span>${esc(s.label)}</span>${mark}
+          <span class="val2">${esc(val || "")}</span></span></li>`;
+      }
+      return `<li class="${cls}"><span class="ico">${ico}</span><span>${esc(s.label)}</span><span class="val">${esc(val || "")}</span></li>`;
     }).join("");
+    const ul = $("#bm-steps"), el = ul.querySelector("li.run");
+    if (el && (el.offsetTop < ul.scrollTop || el.offsetTop + el.offsetHeight > ul.scrollTop + ul.clientHeight)) ul.scrollTop = el.offsetTop - ul.clientHeight / 3;
   }
 
   function focus(id) {
@@ -166,7 +215,10 @@ FTI18N.add({
     startedAt = startedAt || e.t;
     if (e.k === "phase") {
       $("#bm-phase").textContent = t(`bm_ph_${e.phase}`) + (e.message ? ` — ${e.message}` : "");
-      if (["done", "cancelled", "error"].includes(e.phase)) for (const s of steps.values()) if (s.state === "run") s.state = e.phase === "done" ? "done" : "failed";
+      if (["done", "cancelled", "error"].includes(e.phase)) {
+        for (const s of steps.values()) if (s.state === "run") s.state = e.phase === "done" ? "done" : "failed";
+        for (const id of order.filter((id) => steps.get(id).planned)) { steps.delete(id); order.splice(order.indexOf(id), 1); }
+      }
       renderSteps();
     } else if (e.k === "hw") {
       if (e.kind === "plan") for (const s of e.steps) addStep(s.id, hwLabel(s.id), s.unit || "GB/s", s.max);
@@ -183,33 +235,44 @@ FTI18N.add({
         const s = steps.get(e.id) || addStep(e.id, hwLabel(e.id), "GB/s");
         s.state = "skip"; s.note = t(`bm_skip_${e.reason}`) || e.reason; renderSteps();
       }
+    } else if (e.k === "plan") {
+      for (const it of e.items) {
+        const s = addStep(`plan:${it.key}`, lang() === "en" ? it.what_en : it.what, "tok/s");
+        s.planned = true;
+      }
+      $("#bm-now").textContent = t("bm_plan_note", { n: e.items.length });
+    } else if (e.k === "decision") {
+      const row = steps.get(e.trial);
+      if (row) { row.decision = e.decision; row.state = e.decision === "kept" ? "done" : "skip"; renderSteps(); }
     } else if (e.k === "trial") {
       const T = e.trial;
       if (e.step === "load" && e.state === "start") {
         trialCtx[T] = e.change || null;
-        addStep(`${T}.load`, t("bm_s_load", { trial: T, what: changeText(e.change) }), "%", 100);
-        addStep(`${T}.prefill`, t("bm_s_prefill", { trial: T, n: "…" }), "tok/s");
-        addStep(`${T}.decode`, t("bm_s_decode", { trial: T, n: "…" }), "tok/s");
+        const what = (lang() === "en" ? e.what_en : e.what) || changeText(e.change);
+        const label = `${t("bm_col_setting")} ${T}: ${what}`;
+        const planned = e.key && order.indexOf(`plan:${e.key}`);
+        if (planned != null && planned >= 0) { steps.delete(`plan:${e.key}`); order.splice(planned, 1, T); }
+        const row = steps.get(T) || addStep(T, label, "tok/s", null, planned != null && planned >= 0);
+        if (!order.includes(T)) order.push(T);
+        Object.assign(row, { id: T, label, run: true, state: "run", since: Date.now() });
+        steps.set(T, row);
+        for (const k of SUBS) addStep(`${T}.${k}`, `${label} · ${t(`bm_row_${k === "load" ? "loading" : k}`)}`, unitOf(`${T}.${k}`), k === "load" ? 100 : null, true);
       }
-      if (e.state === "failed" && !steps.has(`${T}.${e.step}`)) {
-        // failed between steps (a request that errored mid-measurement): mark whatever was running
-        for (const k of ["load", "prefill", "decode"]) {
-          const st = steps.get(`${T}.${k}`);
-          if (st && st.state !== "done") { st.state = "failed"; st.note = t("bm_trial_failed"); }
-        }
+      const row = steps.get(T);
+      if (e.state === "failed") {
+        if (row) { row.decision = "failed"; row.state = "skip"; }
         renderSteps();
         return;
       }
-      const id = `${T}.${e.step}`;
-      const s = steps.get(id);
-      if (!s) return;
-      if (e.step === "prefill" && e.tokens) s.label = t("bm_s_prefill", { trial: T, n: fmt.num(e.tokens) });
-      if (e.step === "decode" && e.tokens) s.label = t("bm_s_decode", { trial: T, n: fmt.num(e.tokens) });
-      if (e.state === "start") { s.state = "run"; s.since = Date.now(); s.progress = null; focus(id); }
-      else if (e.state === "done") { s.state = "done"; s.value = e.step === "load" ? null : e.value; if (e.step === "load") s.note = `${e.seconds} s`; }
-      else if (e.state === "failed") { s.state = "failed"; s.note = t("bm_trial_failed"); }
+      const s = steps.get(`${T}.${e.step}`);
+      if (!s) {
+        if (row && e.step === "measured") { row.state = "done"; if (T === "A" && !row.decision) row.decision = "base"; renderSteps(); }
+        return;
+      }
+      if (e.state === "start") { s.state = "run"; s.since = Date.now(); s.progress = null; focus(s.id); }
+      else if (e.state === "done") { s.state = "done"; s.value = e.step === "load" ? null : e.value; if (e.step === "load") s.note = `${t("bm_row_loading")} ${e.seconds} s`; }
       renderSteps();
-    } else if (e.k === "sample") { const s = steps.get(e.id); if (s) s.progress = null; sample(e.id, e.value); }
+    } else if (e.k === "sample") { const s = steps.get(e.id); if (s) s.progress = null; if (s) sample(e.id, e.value); }
     else if (e.k === "progress") {
       const s = steps.get(e.id);
       if (!s) return;
@@ -399,21 +462,25 @@ FTI18N.add({
     }
   }
   $("#bm-model").onchange = loadLast;
+  $("#bm-trials").onchange = () => { $("#bm-opts").hidden = !$("#bm-trials").checked; };
   $("#bm-last").onclick = () => { show("result"); renderResult(lastResult); };
   loadLast();
 
   $("#bm-start").onclick = async () => {
     const trials = $("#bm-trials").checked;
     let running = null;
+    $("#bm-opts").hidden = !trials;
     $("#bm-start").disabled = true;  // the health check can take a second or two
     try { running = (await FT.serveGet("/health")).running ? engineCfg?.model : null; } catch {}
     $("#bm-start").disabled = false;
+    const mode = document.querySelector('input[name="bm-mode"]:checked')?.value || "standard";
+    const use = document.querySelector('input[name="bm-use"]:checked')?.value || "both";
     const msg = [running ? t("bm_confirm", { model: modelName(running) }) : t("bm_confirm_none"),
-      t("bm_confirm_time", { min: t(trials ? "bm_time_trials" : "bm_time_hw") })].join("\n\n");
+      t("bm_confirm_time", { min: t(trials ? `bm_time_${mode}` : "bm_time_hw") })].join("\n\n");
     if (!await FT.ask(msg, { title: t("bm_title"), ok: t("bm_start") })) return;
     if (demo) { DemoJob.start(trials); run = null; show("run"); return; }
     try {
-      await FT.raw("/tune/start", { method: "POST", json: { model: $("#bm-model").value, trials } });
+      await FT.raw("/tune/start", { method: "POST", json: { model: $("#bm-model").value, trials, mode, use } });
       run = null; show("run");
     } catch (e) {
       const code = e.body?.code;
@@ -449,24 +516,38 @@ FTI18N.add({
     const trials = r.trials || [];
     const chosen = r.chosen;
     const okTrials = trials;
+    const anyCode = trials.some((x) => x.decode_code_tps);
+    const decisionPill = (x) => {
+      const d = x.decision || (x.ok ? null : "failed");
+      if (!d) return "";
+      const kind = d === "kept" ? "ok" : d === "base" ? "info" : d === "failed" ? "bad" : "mute";
+      return `<span class="pill ${kind}">${esc(t(`bm_dec_${d}`))}</span>`;
+    };
+    const whatOf = (x) => (x.what ? (lang() === "en" ? x.what[1] : x.what[0]) : changeText(x.change));
     const trialTable = okTrials.length ? `<div class="card"><h2>${esc(t("bm_trials_title"))}</h2>
       <p class="hint">${esc(t("bm_trials_hint2"))}</p>
-      <div class="tablewrap"><table class="bm-trials"><thead><tr><th>${esc(t("bm_col_setting"))}</th><th>${esc(t("bm_col_change"))}</th>
+      <div class="tablewrap"><table class="bm-trials"><thead><tr><th>${esc(t("bm_col_setting"))}</th><th>${esc(t("bm_col_change"))}</th><th>${esc(t("bm_col_decision"))}</th>
         <th class="num">${esc(t("bm_col_ctx"))}</th><th class="num">${esc(t("bm_col_slots"))}</th><th class="num">${esc(t("bm_col_load"))}</th>
-        <th class="num">${esc(t("bm_col_prefill"))}</th><th class="num">${esc(t("bm_col_decode"))}</th><th class="num">${esc(t("bm_col_hit"))}</th></tr></thead>
+        <th class="num">${esc(t("bm_col_prefill"))}</th><th class="num">${esc(t("bm_col_decode"))}</th>${anyCode ? `<th class="num">${esc(t("bm_col_decode_code"))}</th>` : ""}<th class="num">${esc(t("bm_col_hit"))}</th></tr></thead>
       <tbody>${okTrials.map((x) => {
         const win = x.ok && x.label === chosen ? "win" : "";
-        return `<tr><td class="${win}"><b>${esc(x.label)}</b> ${win ? `<span class="pill ok">${esc(t("bm_chosen"))}</span>` : ""}${x.ok ? "" : ` <span class="pill warn">${esc(t("bm_trial_failed"))}</span>`}</td>
-          <td class="${win}"><code style="font-size:12px">${esc(changeText(x.change))}</code></td>
+        return `<tr><td class="${win}"><b>${esc(x.label)}</b> ${win ? `<span class="pill ok">${esc(t("bm_chosen"))}</span>` : ""}</td>
+          <td class="${win}" style="white-space:normal;min-width:220px">${esc(whatOf(x))}<div class="small muted"><code style="font-size:11px">${esc(x.change ? changeText(x.change) : "")}</code></div></td>
+          <td class="${win}">${decisionPill(x)}</td>
           <td class="num ${win}">${x.kv_tokens ? fmt.num(x.kv_tokens) : esc(argValue(x.args, "--kv-reserve-tokens") || "—")}</td>
           <td class="num ${win}">${x.expert_slots != null ? fmt.num(x.expert_slots) : "—"}</td>
           <td class="num ${win}">${x.load_s != null ? `${x.load_s} s` : "—"}</td>
           <td class="num ${win}">${fmtVal(x.prefill_tps, "tok/s")}</td>
           <td class="num ${win}">${fmtVal(x.decode_tps, "tok/s")}</td>
+          ${anyCode ? `<td class="num ${win}">${fmtVal(x.decode_code_tps, "tok/s")}</td>` : ""}
           <td class="num ${win}">${fmt.pct(x.hit_rate)}</td></tr>`;
       }).join("")}</tbody></table></div></div>` : "";
 
-    const notes = (r.notes || []).slice().sort((a, b) => (a.source === "measured" ? 0 : 1) - (b.source === "measured" ? 0 : 1));
+    const rank = (n) => (n.rejected ? 2 : n.source === "measured" ? 0 : 1);
+    const notes = (r.notes || []).slice().sort((a, b) => rank(a) - rank(b));
+    const skipped = (r.skipped || []).length ? `<div class="card"><h2>${esc(t("bm_skipped_title"))}</h2>
+      ${r.skipped.map((s) => `<div class="bm-flag"><span style="flex:1;min-width:0"><code>${esc(s.flag)}</code>
+        <div class="small muted" style="margin-top:2px">${esc(lang() === "en" ? s.why_en : s.why)}</div></span></div>`).join("")}</div>` : "";
     const flags = `<div class="card"><h2>${esc(t("bm_flags_title"))}</h2><p class="hint">${esc(t("bm_flags_note"))}</p>
       ${notes.map((n) => `<div class="bm-flag">
         <span style="flex:1;min-width:0"><span style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
@@ -490,7 +571,8 @@ FTI18N.add({
       <div class="card"><h2>${esc(t("bm_hw_title"))}</h2><div class="bm-score" style="margin-top:8px">${tiles.join("")}</div>
         ${sweep ? `<h2 style="margin-top:16px">${esc(t("bm_sweep_title"))}</h2><canvas id="bm-sweep" style="width:100%;height:150px"></canvas>` : ""}</div>
       ${trialTable}
-      ${flags}`;
+      ${flags}
+      ${skipped}`;
     if (sweep) drawSweep(sweep, hw.cpu_moe.threads);
     const b1 = $("#bm-save-new"), b2 = $("#bm-save-into"), b3 = $("#bm-run-now");
     if (b1) b1.onclick = () => FTProfileEditor.open({ name: t("bm_profile_suffix", { name: modelName(r.model) }), model: r.model, port: r.port, args: r.args, _new: true },
@@ -550,6 +632,19 @@ FTI18N.add({
   }
 
   // ---------------------------------------------------------------- ?demo: a made-up run to look at the page
+  // [label, key, what, what_en, change, prefill, prose, code, decision]
+  const DEMO_RUNS = [
+    ["A", null, null, null, null, 548, 18.1, 24.0, "base"],
+    ["B", "strategy_offload", "エキスパートを CPU で計算せず、GPU に転送して計算する", "compute experts on the GPU (fetched) instead of the CPU", { flag: "--moe-strategy", value: "offload" }, 402, 12.2, 15.8, "rejected"],
+    ["C", "kernel_moe_marlin", "エキスパートの計算カーネルを marlin にする", "the marlin expert kernel", { flag: "--quant-backend", value: "moe.nvfp4=marlin" }, 611, 19.0, 25.1, "kept"],
+    ["D", "kv_16bit", "KV キャッシュを量子化しない（16 ビット）", "an unquantized (16-bit) KV cache", { flag: "--kv-cache-dtype", value: null }, 598, 18.7, 24.6, "rejected"],
+    ["E", "budget_075", "プリフィルのチャンク予算を 0.75 にする", "a prefill chunk budget of 0.75", { flag: "--prefill-chunk-budget", value: "0.75" }, 702, 19.1, 25.0, "kept"],
+    ["F", "mtp_3", "MTP で 3 トークン先まで予測する", "MTP drafting 3 tokens ahead", { flag: "--spec-mtp", value: "3" }, 690, 17.2, 38.4, "kept"],
+    ["G", "mtp_5", "MTP で 5 トークン先まで予測する", "MTP drafting 5 tokens ahead", { flag: "--spec-mtp", value: "5" }, 688, 16.1, 41.9, "kept"],
+    ["H", "context_131072", "コンテキスト長を 131,072 にする", "a context of 131,072 tokens", { flag: "--kv-reserve-tokens", value: "131072" }, 681, 16.0, 41.2, "kept"],
+  ];
+  const DEMO_PLAN = DEMO_RUNS.slice(1, 7).map(([, key, what, what_en, change]) => ({ key, what, what_en, change }))
+    .concat([{ key: "overlap_on", what: "プリフィルで CPU 計算と転送を重ねる", what_en: "overlap CPU compute and transfers in prefill", change: null }]);
   const DemoJob = (() => {
     let events = [], s = 0, state = "idle", result = null, id = 0, timer = null;
     const push = (k, f) => events.push({ seq: ++s, k, t: Date.now() / 1000, ...f });
@@ -574,21 +669,25 @@ FTI18N.add({
       at(ms += 300, () => push("hw", { kind: "step", id: "overlap" }));
       at(ms += 1500, () => push("hw", { kind: "done", id: "overlap", value: 14.1 }));
       if (trials) {
-        const runs = [["A", null, 18.1, 548], ["B", { flag: "--prefill-chunk-budget", value: "0.75" }, 18.3, 702], ["C", { flag: "--kv-reserve-tokens", value: "131072" }, 18.0, 689]];
-        for (const [T, change, dec, pre] of runs) {
-          at(ms += 500, () => { push("phase", { phase: "trial" }); push("trial", { trial: T, step: "load", state: "start", change }); });
-          for (let p = 5; p <= 100; p += 5) at(ms += 150, () => push("sample", { id: `${T}.load`, value: p }));
-          at(ms += 300, () => push("trial", { trial: T, step: "load", state: "done", seconds: 94 }));
-          at(ms += 200, () => push("trial", { trial: T, step: "prefill", state: "start", tokens: 16384 }));
-          for (let i = 0; i < 2; i++) {
-            at(ms += 1200, () => {});
-            for (let c = 1; c <= 3; c++) at(ms += 900, () => push("progress", { id: `${T}.prefill`, done: Math.min(16384, 5120 * c), total: 16384, rate: pre * (0.9 + Math.random() * 0.1) }));
-            at(ms += 900, () => push("sample", { id: `${T}.prefill`, value: pre * (0.95 + Math.random() * 0.06) }));
+        const R = DEMO_RUNS;
+        at(ms += 500, () => push("phase", { phase: "trial" }));
+        for (const [T, key, what, what_en, change, pre, dec, code, decision] of R) {
+          at(ms += 500, () => push("trial", { trial: T, step: "load", state: "start", change, key, what, what_en }));
+          if (T === "A") at(ms += 10, () => {});
+          for (let p = 10; p <= 100; p += 10) at(ms += 100, () => push("sample", { id: `${T}.load`, value: p }));
+          at(ms += 200, () => push("trial", { trial: T, step: "load", state: "done", seconds: 90 + Math.round(Math.random() * 20) }));
+          at(ms += 150, () => push("trial", { trial: T, step: "prefill", state: "start", tokens: 16384 }));
+          for (let c = 1; c <= 3; c++) at(ms += 350, () => push("progress", { id: `${T}.prefill`, done: Math.min(16384, 5460 * c), total: 16384, rate: pre }));
+          at(ms += 200, () => { push("sample", { id: `${T}.prefill`, value: pre }); push("trial", { trial: T, step: "prefill", state: "done", value: pre }); });
+          for (const [k, v] of [["decode", dec], ["decode_code", code]]) {
+            if (v == null) continue;
+            at(ms += 150, () => push("trial", { trial: T, step: k, state: "start", tokens: 300 }));
+            for (let i = 0; i < 6; i++) at(ms += 150, () => push("sample", { id: `${T}.${k}`, value: v * (0.94 + Math.random() * 0.1) }));
+            at(ms += 100, () => push("trial", { trial: T, step: k, state: "done", value: v }));
           }
-          at(ms += 200, () => push("trial", { trial: T, step: "prefill", state: "done", value: pre }));
-          at(ms += 200, () => push("trial", { trial: T, step: "decode", state: "start", tokens: 300 }));
-          for (let i = 0; i < 18; i++) at(ms += 250, () => push("sample", { id: `${T}.decode`, value: dec * (0.93 + Math.random() * 0.1) }));
-          at(ms += 200, () => push("trial", { trial: T, step: "decode", state: "done", value: dec }));
+          at(ms += 100, () => push("trial", { trial: T, step: "measured", state: "done" }));
+          if (T === "A") at(ms += 50, () => push("plan", { items: DEMO_PLAN }));
+          else at(ms += 100, () => push("decision", { trial: T, key, decision }));
         }
       }
       at(ms += 500, () => {
@@ -603,7 +702,7 @@ FTI18N.add({
     function demoResult(trials) {
       const now = Date.now() / 1000;
       return {
-        model: "/home/demo/models/Qwen3.8-Flash-Next-NVFP4", port: 1919, started: now - 1180, finished: now, chosen: "C",
+        model: "/home/demo/models/Qwen3.8-Flash-Next-NVFP4", port: 1919, started: now - 3900, finished: now, chosen: "H", mode: "standard", use: "both",
         args: ["--pp-size", "2", "--gpu", "0,1", "--moe-strategy", "hybrid", "--moe-cpu-threads", "8", "--moe-cache-auto", "--moe-bank-ram", "44G", "--kv-cache-dtype", "q8_0", "--kv-reserve-tokens", "131072", "--max-seq-len-override", "131072"],
         hw: { measurements: {
           gpus: [0, 1].map((i) => ({ index: i, name: "NVIDIA GeForce RTX 3060", pcie_gen: 4, pcie_width: i ? 4 : 8, pcie_width_max: 16, link_gbs: i ? 7.88 : 15.75 })),
@@ -611,11 +710,13 @@ FTI18N.add({
           cpu_moe: { best_gbs: 11.8, threads: 8, cores: 10, sweep: { 1: 2.1, 2: 4.0, 4: 7.4, 6: 9.9, 8: 11.2, 10: 11.6 } },
           gather: { 0: { gbs: 5.6 }, 1: { gbs: 2.9 } }, overlap: { cpu_gbs: 9.8, pcie_gbs: 4.3, fetch_fraction: 0.305 },
         } },
-        trials: trials ? [
-          { label: "A", change: null, ok: true, kv_tokens: 65536, expert_slots: 1520, load_s: 101, prefill_tps: 548, decode_tps: 18.1, hit_rate: 0.581, args: [] },
-          { label: "B", change: { flag: "--prefill-chunk-budget", value: "0.75" }, ok: true, kv_tokens: 65536, expert_slots: 1498, load_s: 99, prefill_tps: 702, decode_tps: 18.3, hit_rate: 0.579, args: [] },
-          { label: "C", change: { flag: "--kv-reserve-tokens", value: "131072" }, ok: true, kv_tokens: 131072, expert_slots: 1180, load_s: 118, prefill_tps: 689, decode_tps: 18.0, hit_rate: 0.566, args: [] },
-        ] : [],
+        trials: trials ? DEMO_RUNS.map(([label, key, what, what_en, change, pre, dec, code, decision], i) => ({
+          label, key, what: what ? [what, what_en] : null, change, decision, ok: true, kv_tokens: label === "H" ? 131072 : 65536,
+          expert_slots: 1520 - i * 20, load_s: 95 + i * 3, prefill_tps: pre, decode_tps: dec, decode_code_tps: code, hit_rate: 0.58, args: [] })) : [],
+        skipped: [
+          { flag: "--memory-ratio", why: "上げると他のアプリが GPU を使ったときに落ちます。速さではなく余裕の問題なので測りません。", why_en: "Raising it crashes when other apps use the GPU; it is headroom, not speed." },
+          { flag: "--max-running-req", why: "同時に何人で使うかで決まる値で、速さの測定では決められません。", why_en: "It depends on how many people use the server at once, not on speed." },
+        ],
         notes: [
           { flag: "--moe-strategy", value: "hybrid", source: "measured", why: "CPU でのエキスパート計算（11.8 GB/s）が GPU への転送（2.9 GB/s）の 4.1 倍速いので、GPU に無いエキスパートは CPU で計算します。", why_en: "Computing experts on the CPU (11.8 GB/s) is 4.1x the transfer to the GPU (2.9 GB/s), so experts not on the GPU are computed on the CPU." },
           { flag: "--moe-cpu-threads", value: "8", source: "measured", why: "8 スレッドで最大（11.8 GB/s）の 95% 以上が出ます。", why_en: "8 threads reach 95% of the best (11.8 GB/s)." },

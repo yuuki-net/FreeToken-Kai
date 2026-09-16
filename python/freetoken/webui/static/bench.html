@@ -19,6 +19,15 @@
       <label class="small" style="display:flex;gap:8px;align-items:flex-start">
         <input type="checkbox" id="bm-trials" checked style="margin-top:4px">
         <span><b data-i18n="bm_trials"></b><br><span class="muted" data-i18n="bm_trials_hint"></span></span></label>
+      <div id="bm-opts" class="small" style="display:flex;gap:24px;flex-wrap:wrap">
+        <div><div class="muted" data-i18n="bm_mode"></div>
+          <label><input type="radio" name="bm-mode" value="standard" checked> <span data-i18n="bm_mode_standard"></span></label><br>
+          <label><input type="radio" name="bm-mode" value="thorough"> <span data-i18n="bm_mode_thorough"></span></label></div>
+        <div><div class="muted" data-i18n="bm_use"></div>
+          <label><input type="radio" name="bm-use" value="both" checked> <span data-i18n="bm_use_both"></span></label><br>
+          <label><input type="radio" name="bm-use" value="code"> <span data-i18n="bm_use_code"></span></label><br>
+          <label><input type="radio" name="bm-use" value="prose"> <span data-i18n="bm_use_prose"></span></label></div>
+      </div>
       <div id="bm-warn" class="small" hidden></div>
       <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
         <button id="bm-start" class="primary" style="font-size:15px;padding:8px 22px" data-i18n="bm_start"></button>

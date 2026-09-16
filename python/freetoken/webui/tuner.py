@@ -3,17 +3,21 @@
 Two stages, one background job in ``ft mgr`` (torch-free; the GPU work runs in child processes):
 
 1. Hardware (``webui/hwbench.py``, a child process): PCIe, RAM and SSD rates, and the model's
-   own expert kernels on the CPU (swept over thread counts) and over PCIe. Decides the MoE
-   strategy and the CPU threads.
-2. Real runs (optional): start ``ft serve`` with those flags, send a prompt of random words (no
-   prefix-cache hits; its token count comes back in the usage) and a fixed generation, then read the
-   cache geometry.
-   If the free VRAM (or at most a quarter of an auto-sized expert cache) holds a longer context,
-   run again with it and keep it only when generation stays within 5% and prompt processing
-   within 10%.
+   own expert kernels on the CPU (swept over thread counts) and over PCIe. Sets the MoE strategy
+   and the CPU threads the first run starts from.
+2. Real runs (optional): ``ft serve`` is started with the recommended flags (``webui/recommend.py``)
+   plus the hardware's, and measured. Then every candidate in ``webui/search.py`` that applies is
+   tried as one change against the best settings so far, and kept only when the measurement says
+   so; last, longer contexts are tried the same way. The candidates are recomputed from the best
+   settings after each run, so a kept change can open or close later ones.
 
-The engine the manager was running is stopped first (the measurements need the GPU) and started
-again at the end, whatever happened. Progress is a list of events the page polls."""
+What a run measures, on this repository's own documents and code (a nonce first line keeps the
+prefix cache out of it): a 16k-token prompt twice, generation on prose three times (median), and
+generation on code three times when an MTP head is in play (its acceptance depends on the text).
+Which generation figure decides follows the use the person picked: prose, code, or both.
+
+The engine the manager was running is stopped first and started again at the end, whatever
+happened. Progress is a list of events the page polls."""
 
 from __future__ import annotations
 
@@ -27,6 +31,8 @@ import time
 import urllib.request
 from typing import Any, Callable
 
+from . import search
+
 GiB = 1 << 30
 # the longest a hardware step has gone without a line (the CPU sweep on many cores) is well under this
 HW_QUIET_S = 300.0
@@ -36,6 +42,8 @@ PREFILL_TOKENS = 16384
 # three runs, median: on a 2060 two 200-token runs swung 31-36 tok/s between runs that should match
 DECODE_TOKENS = 300
 DECODE_RUNS = 3
+USES = ("both", "prose", "code")
+MODES = ("standard", "thorough")
 
 
 class Busy(Exception):
@@ -87,10 +95,39 @@ def has_flag(args: list[str], flag: str) -> bool:
 
 
 # ------------------------------------------------------------------ deciding from measurements
+def generation(t: dict, use: str) -> float:
+    """The generation figure that decides, for the use the person picked."""
+    prose = t.get("decode_tps") or 0.0
+    code = t.get("decode_code_tps") or prose
+    if use == "prose":
+        return prose
+    if use == "code":
+        return code
+    return math.sqrt(prose * code) if prose and code else prose or code
+
+
+def keep(best: dict, t: dict, c: search.Candidate, use: str) -> bool:
+    if not t.get("ok"):
+        return False
+    g0, g1 = generation(best, use), generation(t, use)
+    p0, p1 = best.get("prefill_tps") or 0.0, t.get("prefill_tps") or 0.0
+    if c.goal == "prefill":
+        return p1 >= c.gain * p0 and g1 >= c.hold_gen * g0
+    if c.goal == "either":
+        return (g1 >= c.gain * g0 and p1 >= 0.95 * p0) or (p1 >= 1.05 * p0 and g1 >= c.hold_gen * g0)
+    return g1 >= c.gain * g0 and p1 >= c.hold_prefill * p0
+
+
+def context_candidates(geometry: dict, model_max: int | None) -> list[int]:
+    """Context tiers above the one running, up to the model's limit and what the cache budget can hold."""
+    now = (geometry.get("num_pages") or 0) * (geometry.get("page_size") or 1)
+    cap = min(model_max or 262144, ((geometry.get("limits") or {}).get("kv_tokens") or {}).get("max") or 1 << 30)
+    return [t for t in CONTEXT_TIERS if now and t >= now * 1.5 and t <= cap]
+
+
+# kept for callers and tests of the earlier, single-step version
 def longer_context(geometry: dict, ranks: list[dict], cache_auto: bool, model_max: int | None,
                    max_expert_share: float = 0.25, headroom: int = 600 << 20) -> dict | None:
-    """The longest context tier the measured free VRAM holds, taking at most ``max_expert_share``
-    of an auto-sized expert cache for the rest. None when nothing longer fits."""
     ub = geometry.get("unit_bytes") or {}
     kv_per_token, per_expert = ub.get("kv_per_token") or 0, ub.get("moe_per_expert") or 0
     now = (geometry.get("num_pages") or 0) * (geometry.get("page_size") or 1)
@@ -118,27 +155,51 @@ def longer_context(geometry: dict, ranks: list[dict], cache_auto: bool, model_ma
     return best
 
 
-def keep_faster_prefill(a: dict, b: dict, gain: float = 1.05, decode_share: float = 0.97) -> bool:
-    return bool(b.get("ok")) and (b.get("prefill_tps") or 0) >= gain * (a.get("prefill_tps") or 0) and \
-        (b.get("decode_tps") or 0) >= decode_share * (a.get("decode_tps") or 0)
+# ------------------------------------------------------------------ what the runs read
+_FALLBACK_WORDS = (
+    "time year people way day man thing woman life child world school state family student group country "
+    "problem hand part place case week company system program question work government number night point "
+    "home water room mother area money story fact month lot right study book eye job word business issue"
+).split()
 
 
-def keep_faster_decode(a: dict, b: dict, gain: float = 1.03, prefill_share: float = 0.9) -> bool:
-    return bool(b.get("ok")) and (b.get("decode_tps") or 0) >= gain * (a.get("decode_tps") or 0) and \
-        (b.get("prefill_tps") or 0) >= prefill_share * (a.get("prefill_tps") or 0)
+def _repo_root() -> str:
+    return os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 
-def strategy_ratio(hw: dict) -> float | None:
-    """CPU expert compute over the slowest GPU's expert transfer, from the hardware bench."""
-    m = hw.get("measurements") or {}
-    cpu = (m.get("cpu_moe") or {}).get("best_gbs")
-    links = [g.get("gbs") for g in (m.get("gather") or {}).values() if g and g.get("gbs")]
-    return cpu / min(links) if cpu and links else None
+def load_corpus(root: str | None = None) -> dict:
+    """This repository's own prose (README, docs) and code (the package): text a model is actually
+    asked to read, for routing and MTP acceptance that look like use. Random words when neither is
+    there (a wheel install)."""
+    root = root or _repo_root()
+    prose, code = [], []
+    for name in ["README.md"] + sorted(f"docs/{n}" for n in (os.listdir(os.path.join(root, "docs")) if os.path.isdir(os.path.join(root, "docs")) else [])):
+        path = os.path.join(root, name)
+        if name.endswith(".md") and os.path.isfile(path):
+            try:
+                prose.append(open(path, encoding="utf-8").read())
+            except OSError:
+                pass
+    pkg = os.path.join(root, "python", "freetoken")
+    for base, dirs, files in sorted(os.walk(pkg)):
+        dirs.sort()
+        for f in sorted(files):
+            if f.endswith(".py") and "test" not in f:
+                try:
+                    code.append(open(os.path.join(base, f), encoding="utf-8").read())
+                except OSError:
+                    pass
+            if sum(map(len, code)) > 400_000:
+                break
+    words = " ".join(_FALLBACK_WORDS * 200)
+    return {"prose": "\n\n".join(prose) or words, "code": "\n\n".join(code) or words}
 
 
-def keep_longer(a: dict, b: dict, decode_share: float = 0.95, prefill_share: float = 0.9) -> bool:
-    return bool(b.get("ok")) and (b.get("decode_tps") or 0) >= decode_share * (a.get("decode_tps") or 0) and \
-        (b.get("prefill_tps") or 0) >= prefill_share * (a.get("prefill_tps") or 0)
+def excerpt(text: str, chars: int, rng: random.Random) -> str:
+    if len(text) <= chars:
+        return (text * (chars // max(1, len(text)) + 1))[:chars]
+    start = rng.randrange(0, len(text) - chars)
+    return text[start:start + chars]
 
 
 # ------------------------------------------------------------------ talking to the serve
@@ -158,33 +219,26 @@ def _stream(port: int, path: str, body: dict):
             yield raw.decode(errors="replace")
 
 
-_WORDS = (
-    "time year people way day man thing woman life child world school state family student group country "
-    "problem hand part place case week company system program question work government number night point "
-    "home water room mother area money story fact month lot right study book eye job word business issue "
-    "side kind head house service friend father power hour game line end member law car city community name "
-    "president team minute idea kid body information back parent face others level office door health person "
-    "art war history party result change morning reason research girl guy moment air teacher force education "
-    "river stone light green quiet early open simple strong small large young old long short heavy clear warm"
-).split()
-
-
-def _random_text(words: int, rng: random.Random) -> str:
-    # ft serve takes text prompts only; random words keep the prefix cache from shortening the run
-    return " ".join(rng.choice(_WORDS) for _ in range(words))
-
-
 def _prompt_tokens(doc: Any) -> tuple[int, int]:
     usage = (doc or {}).get("usage") or {}
     cached = ((usage.get("prompt_tokens_details") or {}).get("cached_tokens")) or 0
     return int(usage.get("prompt_tokens") or 0), int(cached)
 
 
+def _labels():
+    for a in "ABCDEFGHIJKLMNOPQRSTUVWXYZ":
+        yield a
+    for a in "ABCDEFGHIJKLMNOPQRSTUVWXYZ":
+        for b in "ABCDEFGHIJKLMNOPQRSTUVWXYZ":
+            yield a + b
+
+
 class TuneJob:
     def __init__(self, manager, *, state_dir: str, python: str, default_port: int,
                  recommend: Callable[[str], dict] | None = None, spawn: Callable[..., Any] | None = None,
                  http: Callable[..., Any] | None = None, stream: Callable[..., Any] | None = None,
-                 clock: Callable[[], float] = time.monotonic, sleep: Callable[[float], None] = time.sleep):
+                 clock: Callable[[], float] = time.monotonic, sleep: Callable[[float], None] = time.sleep,
+                 corpus: dict | None = None):
         self.manager = manager
         self.dir = os.path.join(state_dir, "tune")
         self.python = python
@@ -195,6 +249,7 @@ class TuneJob:
         self._stream = stream or _stream
         self._clock = clock
         self._sleep = sleep
+        self._corpus = corpus
         self._lock = threading.Lock()
         self._cancel = threading.Event()
         self._proc = None
@@ -208,8 +263,8 @@ class TuneJob:
         with self._lock:
             self._seq += 1
             self.events.append({"seq": self._seq, "k": event, "t": round(time.time(), 2), **fields})
-            if len(self.events) > 5000:
-                del self.events[:1000]
+            if len(self.events) > 8000:
+                del self.events[:2000]
 
     def status(self, since: int = 0) -> dict:
         with self._lock:
@@ -217,7 +272,7 @@ class TuneJob:
                     "events": [e for e in self.events if e["seq"] > since], "seq": self._seq}
 
     # ---- control
-    def start(self, model: str, trials: bool = True, port: int | None = None) -> dict:
+    def start(self, model: str, trials: bool = True, port: int | None = None, mode: str = "standard", use: str = "both") -> dict:
         with self._lock:
             if self.state == "running":
                 raise Busy("a benchmark is already running")
@@ -225,7 +280,9 @@ class TuneJob:
             self.run_id += 1
             self.state, self.model, self.events, self.result, self.error, self._seq = "running", model, [], None, None, 0
         self._cancel.clear()
-        self._thread = threading.Thread(target=self._run, args=(model, trials, port or self.default_port),
+        mode = mode if mode in MODES else "standard"
+        use = use if use in USES else "both"
+        self._thread = threading.Thread(target=self._run, args=(model, trials, port or self.default_port, mode, use),
                                         name="ft-mgr-benchmark", daemon=True)
         self._thread.start()
         return {"started": True}
@@ -255,10 +312,11 @@ class TuneJob:
             raise InterruptedError("cancelled")
 
     # ---- the job
-    def _run(self, model: str, trials: bool, port: int) -> None:
+    def _run(self, model: str, trials: bool, port: int, mode: str = "standard", use: str = "both") -> None:
         prev = self.manager.status()
         prev_cfg = (prev.get("model"), prev.get("port"), list(self.manager.serve_args())) if prev.get("running") else None
-        result: dict = {"model": model, "port": port, "started": time.time(), "trials": []}
+        result: dict = {"model": model, "port": port, "started": time.time(), "trials": [], "mode": mode, "use": use,
+                        "skipped": [{"flag": f, "why": ja, "why_en": en} for f, ja, en in search.SKIPPED]}
         try:
             if prev_cfg:
                 self._ev("phase", phase="stop")
@@ -272,8 +330,10 @@ class TuneJob:
             args, notes = self._apply_hw(rec, hw)
             result["base_args"] = list(args)
             if trials:
-                model_max = ((rec.get("host") or {}).get("model") or {}).get("max_context")
-                args, notes = self._trials(model, port, args, notes, result, model_max, hw)
+                host = rec.get("host") or {}
+                facts = dict(host.get("model") or {}, ram_total=(host.get("memory") or {}).get("total"),
+                             weight_bytes=host.get("weight_bytes"))
+                args, notes = self._trials(model, port, args, notes, result, facts, hw, mode, use)
             result["args"] = [a for a in args if a != "--moe-collect-stats"]
             result["notes"] = notes
             result["finished"] = time.time()
@@ -374,14 +434,12 @@ class TuneJob:
 
     # ---- real runs
     def _trials(self, model: str, port: int, args: list[str], notes: list[dict], result: dict,
-                model_max: int | None = None, hw: dict | None = None):
-        """One change per run, each kept only when the measurements say so: the prefill chunk
-        budget, a longer context, and the other MoE strategy when the hardware bench was close."""
+                facts: dict, hw: dict, mode: str, use: str):
         self._ev("phase", phase="trial")
-        letters = iter("ABCDEFGHIJ")
+        labels = _labels()
+        mtp_model = bool(facts.get("mtp"))
         base = set_flags(args, {"--moe-collect-stats": None})
-        label = next(letters)
-        a = self._trial(label, model, port, base)
+        a = self._trial(next(labels), model, port, base, code=mtp_model and use != "prose")
         if not a["ok"] and has_flag(base, "--dtype"):
             # float16 on a pre-Ampere card copies while converting: a tight model may not load with it
             result["trials"].append(a)
@@ -391,99 +449,116 @@ class TuneJob:
             notes.append({"flag": "--dtype", "value": None, "source": "measured", "removed": True,
                           "why": "float16 では読み込み時の変換で VRAM が足りず起動できなかったので、指定を外しました。",
                           "why_en": "The model did not load with float16 (the conversion needs VRAM it did not have), so the flag was dropped."})
-            label = next(letters)
-            a = self._trial(label, model, port, base, change={"flag": "--dtype", "value": None})
+            a = self._trial(next(labels), model, port, base, change={"flag": "--dtype", "value": None, "removed": True},
+                            code=mtp_model and use != "prose")
+        a["decision"] = "base"
         result["trials"].append(a)
         if not a["ok"]:
             raise RuntimeError(f"the server did not start with the measured flags: {a.get('error')}")
         best, best_args = a, base
+        self._ev("plan", items=[{"key": c.key, "what": c.what_ja, "what_en": c.what_en, "change": c.change()}
+                                for c in search.plan(best_args, facts, hw, mode)], mode=mode, use=use)
 
-        def attempt(changes: dict, drop: tuple = ()) -> tuple[dict, list[str]]:
+        tried: set[str] = set()
+        kept: set[str] = set()
+        while True:
             self._check()
-            cand_args = set_flags(best_args, changes, drop)
-            change = next(iter(changes.items())) if changes else (drop[0], None)
-            t = self._trial(next(letters), model, port, cand_args, change={"flag": change[0], "value": change[1]})
+            pending = [c for c in search.plan(best_args, facts, hw, mode)
+                       if c.key not in tried and c.group not in tried and (c.after is None or c.after in kept)]
+            if not pending:
+                break
+            c = pending[0]
+            tried.update({c.key, c.group})
+            cand_args = set_flags(best_args, search.merge_changes(best_args, c.changes), c.drop)
+            if cand_args == best_args:
+                continue
+            t = self._trial(next(labels), model, port, cand_args, change=c.change(), key=c.key,
+                            what=(c.what_ja, c.what_en), code=mtp_model and use != "prose" and (c.code or has_flag(cand_args, "--spec-mtp")))
+            won = keep(best, t, c, use)
+            t["decision"] = "kept" if won else ("failed" if not t.get("ok") else "rejected")
             result["trials"].append(t)
-            return t, cand_args
+            self._ev("decision", trial=t["label"], key=c.key, decision=t["decision"])
+            notes = self._note(notes, c, best, t, won, use)
+            if won:
+                best, best_args = t, cand_args
+                kept.add(c.key)
 
-        def speeds(x: dict) -> str:
-            return f"{x.get('prefill_tps') or 0:.0f} / {x.get('decode_tps') or 0:.1f}"
+        # longer contexts last, on everything kept: a tier is kept while generation holds 95%
+        model_max = facts.get("max_context")
+        for tier in context_candidates(best.get("geometry") or {}, model_max):
+            self._check()
+            c = search.Candidate(f"context_{tier}", {"--kv-reserve-tokens": str(tier), "--max-seq-len-override": str(tier)},
+                                 gain=0.95, hold_prefill=0.9,
+                                 what_ja=f"コンテキスト長を {tier:,} にする", what_en=f"a context of {tier:,} tokens")
+            cand_args = set_flags(best_args, c.changes)
+            t = self._trial(next(labels), model, port, cand_args, change=c.change(), key=c.key, what=(c.what_ja, c.what_en),
+                            code=mtp_model and use != "prose" and has_flag(cand_args, "--spec-mtp"))
+            won = keep(best, t, c, use)
+            t["decision"] = "kept" if won else ("failed" if not t.get("ok") else "rejected")
+            result["trials"].append(t)
+            self._ev("decision", trial=t["label"], key=c.key, decision=t["decision"])
+            notes = self._note(notes, c, best, t, won, use)
+            if not won:
+                break
+            best, best_args = t, cand_args
 
-        # 1. the prefill chunk budget: a wider chunk is the largest prefill lever this fork measured
-        if not has_flag(best_args, "--prefill-chunk-budget"):
-            t, t_args = attempt({"--prefill-chunk-budget": "0.75"})
-            if keep_faster_prefill(best, t):
-                notes.append({"flag": "--prefill-chunk-budget", "value": "0.75", "source": "measured",
-                              "why": f"実測で決めました: 0.75 にするとプロンプト処理 / 生成が {speeds(best)} → {speeds(t)} tok/s。プロンプト処理が速くなり、生成は落ちないので採ります。",
-                              "why_en": f"Measured: at 0.75 prompt processing / generation went {speeds(best)} -> {speeds(t)} tok/s. Prompts are faster and generation holds, so it is kept."})
-                best, best_args = t, t_args
-            else:
-                notes.append({"flag": "--prefill-chunk-budget", "value": "0.75", "source": "measured", "rejected": True,
-                              "why": (f"試しました: 0.75 ではプロンプト処理 / 生成が {speeds(best)} → {speeds(t)} tok/s で、5% 以上速くならなかったので既定（0.55）のままにします。"
-                                      if t.get("ok") else "試しました: 0.75 では起動または測定に失敗したので、既定（0.55）のままにします。"),
-                              "why_en": (f"Tried: at 0.75 prompt processing / generation went {speeds(best)} -> {speeds(t)} tok/s, not 5% faster, so the default (0.55) stays."
-                                         if t.get("ok") else "Tried: 0.75 failed to start or to finish the measurement, so the default (0.55) stays.")})
-
-        # 2. a longer context, into the VRAM the best run left free
-        cand = longer_context(best.get("geometry") or {}, best.get("ranks") or [], has_flag(best_args, "--moe-cache-auto"), model_max)
-        result["candidate"] = cand
-        now = best.get("kv_tokens") or 0
-        if cand:
-            tokens = str(cand["tokens"])
-            t, t_args = attempt({"--kv-reserve-tokens": tokens, "--max-seq-len-override": tokens})
-            if keep_longer(best, t):
-                why = (f"実測で決めました: コンテキスト長 {now:,} では プロンプト処理 / 生成が {speeds(best)} tok/s、{cand['tokens']:,} では {speeds(t)} tok/s。"
-                       "長くしても速さがほぼ変わらないので長い方にします。")
-                why_en = (f"Measured: at {now:,} tokens prompt processing / generation was {speeds(best)} tok/s, at {cand['tokens']:,} {speeds(t)}. "
-                          "The longer context costs almost nothing, so it is kept.")
-                best, best_args = t, t_args
-            elif t.get("ok"):
-                why = (f"実測で決めました: コンテキスト長を {cand['tokens']:,} にするとプロンプト処理 / 生成が {speeds(best)} → {speeds(t)} tok/s でした。"
-                       f"生成 95%・プロンプト処理 90% を下回るので、{now:,} のままにします。")
-                why_en = (f"Measured: at {cand['tokens']:,} tokens prompt processing / generation went {speeds(best)} -> {speeds(t)} tok/s, "
-                          f"below the 95% / 90% kept for a longer context, so {now:,} stays.")
-            else:
-                why = f"コンテキスト長 {cand['tokens']:,} では起動できなかったので、{now:,} のままにします。"
-                why_en = f"The server did not start with {cand['tokens']:,} tokens, so {now:,} stays."
-        else:
-            why = f"起動後の空き VRAM では、コンテキスト長 {now:,} より長いものが入りませんでした（エキスパートの枠を 1/4 以上削る必要がある）。"
-            why_en = f"After the start the free VRAM held no context longer than {now:,} tokens without giving up more than a quarter of the expert cache."
         tokens = next((v for k, v in parse_flags(best_args) if k == "--kv-reserve-tokens"), None)
-        notes = [n for n in notes if n["flag"] not in ("--kv-reserve-tokens", "--max-seq-len-override")]
         if tokens:
-            notes.append({"flag": "--kv-reserve-tokens", "value": tokens, "why": why, "why_en": why_en, "source": "measured"})
+            notes = [n for n in notes if n["flag"] != "--max-seq-len-override"]
             notes.append({"flag": "--max-seq-len-override", "value": tokens, "source": "rule",
                           "why": "宣伝する長さと実際に入る長さをそろえます。", "why_en": "The advertised context matches what actually fits."})
-
-        # 3. the other MoE strategy, only when the kernels alone could not tell them apart
-        ratio = strategy_ratio(hw or {})
-        strategy = next((v for k, v in parse_flags(best_args) if k == "--moe-strategy"), None)
-        if ratio is not None and 1.5 <= ratio <= 3.0 and strategy in ("hybrid", "offload"):
-            other = "offload" if strategy == "hybrid" else "hybrid"
-            drop = ("--moe-cpu-layers", "--moe-cpu-threads") if other == "offload" else ()
-            t, t_args = attempt({"--moe-strategy": other}, drop)
-            if keep_faster_decode(best, t):
-                notes = [n for n in notes if n["flag"] not in ("--moe-strategy",) + drop]
-                notes.append({"flag": "--moe-strategy", "value": other, "source": "measured",
-                              "why": f"実測で決めました: CPU と転送の差が {ratio:.1f} 倍と小さかったので両方を起動して比べ、{other} で生成が {best['decode_tps']:.1f} → {t['decode_tps']:.1f} tok/s になりました。",
-                              "why_en": f"Measured: the CPU was only {ratio:.1f}x the transfer, so both were started; {other} took generation {best['decode_tps']:.1f} -> {t['decode_tps']:.1f} tok/s."})
-                best, best_args = t, t_args
-
         result["chosen"] = best["label"]
         return best_args, notes
 
-    def _trial(self, label: str, model: str, port: int, args: list[str], change: dict | None = None) -> dict:
+    def _note(self, notes: list[dict], c: search.Candidate, best: dict, t: dict, won: bool, use: str) -> list[dict]:
+        def figs(x: dict) -> str:
+            g = f"{x.get('decode_tps') or 0:.1f}"
+            if x.get("decode_code_tps"):
+                g += f"（コード {x['decode_code_tps']:.1f}）"
+            return f"{x.get('prefill_tps') or 0:.0f} / {g}"
+
+        def figs_en(x: dict) -> str:
+            g = f"{x.get('decode_tps') or 0:.1f}"
+            if x.get("decode_code_tps"):
+                g += f" (code {x['decode_code_tps']:.1f})"
+            return f"{x.get('prefill_tps') or 0:.0f} / {g}"
+
+        ch = c.change()
+        if won:
+            touched = set(c.changes) | set(c.drop)
+            notes = [n for n in notes if n["flag"] not in touched]
+            why = f"実測で採用: {c.what_ja}。プロンプト処理 / 生成が {figs(best)} → {figs(t)} tok/s。"
+            why_en = f"Measured and kept: {c.what_en}. Prompt processing / generation went {figs_en(best)} -> {figs_en(t)} tok/s."
+            for flag, value in c.changes.items():
+                notes.append({"flag": flag, "value": value, "source": "measured", "why": why, "why_en": why_en})
+            for flag in c.drop:
+                notes.append({"flag": flag, "value": None, "source": "measured", "removed": True, "why": why, "why_en": why_en})
+            return notes
+        if t.get("ok"):
+            why = f"試して不採用: {c.what_ja}。プロンプト処理 / 生成が {figs(best)} → {figs(t)} tok/s で、採用の条件に届きませんでした。"
+            why_en = f"Tried, not kept: {c.what_en}. Prompt processing / generation went {figs_en(best)} -> {figs_en(t)} tok/s, short of the bar."
+        else:
+            why = f"試して不採用: {c.what_ja}。起動または測定に失敗しました（{(t.get('error') or '')[:120]}）。"
+            why_en = f"Tried, not kept: {c.what_en}. It failed to start or to finish the measurement ({(t.get('error') or '')[:120]})."
+        notes.append({"flag": ch["flag"], "value": ch.get("value"), "source": "measured", "rejected": True, "why": why, "why_en": why_en,
+                      "key": c.key})
+        return notes
+
+    def _trial(self, label: str, model: str, port: int, args: list[str], change: dict | None = None, key: str | None = None,
+               what: tuple[str, str] | None = None, code: bool = False) -> dict:
         try:
-            return self._trial_run(label, model, port, args, change)
+            return self._trial_run(label, model, port, args, change, key, what, code)
         except InterruptedError:
             raise
         except Exception as exc:  # noqa: BLE001 -- e.g. a wider chunk that runs out of VRAM mid-prompt
             self._ev("trial", trial=label, step="measure", state="failed", message=str(exc)[:300])
-            return {"label": label, "args": list(args), "change": change, "ok": False, "error": str(exc)[:300]}
+            return {"label": label, "key": key, "what": what, "args": list(args), "change": change, "ok": False, "error": str(exc)[:300]}
 
-    def _trial_run(self, label: str, model: str, port: int, args: list[str], change: dict | None) -> dict:
-        out: dict = {"label": label, "args": list(args), "change": change, "ok": False}
-        self._ev("trial", trial=label, step="load", state="start", args=args, change=change)
+    def _trial_run(self, label: str, model: str, port: int, args: list[str], change: dict | None, key: str | None,
+                   what: tuple[str, str] | None, code: bool) -> dict:
+        out: dict = {"label": label, "key": key, "what": what, "args": list(args), "change": change, "ok": False}
+        self._ev("trial", trial=label, step="load", state="start", args=args, change=change, key=key,
+                 what=what[0] if what else None, what_en=what[1] if what else None)
         t0 = self._clock()
         self.manager.switch(model, port, args)
         ready = self._wait_ready(label, port)
@@ -493,24 +568,29 @@ class TuneJob:
             self._ev("trial", trial=label, step="load", state="failed", message=ready)
             return out
         self._ev("trial", trial=label, step="load", state="done", seconds=out["load_s"])
-        rng = random.Random(0xBE7C + ord(label))
+        if self._corpus is None:
+            self._corpus = load_corpus()
+        rng = random.Random(hash((label, key)) & 0xFFFFFFFF)
         model_id = ((self._http(port, "/v1/models", timeout=30) or {}).get("data") or [{}])[0].get("id") or "default"
-        # warm-up, and how many tokens a word of this vocabulary is for this tokenizer
-        probe = self._http(port, "/v1/completions", {"model": model_id, "prompt": _random_text(400, rng), "max_tokens": 8, "ignore_eos": True})
-        per_word = max(0.5, (_prompt_tokens(probe)[0] or 400) / 400)
+        # warm-up, and how many characters one token of this text is for this tokenizer
+        probe_text = excerpt(self._corpus["prose"], 4000, rng)
+        probe = self._http(port, "/v1/completions", {"model": model_id, "prompt": probe_text, "max_tokens": 8, "ignore_eos": True})
+        chars_per_token = max(1.5, len(probe_text) / max(1, _prompt_tokens(probe)[0] or 1000))
 
         cache = self._http(port, "/v1/cache/status", timeout=30) or {}
         geometry = cache.get("geometry") or {}
         kv_tokens = (geometry.get("num_pages") or 0) * (geometry.get("page_size") or 1)
-        prompt_len = max(512, min(PREFILL_TOKENS, (kv_tokens or PREFILL_TOKENS) - DECODE_TOKENS - 64))
+        prompt_len = max(512, min(PREFILL_TOKENS, (kv_tokens or PREFILL_TOKENS) - DECODE_TOKENS - 256))
 
         self._check()
         self._ev("trial", trial=label, step="prefill", state="start", tokens=prompt_len)
         prefill = []
-        for _ in range(2):
+        mixed = self._corpus["prose"] + "\n\n" + self._corpus["code"]
+        for i in range(2):
+            # a new first line each time: nothing of this prompt is in the prefix cache
+            text = f"[{label}-{i}-{rng.getrandbits(40):010x}]\n" + excerpt(mixed, int(prompt_len * chars_per_token * 0.97), rng)
             t = self._clock()
-            doc = self._prefill_once(label, port, {"model": model_id, "prompt": _random_text(int(prompt_len / per_word), rng),
-                                                   "max_tokens": 1, "ignore_eos": True}, prompt_len)
+            doc = self._prefill_once(label, port, {"model": model_id, "prompt": text, "max_tokens": 1, "ignore_eos": True}, prompt_len)
             tokens, cached = _prompt_tokens(doc)
             tps = max(0, (tokens or prompt_len) - cached) / max(1e-6, self._clock() - t)
             prefill.append(round(tps, 1))
@@ -518,12 +598,15 @@ class TuneJob:
         out["prefill_tps"] = max(prefill)
         self._ev("trial", trial=label, step="prefill", state="done", value=out["prefill_tps"])
 
-        self._check()
-        self._ev("trial", trial=label, step="decode", state="start", tokens=DECODE_TOKENS)
-        decode = [self._decode(label, port, model_id, rng) for _ in range(DECODE_RUNS)]
-        decode = [d for d in decode if d]
-        out["decode_tps"] = round(sorted(decode)[len(decode) // 2], 2) if decode else None
-        self._ev("trial", trial=label, step="decode", state="done", value=out["decode_tps"])
+        for kind in (("prose", "code") if code else ("prose",)):
+            self._check()
+            step = "decode" if kind == "prose" else "decode_code"
+            self._ev("trial", trial=label, step=step, state="start", tokens=DECODE_TOKENS)
+            runs = [self._decode(label, port, model_id, rng, kind) for _ in range(DECODE_RUNS)]
+            runs = [r for r in runs if r]
+            value = round(sorted(runs)[len(runs) // 2], 2) if runs else None
+            out["decode_tps" if kind == "prose" else "decode_code_tps"] = value
+            self._ev("trial", trial=label, step=step, state="done", value=value)
 
         experts = self._http(port, "/v1/kai/experts?window=60", timeout=30) or {}
         layers = [l for l in experts.get("layers") or [] if not l.get("mtp")]
@@ -575,9 +658,13 @@ class TuneJob:
             raise out["error"]
         return out.get("doc")
 
-    def _decode(self, label: str, port: int, model_id: str, rng: random.Random) -> float | None:
-        body = {"model": model_id, "prompt": _random_text(100, rng), "max_tokens": DECODE_TOKENS, "ignore_eos": True,
+    def _decode(self, label: str, port: int, model_id: str, rng: random.Random, kind: str = "prose") -> float | None:
+        source = self._corpus["code" if kind == "code" else "prose"] if self._corpus else " ".join(_FALLBACK_WORDS)
+        lead = "# Continue this Python module.\n" if kind == "code" else "Continue this document.\n\n"
+        prompt = f"[{label}-{kind}-{rng.getrandbits(40):010x}]\n{lead}{excerpt(source, 2400, rng)}"
+        body = {"model": model_id, "prompt": prompt, "max_tokens": DECODE_TOKENS, "ignore_eos": True,
                 "stream": True, "stream_options": {"include_usage": True}}
+        sample_id = f"{label}.decode" if kind == "prose" else f"{label}.decode_code"
         first = last = None
         chunks, usage = 0, None
         for raw in self._stream(port, "/v1/completions", body):
@@ -597,13 +684,13 @@ class TuneJob:
             last = now
             chunks += 1
             if chunks % 20 == 0 and last > first:
-                self._ev("sample", id=f"{label}.decode", value=round((chunks - 1) / (last - first), 2))
+                self._ev("sample", id=sample_id, value=round((chunks - 1) / (last - first), 2))
             if self._cancel.is_set():
                 break
         if first is None or last is None or last <= first or chunks < 2:
             return None
-        # a chunk can carry no text (a token that ends mid-character): the usage count is exact
-        tokens = usage if usage and usage >= chunks else chunks
+        # a chunk can carry several tokens (MTP) or none (a token that ends mid-character): the usage count is exact
+        tokens = usage if usage else chunks
         return (tokens - 1) / (last - first)
 
     def _wait_ready(self, label: str, port: int, timeout: float = 1800.0) -> bool | str:

@@ -105,13 +105,32 @@ while one holds the GPU.
    - `--moe-cpu-threads`: the fewest threads within 95% of the best, not the maximum.
    - The figures are also merged into the GPU's `ft bench bw` profile, which the engine reads for
      the hybrid fetch split (`--moe-hybrid-max-fetch -1`, the default).
-2. **Real runs** (optional, 5-20 minutes): `ft serve` is started with the recommended settings
-   plus the above, and measured with a prompt of 8,192 random token ids (exact length, nothing
-   reused from the prefix cache) and 200 generated tokens (`ignore_eos`). If the free VRAM, or at
-   most a quarter of an auto-sized expert cache, holds a longer context tier, the model is started
-   again with it, and the longer context is kept only when generation stays within 5% and prompt
-   processing within 10%. A pre-Ampere card that cannot load the model in float16 is retried
-   without `--dtype`.
+2. **Real runs** (optional; about an hour on two RTX 3060s in the standard mode, two in the
+   thorough one). Setting A is the recommended settings plus the above. Each later run changes one
+   thing from the best so far (`webui/search.py`) and is kept only when it measured faster; what is
+   kept is carried on and can open or close later candidates (a chunk budget of 0.9 is tried only
+   after 0.75 was kept). Each run is a fresh `ft serve`:
+   - prompt processing: two prompts of 16,384 tokens cut from this repository's own documents and
+     code, each opened with a unique line so nothing comes from the prefix cache;
+   - generation: the median of three 300-token generations continuing prose, and, for a model with
+     MTP weights, three more continuing Python, since MTP drafts far better on code.
+   - **Standard** tries what has helped on some machine: offload instead of hybrid, the CPU thread
+     count, each expert kernel, a 16-bit KV cache, prefill overlap, a chunk budget of 0.75, four
+     prefill pieces, moving the pipeline split one layer, pinned PLE, MTP 3 and 5.
+   - **Thorough** adds what has not helped so far: no hybrid fetch, the linear kernels, a q4_0 KV
+     cache, device-side copies of cache hits, chunk budget 0.9, one piece, a 16k prefill length,
+     no host embedding, bf16 dense weights, the split moved two layers, `--pp-send-ahead` and
+     `--pp-prefill-group`.
+   - **Main use** (prose, code or both) decides a change that helps one and hurts the other, such
+     as MTP.
+   - Longer context tiers come last, on everything kept, and are kept while generation stays
+     within 5% and prompt processing within 10%. A pre-Ampere card that cannot load the model in
+     float16 is retried without `--dtype`.
+   - Not searched, with the reason on the result page: `--memory-ratio` (the risk is later VRAM use
+     by other programs, which a benchmark cannot see), `--max-running-req` and
+     `--cuda-graph-max-bs` (throughput, not one person's speed), `--moe-cpu-layers` and
+     `--attention-backend` (auto already picks what starts), and the settings that decide what fits
+     rather than how fast.
 
 The result lists each flag as **measured** or **rule** with its reason, and can be saved as a new
 profile, merged into a profile for the same model, or started directly. The last result per model

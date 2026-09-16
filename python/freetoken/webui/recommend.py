@@ -113,8 +113,18 @@ def model_facts(path: str) -> dict:
         "max_context": get("max_position_embeddings"),
         "quant": quant.get("quant_method") or quant.get("quant_algo"),
         "vision": bool(cfg.get("vision_config") or text.get("vision_config")),
+        "mtp": bool(get("mtp_num_hidden_layers")) or _has_mtp_weights(path),
     })
     return facts
+
+
+def _has_mtp_weights(path: str) -> bool:
+    """A checkpoint that ships its MTP head says so in its weight index, whatever its config calls it."""
+    try:
+        with open(os.path.join(path, "model.safetensors.index.json")) as fh:
+            return any(k.startswith("mtp.") or ".mtp." in k for k in json.load(fh).get("weight_map", {}))
+    except (OSError, ValueError):
+        return False
 
 
 def kv_layers(facts: dict) -> int:

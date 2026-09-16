@@ -126,6 +126,11 @@ dialog.pe input, dialog.pe select, dialog.pe textarea { box-sizing: border-box; 
 .bm-flag:first-child { border-top: 0; }
 .bm-flag code { font-family: var(--mono); font-size: 12px; font-weight: 600; white-space: nowrap; }
 table.bm-trials td.win, table.bm-trials th.win { background: var(--ok-bg); }
+.bm-steps { max-height: 560px; overflow-y: auto; position: relative; }
+.bm-steps li.two { align-items: flex-start; }
+.bm-steps li.two .grow { min-width: 0; }
+.bm-steps li.two .val2 { display: block; margin-top: 2px; font-size: 12px; font-weight: 400; color: var(--fg2); font-variant-numeric: tabular-nums; }
+.bm-steps li.planned { color: var(--fg3); }
 .heat-strip { display: flex; gap: 1px; height: 28px; border-radius: 4px; overflow: hidden; }
 .heat-cell { flex: 1; min-width: 0; }
 .heat-ticks { display: flex; gap: 1px; font-size: 10px; color: var(--fg3); height: 14px; white-space: nowrap; }

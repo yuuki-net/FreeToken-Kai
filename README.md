@@ -176,8 +176,10 @@ what a bigger cache would hold.
 
 **Benchmark** measures this PC with the model and picks the flags from the numbers: PCIe, memory
 and SSD rates, the model's experts computed on the CPU at each thread count and moved to the GPU,
-then, optionally, the model itself started twice to see whether a longer context costs speed.
-Every reading is drawn as it arrives; the result is a profile in one click.
+then, optionally, the model itself started again and again with one setting changed per run
+(expert kernels, where experts run, the KV cache, prefill, pipeline split, MTP, context length),
+keeping only what measured faster. Every reading is drawn as it arrives; the result is a profile in
+one click.
 
 ![Benchmark running](assets/kai-console-benchmark.png)
 
