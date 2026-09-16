@@ -322,6 +322,38 @@ def test_prompt_progress_is_skipped_on_a_serve_without_counters(tmp_path):
     assert job._prefill_once("A", 1919, {"prompt": "x"}, 10)["usage"]["prompt_tokens"] == 10
 
 
+def test_a_hardware_step_that_goes_quiet_is_stopped(tmp_path):
+    import threading
+
+    release = threading.Event()
+
+    class HungProc:
+        killed = False
+
+        def __init__(self):
+            def lines():
+                yield json.dumps({"type": "step", "id": "gather1"}) + "\n"
+                release.wait(10)  # a CUDA kernel that never returns
+
+            self.stdout = lines()
+            self.returncode = None
+
+        def kill(self):
+            HungProc.killed = True
+            release.set()
+
+        terminate = kill
+
+        def wait(self):
+            return -9
+
+    job = tuner.TuneJob(FakeManager(), state_dir=str(tmp_path), python="python", default_port=1919,
+                        spawn=lambda argv: HungProc())
+    with pytest.raises(RuntimeError, match="gather1"):
+        job._hardware("/models/M", quiet_s=0.3)
+    assert HungProc.killed
+
+
 def test_a_second_start_while_running_is_refused(tmp_path):
     m = FakeManager()
     job = _job(tmp_path, m, FakeServe(m, {}))

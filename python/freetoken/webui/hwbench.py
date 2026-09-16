@@ -78,6 +78,17 @@ def workload_of(path: str):
 
 
 # ------------------------------------------------------------------ steps
+def on_gpu(device_index: int):
+    """Make ``device_index`` the current CUDA device for a step. The slot-cache copy kernels launch
+    on the current device whatever device their tensors live on; ft bench bw benches one GPU and
+    sets it once, this walks every GPU. Without it GPU 1's gather ran on GPU 0 against GPU 1's
+    memory and hung on two RTX 3060s (no peer access)."""
+    import torch
+
+    torch.cuda.set_device(device_index)
+    return torch.cuda.device(device_index)
+
+
 def gpu_links() -> list[dict]:
     fields = "index,name,uuid,memory.total,compute_cap,pcie.link.gen.max,pcie.link.gen.gpucurrent,pcie.link.width.max,pcie.link.width.current"
     try:
@@ -110,12 +121,13 @@ def step_pcie(device_index: int, rounds: int = 8) -> dict:
     sid = f"pcie{device_index}"
     emit("step", id=sid)
     h2d, d2h = [], []
-    for _ in range(rounds):
-        r = measure_pcie_bw(device, nbytes=256 << 20, iters=6)
-        h2d.append(r["h2d_gbs"])
-        d2h.append(r["d2h_gbs"])
-        emit("sample", id=sid, value=round(r["h2d_gbs"], 2))
-    torch.cuda.empty_cache()
+    with on_gpu(device_index):
+        for _ in range(rounds):
+            r = measure_pcie_bw(device, nbytes=256 << 20, iters=6)
+            h2d.append(r["h2d_gbs"])
+            d2h.append(r["d2h_gbs"])
+            emit("sample", id=sid, value=round(r["h2d_gbs"], 2))
+        torch.cuda.empty_cache()
     out = {"h2d_gbs": round(statistics.median(h2d), 2), "d2h_gbs": round(statistics.median(d2h), 2)}
     emit("done", id=sid, value=out["h2d_gbs"], **out)
     return out
@@ -245,11 +257,12 @@ def step_gather(fmt: str, wl, device_index: int, rounds: int = 4) -> dict:
     emit("step", id=sid)
     device = torch.device("cuda", device_index)
     vals = []
-    for _ in range(rounds):
-        r = measure_pcie_gather_bw(fmt, wl, device, iters=8)
-        vals.append(r["bw_gbs"])
-        emit("sample", id=sid, value=round(r["bw_gbs"], 2))
-    torch.cuda.empty_cache()
+    with on_gpu(device_index):
+        for _ in range(rounds):
+            r = measure_pcie_gather_bw(fmt, wl, device, iters=8)
+            vals.append(r["bw_gbs"])
+            emit("sample", id=sid, value=round(r["bw_gbs"], 2))
+        torch.cuda.empty_cache()
     out = {"gbs": round(statistics.median(vals), 2)}
     emit("done", id=sid, value=out["gbs"], **out)
     return out
@@ -261,8 +274,9 @@ def step_overlap(fmt: str, wl, device_index: int, threads: int) -> dict:
     from freetoken.moe.benchbw import measure_overlap_bw
 
     emit("step", id="overlap")
-    r = measure_overlap_bw(fmt, wl, torch.device("cuda", device_index), num_threads=threads, seconds=3.0)
-    torch.cuda.empty_cache()
+    with on_gpu(device_index):
+        r = measure_overlap_bw(fmt, wl, torch.device("cuda", device_index), num_threads=threads, seconds=3.0)
+        torch.cuda.empty_cache()
     out = {"cpu_gbs": round(r["cpu_gbs"], 2), "pcie_gbs": round(r["pcie_gbs"], 2),
            "fetch_fraction": round(r["pcie_gbs"] / (r["pcie_gbs"] + r["cpu_gbs"]), 3) if r["cpu_gbs"] + r["pcie_gbs"] else None}
     emit("done", id="overlap", value=out["pcie_gbs"] + out["cpu_gbs"], **out)

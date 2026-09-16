@@ -224,14 +224,18 @@ const FT = (() => {
       <b>${esc(t("token_title"))}</b>
       <span class="small muted">${esc(t("token_hint"))}</span>
       <input type="password" id="tok" value="${esc(token())}" autocomplete="off">
-      <div style="display:flex;gap:8px;justify-content:flex-end"><button value="clear">${esc(t("clear"))}</button><button value="ok" class="primary">${esc(t("save"))}</button></div>
+      <div style="display:flex;gap:8px;align-items:center">
+        <button value="clear" class="danger">${esc(t("clear"))}</button><span class="grow"></span>
+        <button value="cancel">${esc(t("close"))}</button><button value="ok" class="primary">${esc(t("save"))}</button></div>
     </form>`;
     document.body.append(d);
+    // Enter in the field would press the form's first button, which is "clear": make it save
+    $("#tok", d).addEventListener("keydown", (ev) => { if (ev.key === "Enter") { ev.preventDefault(); d.close("ok"); } });
     d.addEventListener("close", () => {
       if (d.returnValue === "ok") setToken($("#tok", d).value.trim());
       if (d.returnValue === "clear") setToken("");
       d.remove(); asking = false;
-      if (d.returnValue) location.reload();
+      if (d.returnValue === "ok" || d.returnValue === "clear") location.reload();
     });
     d.showModal();
   }

@@ -28,6 +28,8 @@ import urllib.request
 from typing import Any, Callable
 
 GiB = 1 << 30
+# the longest a hardware step has gone without a line (the CPU sweep on many cores) is well under this
+HW_QUIET_S = 300.0
 CONTEXT_TIERS = (32768, 65536, 131072, 262144)
 PREFILL_TOKENS = 8192
 DECODE_TOKENS = 200
@@ -282,11 +284,33 @@ class TuneJob:
         except Exception as exc:  # noqa: BLE001
             self._ev("log", msg=f"could not restore the previous server: {exc}")
 
-    def _hardware(self, model: str) -> dict:
+    def _hardware(self, model: str, quiet_s: float = HW_QUIET_S) -> dict:
+        import queue
+
         proc = self._spawn([self.python, "-m", "freetoken.webui.hwbench", "--model", model])
         self._proc = proc
         out: dict = {}
-        for line in proc.stdout:
+        lines: queue.Queue = queue.Queue()
+
+        def pump() -> None:
+            for raw in proc.stdout:
+                lines.put(raw)
+            lines.put(None)
+
+        threading.Thread(target=pump, name="ft-mgr-benchmark-hw", daemon=True).start()
+        step = None
+        while True:
+            try:
+                line = lines.get(timeout=quiet_s)
+            except queue.Empty:
+                # a GPU kernel that hangs never returns: stop the child rather than wait forever
+                try:
+                    proc.kill()
+                except Exception:  # noqa: BLE001
+                    pass
+                raise RuntimeError(f"hardware step {step or '?'} sent nothing for {int(quiet_s)} s and was stopped")
+            if line is None:
+                break
             line = line.strip()
             if not line.startswith("{"):
                 continue
@@ -295,6 +319,8 @@ class TuneJob:
             except ValueError:
                 continue
             kind = msg.pop("type", None)
+            if kind == "step":
+                step = msg.get("id")
             if kind == "result":
                 out = msg
             elif kind == "error":
