@@ -151,6 +151,21 @@ and this is where the overlap described above pays. Qwen3.8-Flash-Next, `--max-p
 | 4,096 + 1,164-1,946 tokens (2 chunks) | ~17 s | 11-12 s |
 | 128k of input (32 chunks) | ~6 min | — |
 
+What the same model does now, on a 25k-token prompt with `--prefill-mixer-pieces 2
+--max-prefill-length 8192` and the expert-cache defaults of 2026-09:
+
+| | chunk | prefill |
+|---|---|---|
+| `--prefill-chunk-budget` 0.55 (default) | 3,584 tokens | 510 tok/s |
+| `--prefill-chunk-budget` 0.75 | 5,120 tokens | **702 tok/s** |
+
+The chunk is what decides it. An offloaded MoE copies a layer's whole expert bank to the GPU
+once per chunk, whatever the chunk holds, and the second rank's slot moves 33 GiB of
+Flash-Next banks in 5.6 s: at 3,584 tokens that transfer outlasts the rank's compute for the
+chunk and shows up as waiting, at 5,120 it hides behind it. On a card that only serves, this
+is the cheapest prefill win available — see [prefill-chunk.md](prefill-chunk.md#choosing-the-budget)
+for what the budget trades away.
+
 The last chunk cannot overlap — its sampled token is the one that starts decoding — so a
 short prompt sees less of this than a long one. What a user actually feels on a follow-up turn,
 where the prefix is already cached and only the new message is prefilled, is 2.4-4.5 s (9 s
@@ -167,22 +182,36 @@ for a model whose experts mostly fit, `hybrid` for one whose experts mostly do n
 (gpt-oss-120b). A machine with a slower bus or fewer cores would see more from the second
 cache than this one did.
 
-### Grouping chunks on the second rank (`--pp-prefill-group`)
+### Two knobs for a slow second rank
 
-An offloaded MoE copies a layer's whole expert bank to the GPU for every prefill chunk, however
-many tokens the chunk holds. On the machine above the second rank's slot moves those copies at
-about 5.9 GiB/s: 33 GiB of Flash-Next banks per chunk, 5.6 s, where the rank's compute for a
-3,072-token chunk takes about 3 s. Timed part by part, that rank spent half of its prefill
-waiting for banks, and the first rank spent half of its prefill waiting for it.
+Both of these came out of timing a Flash-Next prefill part by part on this machine, and both
+are **off by default because they did not make it faster here**. They are documented because
+what they address is real, and a machine whose second rank is slower than this one — a narrower
+link, fewer lanes, a slower disk behind `--moe-bank-ram` — may see what this one did not.
 
-For Qwen3.8-Flash-Next, `--pp-prefill-group N` (with `--max-running-req 1`) makes the second rank take up to N
-consecutive chunks of a prompt before running them, then run them layer by layer: every chunk
-through a layer before the next layer, so the layer's bank is copied once for all of them. The
-first rank is not held up -- it hands over each chunk as before and moves on. The arithmetic is
-the same as one chunk per forward (unit-tested bit for bit on Flash-Next's GDN and QSA layers).
-Held chunks run before anything that could read or free their state: the next request, a
-prefix-cache restore, an abort. The price is one residual stream of VRAM per held chunk on that
-rank. Experimental: not yet measured on the two-GPU machine.
+What the timing showed, at a 3,072-token chunk: the second rank waited on its expert banks for
+0.69 s per 1k tokens (33 GiB per chunk over a PCIe x4 slot at 5.9 GiB/s, 5.6 s, against about
+3 s of compute for the chunk), and the first rank waited on the second for 0.43 s per 1k.
+
+`--pp-prefill-group N` (Qwen3.8-Flash-Next, `--max-running-req 1`) makes the second rank hold up
+to N consecutive chunks of a prompt and then run them layer by layer: every chunk through a layer
+before the next layer, so the layer's bank is copied once for all of them. The arithmetic is the
+same as one chunk per forward — unit-tested bit for bit on Flash-Next's GDN and QSA layers, and
+the prefix-cache stress suite passes with it on — and held chunks are run before anything that
+could read or free their state (the next request, a snapshot restore, an abort). It did what it
+was meant to: that rank's wait on its banks went from 0.27 to 0.08 s per 1k tokens at a
+5,120-token chunk. The prompt was not faster for it (703 tok/s against 716 with the flag, inside
+the spread between runs), because grouping adds a rendezvous every N chunks.
+
+`--pp-send-ahead N` is the other half: the hand-off used to block until the peer posted its
+receive, so the first rank never got more than one chunk ahead. At N it sends non-blocking from a
+ring of N pinned staging buffers and blocks only when all N are in flight. It removes the cost of
+grouping (618 tok/s with `--pp-prefill-group 2` alone, 716 with both), and on its own it changed
+nothing: at a 5,120-token chunk the two ranks already take the same 1.42 s per 1k tokens each, so
+there was no idling left for a deeper lookahead to fill.
+
+If you try them, measure with `--prefill-profile` (and `--pp-prefill-group` needs
+`--max-running-req 1`, which is the setting a single-user server runs anyway).
 
 ## Limits and caveats
 

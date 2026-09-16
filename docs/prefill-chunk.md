@@ -83,6 +83,23 @@ in gloo with `Received data size doesn't match expected size`.
 So the re-solve before each prefill is a single-GPU feature. A two-card run keeps the boot
 value, and a desktop that takes 300 MB mid-session no longer shrinks the chunk to match.
 
+Which is also why the budget is worth more on two cards than on one. The chunk is fixed for the
+run, and with the experts in host RAM each chunk pays one full bank transfer per layer on each
+rank; a rank on a slow slot needs the chunk to be wide enough that its compute covers that
+transfer. On two RTX 3060s serving Qwen3.8-Flash-Next (`--spec-mtp 5 --prefill-mixer-pieces 2
+--max-prefill-length 8192`), a 25k-token prompt:
+
+| `--prefill-chunk-budget` | chunk | prefill |
+|---|---|---|
+| 0.55 (default) | 3,584 | 510 tok/s |
+| 0.75 | 5,120 | **702 tok/s** |
+
+The second rank's slot moves 33 GiB of banks per chunk in 5.6 s there, and its compute for a
+3,584-token chunk is shorter than that — so the transfer showed up as waiting (0.69 s per 1k
+tokens) until the chunk grew. Going further did not help: `--spec-mtp 0` frees enough for a
+6,144-token chunk and the prompt ran at the same 702 tok/s, while decode dropped from 19-22 to
+18 tok/s without the draft head.
+
 The boot value is checked once more at the end of startup. The measurement has to come before
 the prefill warmup, which runs at the chunk it chose, and so before `--spec-mtp` captures its
 verify-window and draft-head graphs, which keep their memory pools. Once those are in, the ranks
