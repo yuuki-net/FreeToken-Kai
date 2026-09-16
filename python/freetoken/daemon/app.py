@@ -126,6 +126,39 @@ def _parse_ftbench(line: str) -> dict | None:
         return None
 
 
+class _WriteGuard:
+    """Refuses writes a browser may not make, before routing.
+
+    The web console (/ui/) makes this control plane reachable from a browser, and a CORS preflight
+    does not stop a body-less cross-site POST such as /engine/stop: writes from another http(s)
+    origin are refused (clients that send no Origin, ft daemon and curl, pass). Under ft mgr a
+    write must also come from this PC or carry the token (webui/auth.py).
+
+    Plain ASGI, not ``@app.middleware("http")``: that wraps every response in a task group, and the
+    endless /engine/logs stream a dashboard holds open then logs a traceback when shutdown cancels it."""
+
+    def __init__(self, app, *, console: bool, write_token: str | None) -> None:
+        self.app, self.console, self.write_token = app, console, write_token
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http" and scope["method"] not in ("GET", "HEAD", "OPTIONS"):
+            headers = {k.decode("latin-1").lower(): v.decode("latin-1") for k, v in scope.get("headers") or []}
+            origin = urlsplit(headers.get("origin") or "")
+            if origin.scheme in ("http", "https") and origin.hostname != "tauri.localhost" and (
+                origin.netloc != headers.get("host")
+            ):
+                refusal = {"error": "cross-origin write refused", "code": "cross_origin"}
+                return await JSONResponse(status_code=403, content=refusal)(scope, receive, send)
+            if self.console:
+                from freetoken.webui.auth import may_write
+
+                client = (scope.get("client") or (None,))[0]
+                if not may_write(client, headers.get("host"), headers.get("x-ft-token"), self.write_token):
+                    refusal = {"error": "operating ft mgr from another PC needs its token", "code": "write_needs_token"}
+                    return await JSONResponse(status_code=403, content=refusal)(scope, receive, send)
+        await self.app(scope, receive, send)
+
+
 def build_app(
     *,
     manager,
@@ -163,31 +196,7 @@ def build_app(
             except Exception:  # noqa: BLE001
                 pass
 
-    @app.middleware("http")
-    async def _refuse_cross_site_writes(request: Request, call_next):
-        # The web console (/ui/) makes this control plane reachable from a browser, and a CORS
-        # preflight does not stop a body-less cross-site POST such as /engine/stop. Refuse writes a
-        # page from another http(s) origin sends; clients that send no Origin (ft daemon, curl) pass.
-        if request.method not in ("GET", "HEAD", "OPTIONS"):
-            origin = urlsplit(request.headers.get("origin") or "")
-            if origin.scheme in ("http", "https") and origin.hostname != "tauri.localhost" and (
-                origin.netloc != request.headers.get("host")
-            ):
-                return JSONResponse(
-                    status_code=403,
-                    content={"error": "cross-origin write refused", "code": "cross_origin"},
-                )
-            # ft mgr: anyone may look, only this PC or a token holder may act (webui/auth.py)
-            if console:
-                from freetoken.webui.auth import may_write
-
-                client = request.client.host if request.client else None
-                if not may_write(client, request.headers.get("host"), request.headers.get("x-ft-token"), write_token):
-                    return JSONResponse(
-                        status_code=403,
-                        content={"error": "operating ft mgr from another PC needs its token", "code": "write_needs_token"},
-                    )
-        return await call_next(request)
+    app.add_middleware(_WriteGuard, console=console, write_token=write_token)
 
     def require_token(x_ft_token: str | None = Header(default=None)) -> None:
         if token is not None and x_ft_token != token:
@@ -651,6 +660,11 @@ def _sse_gap(dropped: int, from_seq: Any, to_seq: Any) -> str:
     return f"data: {json.dumps(payload)}\n\n"
 
 
+def _shutting_down(request: Request) -> bool:
+    check = getattr(request.app.state, "shutting_down", None)
+    return bool(check and check())
+
+
 def _log_stream(request: Request, ring, since: int) -> StreamingResponse:
     """SSE log stream with replay + live tail. Correctness points:
       * subscribe BEFORE snapshotting the backlog, then dedupe live records by seq → no gap and
@@ -709,14 +723,21 @@ def _log_stream(request: Request, ring, since: int) -> StreamingResponse:
             for rec in backlog:
                 yield _sse(rec)
             last_seq = cursor - 1
+            idle = 0.0
             while True:
-                if await request.is_disconnected():
+                # a stream still open when the daemon stops is cut after the graceful timeout, and
+                # uvicorn logs that cut as a traceback: end it as soon as shutdown begins
+                if await request.is_disconnected() or _shutting_down(request):
                     break
                 try:
-                    rec = await asyncio.wait_for(q.get(), timeout=15.0)
+                    rec = await asyncio.wait_for(q.get(), timeout=0.5)
                 except asyncio.TimeoutError:
-                    yield ": ping\n\n"
+                    idle += 0.5
+                    if idle >= 15.0:
+                        idle = 0.0
+                        yield ": ping\n\n"
                     continue
+                idle = 0.0
                 if rec["seq"] <= last_seq:
                     continue  # already delivered in backlog
                 if drop["n"]:

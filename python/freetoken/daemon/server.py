@@ -236,6 +236,7 @@ def main(argv: Sequence[str] | None = None, *, prog: str = "ft daemon", console:
         )
     )
     app.state.request_shutdown = lambda: setattr(server, "should_exit", True)
+    app.state.shutting_down = lambda: server.should_exit
 
     logger.info("%s %s listening on %s:%s (state-dir=%s)%s", prog, DAEMON_VERSION, args.host, args.port, state_dir,
                 f" — web console: http://{args.host}:{args.port}/ui/" if console else "")
@@ -243,6 +244,9 @@ def main(argv: Sequence[str] | None = None, *, prog: str = "ft daemon", console:
         logger.info("other PCs may watch; operating from them needs the token shown in the console on this PC")
     try:
         server.run()
+    except KeyboardInterrupt:
+        # uvicorn has already shut down cleanly on Ctrl+C and re-raises the signal: exit quietly
+        pass
     finally:
         stop_reaper.set()
         lifecycle_pool.shutdown(wait=False)
