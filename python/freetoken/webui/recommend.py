@@ -235,6 +235,17 @@ def recommend(model: str, *, extra_dirs: list[str] | None = None) -> dict:
             "“From measurements” proposes a longer one from the free VRAM.")
         add("--max-seq-len-override", str(ctx), "宣伝する長さと実際に入る長さをそろえます。",
             "The advertised context matches what actually fits.")
+    # --- prefill and dense weights: measured in this fork, and not upstream's defaults
+    gdn = any("linear" in str(x) for x in facts.get("layer_types") or [])
+    multi = len(cards) > 1 and resident and resident > vram * 0.75
+    if gdn and (facts.get("model_type") == "qwen4_exp" or (facts.get("model_type") == "qwen3_5_moe" and not multi)):
+        add("--prefill-mixer-pieces", "2",
+            "プロンプト処理で GDN と attention だけをチャンクの中で 2 つに分け、チャンクを広げます（2060・Ornith で 490 → 649 tok/s、3060×2・Flash-Next で 437 → 546 tok/s の実測）。",
+            "Runs GDN and attention over two pieces of each prefill chunk so the chunk can be wider (490 -> 649 tok/s on a 2060 with Ornith, 437 -> 546 on two 3060s with Flash-Next).")
+    if facts.get("model_type") == "qwen4_exp":
+        add("--dense-quant", "fp8",
+            "エキスパート以外の bf16 の重みを読み込み時に fp8 にします。常駐分が 1 枚あたり 4.9 → 2.9 GB になり、空いた VRAM がエキスパートの枠に回ります。",
+            "Quantizes the bf16 non-expert weights to fp8 at load: resident weights go from 4.9 to 2.9 GB per card, and the freed VRAM goes to the expert cache.")
     if facts.get("model_type") in ("qwen3_5_moe", "qwen4_exp") and vram <= 8 * GiB:
         add("--host-embedding", None, "埋め込み表を RAM に置いて、その分の VRAM を KV に回します。",
             "Keep the embedding table in RAM and give its VRAM to the KV cache.")

@@ -4,15 +4,15 @@
 
 FTI18N.add({
   bm_title: "ベンチマークで設定を決める",
-  bm_hint: "この PC とモデルで実際に測り、その結果から ft serve のフラグを決めます。PCIe・メモリ・SSD の速さ、CPU と GPU でのエキスパート処理の速さを測り、必要ならモデルを起動して文脈の長さを実測で比べます。終わったら結果をそのままプロファイルにできます。",
+  bm_hint: "この PC とモデルで実際に測り、その結果から ft serve のフラグを決めます。PCIe・メモリ・SSD の速さ、CPU と GPU でのエキスパート処理の速さを測り、必要ならモデルを起動して、効きそうな設定を 1 つずつ実測で比べます。終わったら結果をそのままプロファイルにできます。",
   bm_trials: "モデルを起動して実測する（おすすめ）",
-  bm_trials_hint: "プロンプト処理と生成の速さを実際に測り、文脈を長くしても遅くならないかを比べます。モデルの読み込みが 1〜2 回あるので、全体で 5〜20 分ほどかかります。外すとハードウェアだけ測ります（数分）。",
+  bm_trials_hint: "プロンプト処理と生成の速さを実際に測り、プリフィルのチャンク予算やコンテキスト長を 1 つずつ変えて比べます。モデルの読み込みが 2〜4 回あるので、全体で 10〜25 分ほどかかります。外すとハードウェアだけ測ります（数分）。",
   bm_start: "測定を始める", bm_last: "前回の結果を見る", bm_last_when: "前回: {when}",
   bm_running_title: "測定中", bm_cancel: "中止",
   bm_confirm: "測定を始めます。GPU を使うので、動いているサーバ（{model}）は止まり、終わったら同じ設定で起動し直します。",
   bm_confirm_none: "測定を始めます。測定中は GPU を使います。",
   bm_confirm_time: "かかる時間の目安: {min}。途中で中止できます。",
-  bm_time_hw: "数分", bm_time_trials: "5〜20 分",
+  bm_time_hw: "数分", bm_time_trials: "10〜25 分",
   bm_view_only: "この画面から測定を始めるには、この PC で開くかトークンが必要です。",
   bm_external: "ft mgr の管理外で起動したサーバが動いていて、GPU を使っています。止めてから測定してください。",
   bm_busy: "ほかの測定が動いています。",
@@ -20,7 +20,7 @@ FTI18N.add({
   bm_ph_restore: "元のサーバを起動し直しています", bm_ph_done: "終わりました", bm_ph_cancelled: "中止しました", bm_ph_error: "エラーで止まりました",
   bm_s_gpu: "GPU を調べる", bm_s_pcie: "PCIe の転送速度（GPU {gpu}）", bm_s_ram: "メモリの読み出し速度", bm_s_ssd: "SSD からモデルを読む速度",
   bm_s_cpu_moe: "CPU でのエキスパート計算（スレッド数ごと）", bm_s_gather: "GPU へのエキスパート転送（GPU {gpu}）", bm_s_overlap: "CPU 計算と GPU 転送を同時に",
-  bm_s_load: "設定 {trial} で起動（文脈 {ctx}）", bm_s_prefill: "設定 {trial}: プロンプト処理（{n} トークン）", bm_s_decode: "設定 {trial}: 生成（{n} トークン）",
+  bm_s_load: "設定 {trial} で起動（{what}）", bm_s_prefill: "設定 {trial}: プロンプト処理（{n} トークン）", bm_s_decode: "設定 {trial}: 生成（{n} トークン）",
   bm_skip_failed: "測れませんでした", bm_skip_no_weights: "重みファイルがありません",
   bm_threads: "{n} スレッド", bm_loading_pct: "読み込み {v}%", bm_loading: "モデルを読み込み中", bm_working: "処理中", bm_working_hint: "最初の区切りが終わるまで数値は出ません", bm_progress: "{done} / {total} トークン",
   bm_result: "測定結果", bm_took: "{when} · {min} 分 {sec} 秒",
@@ -35,24 +35,26 @@ FTI18N.add({
   bm_gather: "GPU へのエキスパート転送（GPU {gpu}）", bm_gather_sub: "エキスパートの重みをまとめて送る速さ",
   bm_overlap: "同時に動かしたとき", bm_overlap_sub: "足りないエキスパートの {pct} を GPU に送り、残りを CPU で計算",
   bm_sweep_title: "スレッド数ごとの CPU 計算速度",
-  bm_trials_title: "実測（モデルを起動して）", bm_col_setting: "設定", bm_col_ctx: "文脈", bm_col_slots: "GPU のエキスパート枠",
+  bm_trials_title: "実測（モデルを起動して）", bm_col_setting: "設定", bm_col_ctx: "コンテキスト長", bm_col_slots: "GPU のエキスパート枠",
   bm_col_load: "起動", bm_col_prefill: "プロンプト処理", bm_col_decode: "生成", bm_col_hit: "GPU で足りた割合", bm_chosen: "採用",
-  bm_trial_failed: "起動できませんでした",
+  bm_trial_failed: "起動か測定に失敗", bm_col_change: "変えたところ", bm_rejected: "試して不採用",
+  bm_trials_hint2: "設定 A から 1 つずつ変えて測り、速くなったものだけを次に引き継ぎます。",
+  bm_change_base: "基本の設定", bm_change_ctx: "コンテキスト長 {n}", bm_change_without: "{flag} なし",
   bm_flags_title: "決まったフラグ", bm_src_measured: "実測", bm_src_rule: "目安", bm_removed: "外した",
   bm_flags_note: "「実測」はこの測定の数字から、「目安」は GPU・RAM・モデルの構成から決めた値です。",
   bm_saved: "プロファイルを保存しました。",
   bm_empty_hint: "モデルを選んで「測定を始める」を押してください。", bm_loading_models: "モデルを読み込み中…",
 }, {
   bm_title: "Benchmark to pick the settings",
-  bm_hint: "Measure this PC with the model and pick ft serve's flags from the numbers: PCIe, memory and SSD rates, how fast experts are computed on the CPU and moved to the GPU, and, if you like, the model itself started to compare context lengths. The result becomes a profile in one click.",
+  bm_hint: "Measure this PC with the model and pick ft serve's flags from the numbers: PCIe, memory and SSD rates, how fast experts are computed on the CPU and moved to the GPU, and, if you like, the model itself started to compare the settings that matter one at a time. The result becomes a profile in one click.",
   bm_trials: "Start the model and measure it (recommended)",
-  bm_trials_hint: "Measures prompt processing and generation for real and checks whether a longer context slows them down. The model loads once or twice, so this takes about 5-20 minutes. Unticked, only the hardware is measured (a few minutes).",
+  bm_trials_hint: "Measures prompt processing and generation for real and changes the prefill chunk budget and the context length one at a time. The model loads two to four times, so this takes about 10-25 minutes. Unticked, only the hardware is measured (a few minutes).",
   bm_start: "Start", bm_last: "Show the last result", bm_last_when: "Last: {when}",
   bm_running_title: "Measuring", bm_cancel: "Cancel",
   bm_confirm: "The measurement uses the GPU, so the running server ({model}) stops and is started again with the same settings afterwards.",
   bm_confirm_none: "The measurement uses the GPU.",
   bm_confirm_time: "Expected time: {min}. You can cancel at any point.",
-  bm_time_hw: "a few minutes", bm_time_trials: "5-20 minutes",
+  bm_time_hw: "a few minutes", bm_time_trials: "10-25 minutes",
   bm_view_only: "Starting a benchmark from this page needs this PC or the token.",
   bm_external: "A server started outside ft mgr is running and holds the GPU. Stop it first.",
   bm_busy: "Another benchmark is running.",
@@ -60,7 +62,7 @@ FTI18N.add({
   bm_ph_restore: "Starting the previous server again", bm_ph_done: "Done", bm_ph_cancelled: "Cancelled", bm_ph_error: "Stopped on an error",
   bm_s_gpu: "Look at the GPUs", bm_s_pcie: "PCIe transfer (GPU {gpu})", bm_s_ram: "Memory read", bm_s_ssd: "Reading the model from the SSD",
   bm_s_cpu_moe: "Experts computed on the CPU, by thread count", bm_s_gather: "Experts moved to the GPU (GPU {gpu})", bm_s_overlap: "CPU compute and GPU transfer together",
-  bm_s_load: "Start setting {trial} (context {ctx})", bm_s_prefill: "Setting {trial}: prompt processing ({n} tokens)", bm_s_decode: "Setting {trial}: generation ({n} tokens)",
+  bm_s_load: "Start setting {trial} ({what})", bm_s_prefill: "Setting {trial}: prompt processing ({n} tokens)", bm_s_decode: "Setting {trial}: generation ({n} tokens)",
   bm_skip_failed: "could not measure", bm_skip_no_weights: "no weight files",
   bm_threads: "{n} threads", bm_loading_pct: "loading {v}%", bm_loading: "loading the model", bm_working: "working", bm_working_hint: "no figure until the first chunk is done", bm_progress: "{done} / {total} tokens",
   bm_result: "Result", bm_took: "{when} · {min} min {sec} s",
@@ -77,7 +79,9 @@ FTI18N.add({
   bm_sweep_title: "CPU compute by thread count",
   bm_trials_title: "Measured with the model", bm_col_setting: "Setting", bm_col_ctx: "Context", bm_col_slots: "Experts on the GPU",
   bm_col_load: "Start", bm_col_prefill: "Prompt processing", bm_col_decode: "Generation", bm_col_hit: "Served from the GPU", bm_chosen: "chosen",
-  bm_trial_failed: "did not start",
+  bm_trial_failed: "failed to start or measure", bm_col_change: "Changed", bm_rejected: "tried, not kept",
+  bm_trials_hint2: "Each run changes one thing from the best so far; only what measured faster is carried on.",
+  bm_change_base: "base settings", bm_change_ctx: "context {n}", bm_change_without: "without {flag}",
   bm_flags_title: "The flags", bm_src_measured: "measured", bm_src_rule: "rule", bm_removed: "dropped",
   bm_flags_note: "“measured” values come from this run's numbers, “rule” values from the GPU, RAM and the model's config.",
   bm_saved: "The profile was saved.",
@@ -182,11 +186,19 @@ FTI18N.add({
     } else if (e.k === "trial") {
       const T = e.trial;
       if (e.step === "load" && e.state === "start") {
-        const ctx = argValue(e.args, "--kv-reserve-tokens");
-        trialCtx[T] = ctx;
-        addStep(`${T}.load`, t("bm_s_load", { trial: T, ctx: ctx ? fmt.num(+ctx) : "—" }), "%", 100);
+        trialCtx[T] = e.change || null;
+        addStep(`${T}.load`, t("bm_s_load", { trial: T, what: changeText(e.change) }), "%", 100);
         addStep(`${T}.prefill`, t("bm_s_prefill", { trial: T, n: "…" }), "tok/s");
         addStep(`${T}.decode`, t("bm_s_decode", { trial: T, n: "…" }), "tok/s");
+      }
+      if (e.state === "failed" && !steps.has(`${T}.${e.step}`)) {
+        // failed between steps (a request that errored mid-measurement): mark whatever was running
+        for (const k of ["load", "prefill", "decode"]) {
+          const st = steps.get(`${T}.${k}`);
+          if (st && st.state !== "done") { st.state = "failed"; st.note = t("bm_trial_failed"); }
+        }
+        renderSteps();
+        return;
       }
       const id = `${T}.${e.step}`;
       const s = steps.get(id);
@@ -210,6 +222,13 @@ FTI18N.add({
   }
 
   const argValue = (args, flag) => { const i = (args || []).indexOf(flag); return i >= 0 ? args[i + 1] : null; };
+  // what a run changed against the best one before it
+  function changeText(change) {
+    if (!change) return t("bm_change_base");
+    if (change.flag === "--kv-reserve-tokens" || change.flag === "--max-seq-len-override") return t("bm_change_ctx", { n: fmt.num(+change.value) });
+    if (change.value == null) return t("bm_change_without", { flag: change.flag });
+    return `${change.flag} ${change.value}`;
+  }
 
   // ---------------------------------------------------------------- drawing
   const css = (n) => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
@@ -429,14 +448,16 @@ FTI18N.add({
 
     const trials = r.trials || [];
     const chosen = r.chosen;
-    const okTrials = trials.filter((x) => x.ok || trials.filter((y) => y.label === x.label).length === 1);
+    const okTrials = trials;
     const trialTable = okTrials.length ? `<div class="card"><h2>${esc(t("bm_trials_title"))}</h2>
-      <div class="tablewrap"><table class="bm-trials"><thead><tr><th>${esc(t("bm_col_setting"))}</th>
+      <p class="hint">${esc(t("bm_trials_hint2"))}</p>
+      <div class="tablewrap"><table class="bm-trials"><thead><tr><th>${esc(t("bm_col_setting"))}</th><th>${esc(t("bm_col_change"))}</th>
         <th class="num">${esc(t("bm_col_ctx"))}</th><th class="num">${esc(t("bm_col_slots"))}</th><th class="num">${esc(t("bm_col_load"))}</th>
         <th class="num">${esc(t("bm_col_prefill"))}</th><th class="num">${esc(t("bm_col_decode"))}</th><th class="num">${esc(t("bm_col_hit"))}</th></tr></thead>
       <tbody>${okTrials.map((x) => {
         const win = x.ok && x.label === chosen ? "win" : "";
         return `<tr><td class="${win}"><b>${esc(x.label)}</b> ${win ? `<span class="pill ok">${esc(t("bm_chosen"))}</span>` : ""}${x.ok ? "" : ` <span class="pill warn">${esc(t("bm_trial_failed"))}</span>`}</td>
+          <td class="${win}"><code style="font-size:12px">${esc(changeText(x.change))}</code></td>
           <td class="num ${win}">${x.kv_tokens ? fmt.num(x.kv_tokens) : esc(argValue(x.args, "--kv-reserve-tokens") || "—")}</td>
           <td class="num ${win}">${x.expert_slots != null ? fmt.num(x.expert_slots) : "—"}</td>
           <td class="num ${win}">${x.load_s != null ? `${x.load_s} s` : "—"}</td>
@@ -449,8 +470,8 @@ FTI18N.add({
     const flags = `<div class="card"><h2>${esc(t("bm_flags_title"))}</h2><p class="hint">${esc(t("bm_flags_note"))}</p>
       ${notes.map((n) => `<div class="bm-flag">
         <span style="flex:1;min-width:0"><span style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
-          <code${n.removed ? ' style="text-decoration:line-through"' : ""}>${esc(n.flag)}${n.value != null ? " " + esc(homePath(n.value)) : ""}</code>
-          <span class="pill ${n.source === "measured" ? "ok" : "mute"}">${esc(t(n.removed ? "bm_removed" : n.source === "measured" ? "bm_src_measured" : "bm_src_rule"))}</span></span>
+          <code${n.removed || n.rejected ? ' style="text-decoration:line-through"' : ""}>${esc(n.flag)}${n.value != null ? " " + esc(homePath(n.value)) : ""}</code>
+          <span class="pill ${n.rejected ? "warn" : n.source === "measured" ? "ok" : "mute"}">${esc(t(n.rejected ? "bm_rejected" : n.removed ? "bm_removed" : n.source === "measured" ? "bm_src_measured" : "bm_src_rule"))}</span></span>
           <div class="small muted" style="margin-top:2px">${esc(lang() === "en" && n.why_en ? n.why_en : n.why)}</div></span></div>`).join("")}</div>`;
 
     const sweep = hw.cpu_moe?.sweep;
@@ -553,18 +574,19 @@ FTI18N.add({
       at(ms += 300, () => push("hw", { kind: "step", id: "overlap" }));
       at(ms += 1500, () => push("hw", { kind: "done", id: "overlap", value: 14.1 }));
       if (trials) {
-        for (const [T, ctx, dec, pre] of [["A", 32768, 18.9, 702], ["B", 131072, 18.4, 680]]) {
-          at(ms += 500, () => { push("phase", { phase: "trial" }); push("trial", { trial: T, step: "load", state: "start", args: ["--kv-reserve-tokens", String(ctx)] }); });
+        const runs = [["A", null, 18.1, 548], ["B", { flag: "--prefill-chunk-budget", value: "0.75" }, 18.3, 702], ["C", { flag: "--kv-reserve-tokens", value: "131072" }, 18.0, 689]];
+        for (const [T, change, dec, pre] of runs) {
+          at(ms += 500, () => { push("phase", { phase: "trial" }); push("trial", { trial: T, step: "load", state: "start", change }); });
           for (let p = 5; p <= 100; p += 5) at(ms += 150, () => push("sample", { id: `${T}.load`, value: p }));
           at(ms += 300, () => push("trial", { trial: T, step: "load", state: "done", seconds: 94 }));
-          at(ms += 200, () => push("trial", { trial: T, step: "prefill", state: "start", tokens: 8192 }));
+          at(ms += 200, () => push("trial", { trial: T, step: "prefill", state: "start", tokens: 16384 }));
           for (let i = 0; i < 2; i++) {
             at(ms += 1200, () => {});
-            for (let c = 1; c <= 3; c++) at(ms += 900, () => push("progress", { id: `${T}.prefill`, done: Math.min(8192, 2304 * c), total: 8192, rate: pre * (0.9 + Math.random() * 0.1) }));
+            for (let c = 1; c <= 3; c++) at(ms += 900, () => push("progress", { id: `${T}.prefill`, done: Math.min(16384, 5120 * c), total: 16384, rate: pre * (0.9 + Math.random() * 0.1) }));
             at(ms += 900, () => push("sample", { id: `${T}.prefill`, value: pre * (0.95 + Math.random() * 0.06) }));
           }
           at(ms += 200, () => push("trial", { trial: T, step: "prefill", state: "done", value: pre }));
-          at(ms += 200, () => push("trial", { trial: T, step: "decode", state: "start", tokens: 200 }));
+          at(ms += 200, () => push("trial", { trial: T, step: "decode", state: "start", tokens: 300 }));
           for (let i = 0; i < 18; i++) at(ms += 250, () => push("sample", { id: `${T}.decode`, value: dec * (0.93 + Math.random() * 0.1) }));
           at(ms += 200, () => push("trial", { trial: T, step: "decode", state: "done", value: dec }));
         }
@@ -581,7 +603,7 @@ FTI18N.add({
     function demoResult(trials) {
       const now = Date.now() / 1000;
       return {
-        model: "/home/demo/models/Qwen3.8-Flash-Next-NVFP4", port: 1919, started: now - 745, finished: now, chosen: "B",
+        model: "/home/demo/models/Qwen3.8-Flash-Next-NVFP4", port: 1919, started: now - 1180, finished: now, chosen: "C",
         args: ["--pp-size", "2", "--gpu", "0,1", "--moe-strategy", "hybrid", "--moe-cpu-threads", "8", "--moe-cache-auto", "--moe-bank-ram", "44G", "--kv-cache-dtype", "q8_0", "--kv-reserve-tokens", "131072", "--max-seq-len-override", "131072"],
         hw: { measurements: {
           gpus: [0, 1].map((i) => ({ index: i, name: "NVIDIA GeForce RTX 3060", pcie_gen: 4, pcie_width: i ? 4 : 8, pcie_width_max: 16, link_gbs: i ? 7.88 : 15.75 })),
@@ -590,8 +612,9 @@ FTI18N.add({
           gather: { 0: { gbs: 5.6 }, 1: { gbs: 2.9 } }, overlap: { cpu_gbs: 9.8, pcie_gbs: 4.3, fetch_fraction: 0.305 },
         } },
         trials: trials ? [
-          { label: "A", ok: true, kv_tokens: 32768, expert_slots: 2310, load_s: 94, prefill_tps: 702, decode_tps: 18.9, hit_rate: 0.941, args: [] },
-          { label: "B", ok: true, kv_tokens: 131072, expert_slots: 1980, load_s: 96, prefill_tps: 680, decode_tps: 18.4, hit_rate: 0.932, args: [] },
+          { label: "A", change: null, ok: true, kv_tokens: 65536, expert_slots: 1520, load_s: 101, prefill_tps: 548, decode_tps: 18.1, hit_rate: 0.581, args: [] },
+          { label: "B", change: { flag: "--prefill-chunk-budget", value: "0.75" }, ok: true, kv_tokens: 65536, expert_slots: 1498, load_s: 99, prefill_tps: 702, decode_tps: 18.3, hit_rate: 0.579, args: [] },
+          { label: "C", change: { flag: "--kv-reserve-tokens", value: "131072" }, ok: true, kv_tokens: 131072, expert_slots: 1180, load_s: 118, prefill_tps: 689, decode_tps: 18.0, hit_rate: 0.566, args: [] },
         ] : [],
         notes: [
           { flag: "--moe-strategy", value: "hybrid", source: "measured", why: "CPU でのエキスパート計算（11.8 GB/s）が GPU への転送（2.9 GB/s）の 4.1 倍速いので、GPU に無いエキスパートは CPU で計算します。", why_en: "Computing experts on the CPU (11.8 GB/s) is 4.1x the transfer to the GPU (2.9 GB/s), so experts not on the GPU are computed on the CPU." },

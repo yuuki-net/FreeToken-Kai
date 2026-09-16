@@ -31,8 +31,11 @@ GiB = 1 << 30
 # the longest a hardware step has gone without a line (the CPU sweep on many cores) is well under this
 HW_QUIET_S = 300.0
 CONTEXT_TIERS = (32768, 65536, 131072, 262144)
-PREFILL_TOKENS = 8192
-DECODE_TOKENS = 200
+# long enough for several chunks: two 8k chunks hide what the two-rank overlap and a wider chunk buy
+PREFILL_TOKENS = 16384
+# three runs, median: on a 2060 two 200-token runs swung 31-36 tok/s between runs that should match
+DECODE_TOKENS = 300
+DECODE_RUNS = 3
 
 
 class Busy(Exception):
@@ -113,6 +116,24 @@ def longer_context(geometry: dict, ranks: list[dict], cache_auto: bool, model_ma
             continue
         best = {"tokens": ctx, "now": now, "need_bytes": need, "free_bytes": free, "experts_lost": lost, "experts": slots}
     return best
+
+
+def keep_faster_prefill(a: dict, b: dict, gain: float = 1.05, decode_share: float = 0.97) -> bool:
+    return bool(b.get("ok")) and (b.get("prefill_tps") or 0) >= gain * (a.get("prefill_tps") or 0) and \
+        (b.get("decode_tps") or 0) >= decode_share * (a.get("decode_tps") or 0)
+
+
+def keep_faster_decode(a: dict, b: dict, gain: float = 1.03, prefill_share: float = 0.9) -> bool:
+    return bool(b.get("ok")) and (b.get("decode_tps") or 0) >= gain * (a.get("decode_tps") or 0) and \
+        (b.get("prefill_tps") or 0) >= prefill_share * (a.get("prefill_tps") or 0)
+
+
+def strategy_ratio(hw: dict) -> float | None:
+    """CPU expert compute over the slowest GPU's expert transfer, from the hardware bench."""
+    m = hw.get("measurements") or {}
+    cpu = (m.get("cpu_moe") or {}).get("best_gbs")
+    links = [g.get("gbs") for g in (m.get("gather") or {}).values() if g and g.get("gbs")]
+    return cpu / min(links) if cpu and links else None
 
 
 def keep_longer(a: dict, b: dict, decode_share: float = 0.95, prefill_share: float = 0.9) -> bool:
@@ -252,7 +273,7 @@ class TuneJob:
             result["base_args"] = list(args)
             if trials:
                 model_max = ((rec.get("host") or {}).get("model") or {}).get("max_context")
-                args, notes = self._trials(model, port, args, notes, result, model_max)
+                args, notes = self._trials(model, port, args, notes, result, model_max, hw)
             result["args"] = [a for a in args if a != "--moe-collect-stats"]
             result["notes"] = notes
             result["finished"] = time.time()
@@ -352,63 +373,117 @@ class TuneJob:
         return args, list(notes.values())
 
     # ---- real runs
-    def _trials(self, model: str, port: int, args: list[str], notes: list[dict], result: dict, model_max: int | None = None):
+    def _trials(self, model: str, port: int, args: list[str], notes: list[dict], result: dict,
+                model_max: int | None = None, hw: dict | None = None):
+        """One change per run, each kept only when the measurements say so: the prefill chunk
+        budget, a longer context, and the other MoE strategy when the hardware bench was close."""
         self._ev("phase", phase="trial")
-        run_args = set_flags(args, {"--moe-collect-stats": None})
-        a = self._trial("A", model, port, run_args)
-        if not a["ok"] and has_flag(run_args, "--dtype"):
+        letters = iter("ABCDEFGHIJ")
+        base = set_flags(args, {"--moe-collect-stats": None})
+        label = next(letters)
+        a = self._trial(label, model, port, base)
+        if not a["ok"] and has_flag(base, "--dtype"):
             # float16 on a pre-Ampere card copies while converting: a tight model may not load with it
             result["trials"].append(a)
             self._ev("log", msg="dtype_retry")
-            run_args = set_flags(run_args, {}, drop=("--dtype",))
+            base = set_flags(base, {}, drop=("--dtype",))
             notes = [n for n in notes if n["flag"] != "--dtype"]
             notes.append({"flag": "--dtype", "value": None, "source": "measured", "removed": True,
                           "why": "float16 では読み込み時の変換で VRAM が足りず起動できなかったので、指定を外しました。",
                           "why_en": "The model did not load with float16 (the conversion needs VRAM it did not have), so the flag was dropped."})
-            a = self._trial("A", model, port, run_args)
+            label = next(letters)
+            a = self._trial(label, model, port, base, change={"flag": "--dtype", "value": None})
         result["trials"].append(a)
         if not a["ok"]:
             raise RuntimeError(f"the server did not start with the measured flags: {a.get('error')}")
-        self._check()
-        cand = longer_context(a.get("geometry") or {}, a.get("ranks") or [], has_flag(run_args, "--moe-cache-auto"),
-                              model_max)
-        result["candidate"] = cand
-        chosen = run_args
-        if cand:
-            b_args = set_flags(run_args, {"--kv-reserve-tokens": str(cand["tokens"]), "--max-seq-len-override": str(cand["tokens"])})
-            b = self._trial("B", model, port, b_args)
-            result["trials"].append(b)
-            if keep_longer(a, b):
-                chosen, result["chosen"] = b_args, "B"
-                why = (f"実測で決めました: {a['kv_tokens']:,} トークンでは生成 {a['decode_tps']:.1f} tok/s・プロンプト処理 {a['prefill_tps']:.0f} tok/s、"
-                       f"{cand['tokens']:,} トークンでは {b['decode_tps']:.1f} tok/s・{b['prefill_tps']:.0f} tok/s。長くしても速さがほぼ変わらないので長い方にします。")
-                why_en = (f"Measured: {a['kv_tokens']:,} tokens gave {a['decode_tps']:.1f} tok/s generation and {a['prefill_tps']:.0f} tok/s prompt processing, "
-                          f"{cand['tokens']:,} tokens {b['decode_tps']:.1f} and {b['prefill_tps']:.0f}. The longer context costs almost nothing, so it is kept.")
-            elif b.get("ok"):
-                result["chosen"] = "A"
-                why = (f"実測で決めました: {cand['tokens']:,} トークンにすると生成 {a['decode_tps']:.1f} → {b['decode_tps'] or 0:.1f} tok/s、"
-                       f"プロンプト処理 {a['prefill_tps']:.0f} → {b['prefill_tps'] or 0:.0f} tok/s でした。生成 95%・プロンプト処理 90% を下回るので、{a['kv_tokens']:,} のままにします。")
-                why_en = (f"Measured: at {cand['tokens']:,} tokens generation went {a['decode_tps']:.1f} -> {b['decode_tps'] or 0:.1f} tok/s and prompt processing "
-                          f"{a['prefill_tps']:.0f} -> {b['prefill_tps'] or 0:.0f} tok/s, below the 95% / 90% kept for a longer context, so {a['kv_tokens']:,} stays.")
+        best, best_args = a, base
+
+        def attempt(changes: dict, drop: tuple = ()) -> tuple[dict, list[str]]:
+            self._check()
+            cand_args = set_flags(best_args, changes, drop)
+            change = next(iter(changes.items())) if changes else (drop[0], None)
+            t = self._trial(next(letters), model, port, cand_args, change={"flag": change[0], "value": change[1]})
+            result["trials"].append(t)
+            return t, cand_args
+
+        def speeds(x: dict) -> str:
+            return f"{x.get('prefill_tps') or 0:.0f} / {x.get('decode_tps') or 0:.1f}"
+
+        # 1. the prefill chunk budget: a wider chunk is the largest prefill lever this fork measured
+        if not has_flag(best_args, "--prefill-chunk-budget"):
+            t, t_args = attempt({"--prefill-chunk-budget": "0.75"})
+            if keep_faster_prefill(best, t):
+                notes.append({"flag": "--prefill-chunk-budget", "value": "0.75", "source": "measured",
+                              "why": f"実測で決めました: 0.75 にするとプロンプト処理 / 生成が {speeds(best)} → {speeds(t)} tok/s。プロンプト処理が速くなり、生成は落ちないので採ります。",
+                              "why_en": f"Measured: at 0.75 prompt processing / generation went {speeds(best)} -> {speeds(t)} tok/s. Prompts are faster and generation holds, so it is kept."})
+                best, best_args = t, t_args
             else:
-                result["chosen"] = "A"
-                why = f"{cand['tokens']:,} トークンでは起動できなかったので、{a['kv_tokens']:,} のままにします。"
-                why_en = f"The server did not start with {cand['tokens']:,} tokens, so {a['kv_tokens']:,} stays."
+                notes.append({"flag": "--prefill-chunk-budget", "value": "0.75", "source": "measured", "rejected": True,
+                              "why": (f"試しました: 0.75 ではプロンプト処理 / 生成が {speeds(best)} → {speeds(t)} tok/s で、5% 以上速くならなかったので既定（0.55）のままにします。"
+                                      if t.get("ok") else "試しました: 0.75 では起動または測定に失敗したので、既定（0.55）のままにします。"),
+                              "why_en": (f"Tried: at 0.75 prompt processing / generation went {speeds(best)} -> {speeds(t)} tok/s, not 5% faster, so the default (0.55) stays."
+                                         if t.get("ok") else "Tried: 0.75 failed to start or to finish the measurement, so the default (0.55) stays.")})
+
+        # 2. a longer context, into the VRAM the best run left free
+        cand = longer_context(best.get("geometry") or {}, best.get("ranks") or [], has_flag(best_args, "--moe-cache-auto"), model_max)
+        result["candidate"] = cand
+        now = best.get("kv_tokens") or 0
+        if cand:
+            tokens = str(cand["tokens"])
+            t, t_args = attempt({"--kv-reserve-tokens": tokens, "--max-seq-len-override": tokens})
+            if keep_longer(best, t):
+                why = (f"実測で決めました: コンテキスト長 {now:,} では プロンプト処理 / 生成が {speeds(best)} tok/s、{cand['tokens']:,} では {speeds(t)} tok/s。"
+                       "長くしても速さがほぼ変わらないので長い方にします。")
+                why_en = (f"Measured: at {now:,} tokens prompt processing / generation was {speeds(best)} tok/s, at {cand['tokens']:,} {speeds(t)}. "
+                          "The longer context costs almost nothing, so it is kept.")
+                best, best_args = t, t_args
+            elif t.get("ok"):
+                why = (f"実測で決めました: コンテキスト長を {cand['tokens']:,} にするとプロンプト処理 / 生成が {speeds(best)} → {speeds(t)} tok/s でした。"
+                       f"生成 95%・プロンプト処理 90% を下回るので、{now:,} のままにします。")
+                why_en = (f"Measured: at {cand['tokens']:,} tokens prompt processing / generation went {speeds(best)} -> {speeds(t)} tok/s, "
+                          f"below the 95% / 90% kept for a longer context, so {now:,} stays.")
+            else:
+                why = f"コンテキスト長 {cand['tokens']:,} では起動できなかったので、{now:,} のままにします。"
+                why_en = f"The server did not start with {cand['tokens']:,} tokens, so {now:,} stays."
         else:
-            result["chosen"] = "A"
-            why = f"起動後の空き VRAM では {a['kv_tokens']:,} トークンより長い文脈が入りませんでした（エキスパートの枠を 1/4 以上削る必要がある）。"
-            why_en = f"After the start the free VRAM held no context longer than {a['kv_tokens']:,} tokens without giving up more than a quarter of the expert cache."
-        tokens = next((v for k, v in parse_flags(chosen) if k == "--kv-reserve-tokens"), None)
+            why = f"起動後の空き VRAM では、コンテキスト長 {now:,} より長いものが入りませんでした（エキスパートの枠を 1/4 以上削る必要がある）。"
+            why_en = f"After the start the free VRAM held no context longer than {now:,} tokens without giving up more than a quarter of the expert cache."
+        tokens = next((v for k, v in parse_flags(best_args) if k == "--kv-reserve-tokens"), None)
         notes = [n for n in notes if n["flag"] not in ("--kv-reserve-tokens", "--max-seq-len-override")]
         if tokens:
             notes.append({"flag": "--kv-reserve-tokens", "value": tokens, "why": why, "why_en": why_en, "source": "measured"})
             notes.append({"flag": "--max-seq-len-override", "value": tokens, "source": "rule",
                           "why": "宣伝する長さと実際に入る長さをそろえます。", "why_en": "The advertised context matches what actually fits."})
-        return chosen, notes
 
-    def _trial(self, label: str, model: str, port: int, args: list[str]) -> dict:
-        out: dict = {"label": label, "args": list(args), "ok": False}
-        self._ev("trial", trial=label, step="load", state="start", args=args)
+        # 3. the other MoE strategy, only when the kernels alone could not tell them apart
+        ratio = strategy_ratio(hw or {})
+        strategy = next((v for k, v in parse_flags(best_args) if k == "--moe-strategy"), None)
+        if ratio is not None and 1.5 <= ratio <= 3.0 and strategy in ("hybrid", "offload"):
+            other = "offload" if strategy == "hybrid" else "hybrid"
+            drop = ("--moe-cpu-layers", "--moe-cpu-threads") if other == "offload" else ()
+            t, t_args = attempt({"--moe-strategy": other}, drop)
+            if keep_faster_decode(best, t):
+                notes = [n for n in notes if n["flag"] not in ("--moe-strategy",) + drop]
+                notes.append({"flag": "--moe-strategy", "value": other, "source": "measured",
+                              "why": f"実測で決めました: CPU と転送の差が {ratio:.1f} 倍と小さかったので両方を起動して比べ、{other} で生成が {best['decode_tps']:.1f} → {t['decode_tps']:.1f} tok/s になりました。",
+                              "why_en": f"Measured: the CPU was only {ratio:.1f}x the transfer, so both were started; {other} took generation {best['decode_tps']:.1f} -> {t['decode_tps']:.1f} tok/s."})
+                best, best_args = t, t_args
+
+        result["chosen"] = best["label"]
+        return best_args, notes
+
+    def _trial(self, label: str, model: str, port: int, args: list[str], change: dict | None = None) -> dict:
+        try:
+            return self._trial_run(label, model, port, args, change)
+        except InterruptedError:
+            raise
+        except Exception as exc:  # noqa: BLE001 -- e.g. a wider chunk that runs out of VRAM mid-prompt
+            self._ev("trial", trial=label, step="measure", state="failed", message=str(exc)[:300])
+            return {"label": label, "args": list(args), "change": change, "ok": False, "error": str(exc)[:300]}
+
+    def _trial_run(self, label: str, model: str, port: int, args: list[str], change: dict | None) -> dict:
+        out: dict = {"label": label, "args": list(args), "change": change, "ok": False}
+        self._ev("trial", trial=label, step="load", state="start", args=args, change=change)
         t0 = self._clock()
         self.manager.switch(model, port, args)
         ready = self._wait_ready(label, port)
@@ -445,9 +520,9 @@ class TuneJob:
 
         self._check()
         self._ev("trial", trial=label, step="decode", state="start", tokens=DECODE_TOKENS)
-        decode = [self._decode(label, port, model_id, rng) for _ in range(2)]
+        decode = [self._decode(label, port, model_id, rng) for _ in range(DECODE_RUNS)]
         decode = [d for d in decode if d]
-        out["decode_tps"] = round(sum(decode) / len(decode), 2) if decode else None
+        out["decode_tps"] = round(sorted(decode)[len(decode) // 2], 2) if decode else None
         self._ev("trial", trial=label, step="decode", state="done", value=out["decode_tps"])
 
         experts = self._http(port, "/v1/kai/experts?window=60", timeout=30) or {}

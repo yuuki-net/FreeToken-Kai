@@ -172,11 +172,27 @@ REC = {
 
 
 class FakeServe:
-    """A serve whose speed and geometry follow the --kv-reserve-tokens it was started with."""
+    """A serve whose speed and geometry follow the flags it was started with: ``speeds`` by
+    --kv-reserve-tokens as (decode, prefill), ``budget`` and ``offload`` as (decode, prefill)
+    factors for --prefill-chunk-budget 0.75 and --moe-strategy offload, ``fail`` a predicate on
+    the flags that makes the prompt request error (a chunk that runs out of VRAM)."""
 
-    def __init__(self, manager, speeds, free=2.5 * GiB):
+    def __init__(self, manager, speeds, free=2.5 * GiB, budget=(1.0, 1.0), offload=(1.0, 1.0), fail=None):
         self.m, self.speeds, self.free = manager, speeds, free
+        self.budget, self.offload, self.fail = budget, offload, fail
         self.t = 0.0
+
+    def flags(self):
+        return dict(tuner.parse_flags(self.m.cfg[2]))
+
+    def rates(self):
+        f = self.flags()
+        d, p = self.speeds[self.ctx()]
+        if f.get("--prefill-chunk-budget") == "0.75":
+            d, p = d * self.budget[0], p * self.budget[1]
+        if f.get("--moe-strategy") == "offload":
+            d, p = d * self.offload[0], p * self.offload[1]
+        return d, p
 
     def clock(self):
         return self.t
@@ -199,12 +215,14 @@ class FakeServe:
             assert isinstance(body["prompt"], str)  # token-id prompts are refused by ft serve
             n = int(len(body["prompt"].split()) * 1.3)
             if body["max_tokens"] == 1:
-                self.t += n / self.speeds[ctx][1]
+                if self.fail and self.fail(self.flags()):
+                    raise RuntimeError("HTTP Error 500: Internal Server Error")
+                self.t += n / self.rates()[1]
             return {"usage": {"prompt_tokens": n, "completion_tokens": body["max_tokens"]}}
         raise AssertionError(path)
 
     def stream(self, port, path, body):
-        rate = self.speeds[self.ctx()][0]
+        rate = self.rates()[0]
         for i in range(body["max_tokens"]):
             self.t += 1 / rate
             yield "data: " + json.dumps({"choices": [{"text": "x"}]}) + "\n"
@@ -224,6 +242,10 @@ def _run(job, model="/models/M", trials=True):
     return job.status()
 
 
+def _changes(r):
+    return [(t["label"], (t.get("change") or {}).get("flag")) for t in r["trials"]]
+
+
 def test_full_run_keeps_the_longer_context_and_brings_the_old_engine_back(tmp_path):
     prev = ("/models/Old", 1919, ["--old"])
     m = FakeManager(running=prev)
@@ -231,7 +253,11 @@ def test_full_run_keeps_the_longer_context_and_brings_the_old_engine_back(tmp_pa
     st = _run(_job(tmp_path, m, serve))
     assert st["state"] == "done", st["error"]
     r = st["result"]
-    assert r["chosen"] == "B" and r["candidate"]["tokens"] == 131072
+    # one change per run: the budget (no faster here, not kept), then the context on the best so far
+    assert _changes(r) == [("A", None), ("B", "--prefill-chunk-budget"), ("C", "--kv-reserve-tokens")]
+    assert r["chosen"] == "C" and r["candidate"]["tokens"] == 131072
+    assert "--prefill-chunk-budget" not in dict(tuner.parse_flags(r["args"]))
+    assert [n for n in r["notes"] if n["flag"] == "--prefill-chunk-budget"][0]["rejected"]
     flags = dict(tuner.parse_flags(r["args"]))
     assert flags["--kv-reserve-tokens"] == flags["--max-seq-len-override"] == "131072"
     assert flags["--moe-cpu-threads"] == "6"  # measured beats the rule's 8
@@ -239,11 +265,11 @@ def test_full_run_keeps_the_longer_context_and_brings_the_old_engine_back(tmp_pa
     assert [n for n in r["notes"] if n["flag"] == "--moe-cpu-threads"][0]["source"] == "measured"
     assert m.calls[0] == ("stop",) and m.calls[-1] == ("switch", *prev)
     assert m.cfg == prev
-    assert json.load(open(tmp_path / "tune" / "M.json"))["chosen"] == "B"
+    assert json.load(open(tmp_path / "tune" / "M.json"))["chosen"] == "C"
     kinds = {e["k"] for e in st["events"]}
     assert {"phase", "hw", "trial", "sample"} <= kinds
     decode = [t["decode_tps"] for t in r["trials"]]
-    assert decode[0] == pytest.approx(38.0, rel=0.01) and decode[1] == pytest.approx(37.0, rel=0.01)
+    assert decode[0] == pytest.approx(38.0, rel=0.01) and decode[2] == pytest.approx(37.0, rel=0.01)
 
 
 def test_longer_context_that_slows_generation_is_not_kept(tmp_path):
@@ -254,6 +280,53 @@ def test_longer_context_that_slows_generation_is_not_kept(tmp_path):
     assert r["chosen"] == "A"
     assert dict(tuner.parse_flags(r["args"]))["--kv-reserve-tokens"] == "16384"
     assert m.cfg is None  # nothing was running before: nothing is left running
+
+
+def test_a_faster_prefill_budget_is_kept_and_carried_into_the_context_run(tmp_path):
+    m = FakeManager()
+    serve = FakeServe(m, {16384: (38.0, 520.0), 131072: (37.5, 510.0)}, budget=(1.0, 1.35))
+    r = _run(_job(tmp_path, m, serve))["result"]
+    assert r["chosen"] == "C"
+    flags = dict(tuner.parse_flags(r["args"]))
+    assert flags["--prefill-chunk-budget"] == "0.75" and flags["--kv-reserve-tokens"] == "131072"
+    assert dict(tuner.parse_flags(r["trials"][2]["args"]))["--prefill-chunk-budget"] == "0.75"
+    note = [n for n in r["notes"] if n["flag"] == "--prefill-chunk-budget"][0]
+    assert note["source"] == "measured" and not note.get("rejected")
+
+
+def test_a_run_that_fails_mid_measurement_is_not_kept_and_the_job_goes_on(tmp_path):
+    m = FakeManager()
+    serve = FakeServe(m, {16384: (38.0, 580.0), 131072: (37.0, 560.0)},
+                      fail=lambda f: f.get("--prefill-chunk-budget") == "0.75")
+    st = _run(_job(tmp_path, m, serve))
+    assert st["state"] == "done", st["error"]
+    r = st["result"]
+    assert r["trials"][1]["ok"] is False and "500" in r["trials"][1]["error"]
+    assert "--prefill-chunk-budget" not in dict(tuner.parse_flags(r["args"]))
+    assert r["chosen"] == "C"
+
+
+def _hw_lines(cpu, gather):
+    lines = [dict(x) for x in HW_LINES]
+    lines[-1] = dict(lines[-1], measurements={"cpu_moe": {"best_gbs": cpu}, "gather": {"0": {"gbs": gather}}})
+    return lines
+
+
+def test_the_other_strategy_is_tried_only_when_the_kernels_were_close(tmp_path):
+    m = FakeManager()
+    serve = FakeServe(m, {16384: (20.0, 500.0), 131072: (19.0, 480.0)}, offload=(1.10, 1.0))
+    job = _job(tmp_path, m, serve)
+    job._spawn = lambda argv: FakeProc(_hw_lines(cpu=12.0, gather=6.0))  # 2.0x: close
+    r = _run(job)["result"]
+    assert _changes(r)[-1] == ("D", "--moe-strategy")
+    flags = dict(tuner.parse_flags(r["args"]))
+    assert flags["--moe-strategy"] == "offload" and "--moe-cpu-threads" not in flags and "--moe-cpu-layers" not in flags
+
+    m2 = FakeManager()
+    job2 = _job(tmp_path / "far", m2, FakeServe(m2, {16384: (20.0, 500.0), 131072: (19.0, 480.0)}))
+    job2._spawn = lambda argv: FakeProc(_hw_lines(cpu=30.3, gather=6.3))  # 4.8x: the kernels decide
+    r2 = _run(job2)["result"]
+    assert "--moe-strategy" not in [c for _, c in _changes(r2)]
 
 
 def test_float16_that_does_not_load_is_dropped(tmp_path):

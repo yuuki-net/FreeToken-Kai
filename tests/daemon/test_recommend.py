@@ -82,13 +82,34 @@ def test_small_model_on_two_cards_uses_one(tmp_path, monkeypatch):
     assert f["--gpu"] == "0" and "--pp-size" not in f
 
 
+def test_measured_prefill_and_dense_flags(tmp_path, monkeypatch):
+    _host(monkeypatch, [("NVIDIA GeForce RTX 3060", 12, 8.6)] * 2, ram_gib=128, cores=8)
+    flash = dict(GDN_MOE, model_type="qwen4_exp", num_hidden_layers=48, num_experts=512, hidden_size=2560,
+                 moe_intermediate_size=640, vision_config=None)
+    f = _flags(rec.recommend(_model(tmp_path, "Flash-Next", weight_gib=135, **flash)))
+    assert f["--pp-size"] == "2"
+    assert f["--prefill-mixer-pieces"] == "2" and f["--dense-quant"] == "fp8"
+
+    _host(monkeypatch, [("NVIDIA GeForce RTX 2060", 6, 7.5)], ram_gib=24, cores=12)
+    f = _flags(rec.recommend(_model(tmp_path, "Ornith", weight_gib=20, **GDN_MOE)))
+    assert f["--prefill-mixer-pieces"] == "2" and "--dense-quant" not in f
+
+
+def test_no_pieces_for_a_qwen35_moe_split_across_cards(tmp_path, monkeypatch):
+    # the pieces run on one GPU for qwen3_5_moe; only Flash-Next has them under --pp-size
+    _host(monkeypatch, [("NVIDIA GeForce RTX 3060", 12, 8.6)] * 2, ram_gib=128, cores=16)
+    heavy = dict(GDN_MOE, num_experts=8, vision_config=None)
+    f = _flags(rec.recommend(_model(tmp_path, "Heavy", weight_gib=40, **heavy)))
+    assert f["--pp-size"] == "2" and "--prefill-mixer-pieces" not in f
+
+
 def test_dense_model_on_a_large_card_keeps_its_own_limit(tmp_path, monkeypatch):
     _host(monkeypatch, [("NVIDIA RTX 6000", 48, 8.9)], ram_gib=128, cores=32)
     dense = dict(model_type="llama", num_hidden_layers=32, hidden_size=4096, num_attention_heads=32,
                  num_key_value_heads=8, max_position_embeddings=32768)
     f = _flags(rec.recommend(_model(tmp_path, "Dense", weight_gib=16, **dense)))
     assert f["--kv-reserve-tokens"] == "32768"  # the 131072 tier, capped by the checkpoint
-    for moe_flag in ("--moe-cache-auto", "--moe-strategy", "--kv-cache-dtype", "--moe-bank-ram"):
+    for moe_flag in ("--moe-cache-auto", "--moe-strategy", "--kv-cache-dtype", "--moe-bank-ram", "--prefill-mixer-pieces", "--dense-quant"):
         assert moe_flag not in f
 
 

@@ -2,7 +2,7 @@
   "categories": [
     ["model", "モデルと重み"],
     ["gpu", "GPU と並列"],
-    ["context", "文脈と KV キャッシュ"],
+    ["context", "コンテキスト長と KV キャッシュ"],
     ["moe", "MoE（エキスパート）"],
     ["bank", "RAM と SSD のバンク"],
     ["prefill", "プロンプト処理"],
@@ -37,7 +37,7 @@
     "--disable-cuda-graph": {"cat": "measure", "ja": "CUDA graph を使わずに生成する。", "more": "とても遅くなります。--moe-stats-out でエキスパートごとの回数を正しく数える計測のときだけ使います。"},
     "--attention-backend": {"cat": "gpu", "ja": "attention の計算に使う実装。", "more": "2 つ書くと 1 つ目がプロンプト処理用、2 つ目が生成用。普段は auto。"},
 
-    "--max-seq-len-override": {"cat": "context", "ja": "1 つの会話で扱える最大トークン数（文脈の上限）。", "more": "上げると KV の VRAM が増えます。--kv-reserve-tokens と同じ値にそろえると、宣伝される長さと実際に入る長さが一致します。"},
+    "--max-seq-len-override": {"cat": "context", "ja": "1 つの会話で扱える最大トークン数（コンテキスト長の上限）。", "more": "上げると KV の VRAM が増えます。--kv-reserve-tokens と同じ値にそろえると、宣伝される長さと実際に入る長さが一致します。"},
     "--kv-cache-dtype": {"cat": "context", "ja": "KV キャッシュを量子化して小さくする。", "more": "q8_0 で 1.88 倍、q4_0 で 3.56 倍小さくなります。空いた VRAM は --moe-cache-auto がエキスパートに回します。gpt-oss の q4_0 では推論が繰り返しになる例がありました。"},
     "--kv-reserve-tokens": {"cat": "context", "ja": "--moe-cache-auto がエキスパートに VRAM を回す前に、KV に確保しておくトークン数。", "more": "既定 8192。長い会話をするなら上げます（上げたぶんエキスパートの枠は減ります）。"},
     "--num-pages": {"cat": "context", "ja": "KV キャッシュのページ数を直接指定する。", "more": "普段は自動。--num-tokens とは同時に使えません。"},
