@@ -10,43 +10,8 @@ at the far end. A 125B MoE on two of them. A 35B MoE on an RTX 2060 6 GB.**
 > **Please keep questions and bug reports about this fork in this repository.** The FreeToken
 > maintainers have no part in it; do not contact them about anything you find here.
 
-> **2026-09-09 — pull if you cloned before this date and run `--pp-size`.** Multi-rank decoding
-> slowed steadily for as long as the server stayed up: 17.9 -> 2.3 tok/s over one 12.5-hour
-> session on two RTX 3060s, unrelated to context length, reset only by a restart. The cause and
-> the fix are in [docs/pipeline.md](docs/pipeline.md). Single-GPU runs were never affected.
-
-> **2026-09-12 — pull if you cloned before this date and either serve Qwen3.8-Flash-Next with
-> `--kv-cache-dtype q8_0` or use `--moe-bank-ram`.** Two refused CUDA calls were left
-> uncleaned, and each surfaced somewhere it had nothing to do with. One killed the boot with
-> `--moe-bank-ram` on a host that cannot register a read-only file mapping, reporting itself
-> out of an unrelated 48 KB allocation. The other killed the first request: under `q8_0` the
-> sparse-attention tile does not fit a GA10x card's shared memory, and nothing before that
-> request complained. See [docs/bank-ram.md](docs/bank-ram.md) and
-> [docs/kv-cache-quant.md](docs/kv-cache-quant.md). `q4_0` and 16-bit KV were never affected.
->
-> Fixed the same day: **`--moe-bank-ram` and `--spec-mtp` could not be used together at
-> all.** The draft head's expert layer is appended to the banks after the resident placement
-> has been solved, and the renumbering list was never extended to cover it. The rank carrying
-> the head died on a bare `IndexError` -- while the other rank came up and reported its banks
-> mapped and registered.
-
-> **2026-09-13 — pull if you run `--pp-size`, or serve a Qwen model to a client that uses tool
-> calls.** Two ways a two-card server could stop serving without an error, both found by reading
-> the code rather than by a failure here: a request sent the moment the server reported ready
-> could be dropped on its way from the first rank to the others, leaving both waiting on each
-> other; and the ranks sized their KV pools separately (2050 and 2048 pages on the two RTX
-> 3060s) while each rank's scheduler reads its own pool when it evicts cached prefixes. The
-> prefill chunk is also checked again once the `--spec-mtp` graphs have taken their VRAM. See
-> [docs/pipeline.md](docs/pipeline.md).
->
-> On any card: Qwen output could carry `<|im_end|>` and other special tokens in the text, and a
-> Qwen3.5-family tool call written as JSON inside `<tool_call>` reached the client as plain text
-> (non-streaming) or not at all (streaming). The startup log now also says how much context the
-> KV pool actually holds, which for an offloaded MoE left at the default `--kv-reserve-tokens 8192`
-> is far below what `/v1/models` advertises.
-
 Upstream FreeToken serves one model on one GPU, on Ampere (RTX 30 series) or newer.
-This fork adds nine things on top of it. They are independent — take one, ignore the rest.
+This fork adds ten things on top of it. They are independent — take one, ignore the rest.
 
 | | What it does | How you ask for it |
 |---|---|---|
@@ -59,6 +24,7 @@ This fork adds nine things on top of it. They are independent — take one, igno
 | 7 | **A KV cache 1.9x or 3.6x smaller**, stored as block-quantized codes: 1.25 GiB down to 0.35 GiB at 64k on a 6 GB card. It buys VRAM, not speed — past a few thousand tokens of context it costs about a third of the decode rate. Plain paged-attention models and gpt-oss on the Triton backend, and Qwen3.8-Flash-Next on its own sparse backend — where the cost above does not apply: measured on two RTX 3060s, `q4_0` decode is flat from 8k to 125k of context (−1.4%) while the KV drops 1.55 GiB to 0.47 GiB per rank, because its attention reads a fixed budget of tokens however long the context is. On gpt-oss use `q8_0`: it runs gpt-oss-120b at 128k of context on two RTX 3060s, and `q4_0` breaks its answers. | `--kv-cache-dtype q4_0` (gpt-oss: `q8_0`) |
 | 8 | **The checkpoint's bf16 dense weights served as fp8.** Attention, GDN, shared expert, lm_head and the embedding are quantized per output row at load and read W8A16; the router, hyper-connection, QSA indexer, PLE and GDN gates stay bf16. Qwen3.8-Flash-Next's resident dense weights go from 4.9 GB per card to 2.9 GB, and the freed VRAM goes to the expert cache. | `--dense-quant fp8` |
 | 9 | **A prefill chunk sized to the VRAM that is actually free.** Upstream's fixed 8192 needs 0.97 GiB of transient on a 35B MoE; a 6 GB card does not have it, so long prompts crawled and sometimes died. The transient is measured at startup; the chunk itself is solved before every prefill, against the VRAM free at that moment, with `--max-prefill-length` left as the ceiling. Running the GDN and attention over pieces of a chunk, and the MoE over all of it, makes the chunk wider still: a 20k-token prompt went 490 → 722 tok/s on a 2060 and 437 → 546 on two 3060s. | automatic, `--prefill-chunk-budget`; `--prefill-mixer-pieces 2` |
+| 10 | **A browser console instead of the desktop app.** Upstream's desktop app is built for upstream's engine and does not know these flags. `ft mgr` serves a dashboard (speed, VRAM per GPU, host RAM, the expert cache per layer), launch profiles with every `ft serve` flag explained, settings recommended for the PC it runs on, and changes suggested from the running server's own measurements. Other PCs on the LAN can watch; operating from them takes a token. | `ft mgr`, then `http://127.0.0.1:1901/ui/` |
 
 Everything else is upstream FreeToken.
 
@@ -184,6 +150,34 @@ a compute-capability check, and the layer split, the bank mapping, image input, 
 `--host-embedding` are architecture-independent. See the "Ampere and newer" section of
 [docs/kai.md](docs/kai.md).
 
+## The web console
+
+`ft mgr` is `ft daemon` with a console served to the browser: nothing to install on the machine
+you look from. `ft daemon` itself stays upstream's, on its own port.
+
+```bash
+ft mgr --host 0.0.0.0     # then open http://127.0.0.1:1901/ui/
+```
+
+![Dashboard](assets/kai-console-dashboard.png)
+
+**Launch profiles** pick the model from `~/models` and the Hugging Face cache and the flags from
+`ft serve`'s own parser, with what each one does. **Recommended** fills in the flags for this PC's
+GPUs, RAM and cores and the checkpoint's config, says why for each, and marks which ones the
+profile already has.
+
+![Profile editor with recommended settings](assets/kai-console-profile-editor.png)
+
+**How experts are served** shows, per layer, how often a routed expert was not on the GPU, and what
+to change about it. With a measurement run it also shows how often each expert was picked, and
+what a bigger cache would hold.
+
+![Expert heatmap](assets/kai-console-heatmap.png)
+
+Other PCs on the LAN can watch everything; starting, stopping and editing from them needs the token
+the console shows on this PC. `ft serve` serves the same dashboard read-only on its own port.
+English or Japanese, following the browser. See [docs/web-console.md](docs/web-console.md).
+
 ## Install
 
 Source install, same as upstream, plus Pillow for image decoding. torchvision is deliberately not
@@ -203,6 +197,7 @@ CUDA kernels are JIT-compiled on first use (CUDA 13 toolkit with `nvcc`, as upst
 | | |
 |---|---|
 | [docs/kai.md](docs/kai.md) | What the fork adds, tested configurations, Ampere and newer, every flag |
+| [docs/web-console.md](docs/web-console.md) | The browser console (`ft mgr`): dashboard, launch profiles, recommended settings, the expert heatmap, operating from another PC |
 | [docs/pipeline.md](docs/pipeline.md) | Two GPUs, one model (`--pp-size`) |
 | [docs/bank-ram.md](docs/bank-ram.md) | Half the host RAM (`--moe-bank-ram`), and the `read_ahead_kb` that is worth 2.5x |
 | [docs/prefill-chunk.md](docs/prefill-chunk.md) | The prefill chunk: sized to free VRAM (`--prefill-chunk-budget`), and made wider (`--prefill-mixer-pieces`) |
