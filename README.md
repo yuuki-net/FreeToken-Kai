@@ -1,7 +1,11 @@
 # FreeToken Kai (改)
 
-**gpt-oss-120b on one RTX 3060 12 GB. A 35B MoE at 250k of context on the same card, still 25 tok/s
-at the far end. A 125B MoE on two of them. A 35B MoE on an RTX 2060 6 GB.**
+**Large models on the PC you already have, with the settings worked out for you.**
+
+gpt-oss-120b on one RTX 3060 12 GB. A 125B MoE on two of them. A 35B MoE on an RTX 2060 6 GB, and
+at 250k of context on one 3060. Getting there used to mean learning a dozen `ft serve` flags and
+how they trade against each other on your card. Now a benchmark in the browser measures your PC
+with the model, tries the settings one at a time, and hands you the fastest as a launch profile.
 
 > An unofficial fork of [FlashML-org/FreeToken](https://github.com/FlashML-org/FreeToken), merged
 > with upstream `main` at `cac247a` (2026-09-16). Not affiliated with, endorsed by, or supported by
@@ -10,8 +14,117 @@ at the far end. A 125B MoE on two of them. A 35B MoE on an RTX 2060 6 GB.**
 > **Please keep questions and bug reports about this fork in this repository.** The FreeToken
 > maintainers have no part in it; do not contact them about anything you find here.
 
-Upstream FreeToken serves one model on one GPU, on Ampere (RTX 30 series) or newer.
-This fork adds ten things on top of it. They are independent — take one, ignore the rest.
+## Getting started
+
+1. **Install.** Source install, same as upstream, plus Pillow for image decoding. torchvision is
+   deliberately not required (without it the Qwen VL image processor is loaded as its Pillow
+   backend).
+
+   ```bash
+   git clone https://github.com/yuuki-net/FreeToken-Kai.git && cd FreeToken-Kai
+   uv venv && source .venv/bin/activate
+   uv pip install -e ".[accel]"
+   uv pip install pillow
+   ```
+
+   CUDA kernels are JIT-compiled on first use (CUDA 13 toolkit with `nvcc`, as upstream).
+
+2. **Open the console.**
+
+   ```bash
+   ft mgr --host 0.0.0.0     # then open http://127.0.0.1:1901/ui/
+   ```
+
+3. **Run the benchmark** on the model you want: **Benchmark** in the header, pick the model, start.
+   It needs the GPU for a while; the time left is shown as it goes.
+4. **Save the result as a profile and start it.** From then on the profile editor's
+   **Recommended** follows what was measured.
+
+What the benchmark found on the machines this fork is tested on, against the settings recommended
+from the GPUs, RAM and model alone (prompt processing on a 16k prompt / generation):
+
+| PC | Model | Before | After the benchmark | Benchmark |
+|---|---|---|---|---|
+| 2× RTX 3060 12 GB, 128 GB RAM | Qwen3.8-Flash-Next (125B MoE) | 262 / 18.4 tok/s, 65k of context | **575 / 25.5 tok/s on code** (19.8 on prose), 131k of context | thorough, 2 h 56 min |
+| 1× RTX 2060 6 GB, 32 GB RAM | Ornith-1.5-35B-A3B | 610 / 30.9 tok/s | **759 / 32.0 tok/s** | standard, 1 h |
+
+On the two 3060s it chose a 16-bit KV cache, a wider prefill chunk, MTP drafting 3 tokens and 131k
+of context; on the 2060 a wider chunk and four prefill pieces. Different PCs get different flags,
+which is the point.
+
+![Benchmark running](assets/kai-console-benchmark.png)
+
+## Is this for you?
+
+**You want a big model on your own PC and do not want to learn the flags.** Follow
+[Getting started](#getting-started): the benchmark picks them. See
+[docs/web-console.md](docs/web-console.md).
+
+**You have two GPUs and upstream will only use one.** See [docs/pipeline.md](docs/pipeline.md).
+`--pp-size 2` needs neither NCCL nor peer access, so it works on consumer boards where P2P is
+unavailable and on a card sitting in a chipset PCIe 4.0 x4 slot.
+
+**You have 64 GB of RAM and the model wants 128.** See [docs/bank-ram.md](docs/bank-ram.md).
+Read it before you conclude the design is slow: one `read_ahead_kb` setting outside the engine is
+worth 2.5x on its own.
+
+**You have an RTX 2060, 2070, 2080, or another Turing (sm_75) card** and upstream fails with
+`an illegal memory access was encountered`, `cudaErrorNoKernelImageForDevice`, or
+`BatchPrefillWithPagedKVCache failed with error unspecified launch failure`. See
+[docs/turing.md](docs/turing.md), which gives all six symptoms, their causes and their fixes.
+Other Turing cards (RTX 2070/2080, T4) should behave like the 2060 but are unverified.
+
+**You want image input on a small card** — Qwen3.8-Flash-Next, Qwen3.6-35B-A3B, Ornith-1.5-35B-A3B.
+Upstream's vision tower lives on the GPU; `--mm-encoder-weights cpu` keeps it off. See
+[docs/image-input.md](docs/image-input.md).
+
+**You are on Ampere or newer.** Nothing here is taken away from you: every Turing change is behind
+a compute-capability check, and the layer split, the bank mapping, image input, `--spec-mtp` and
+`--host-embedding` are architecture-independent. See the "Ampere and newer" section of
+[docs/kai.md](docs/kai.md).
+
+## The web console
+
+`ft mgr` is `ft daemon` with a console served to the browser: nothing to install on the machine
+you look from. `ft daemon` itself stays upstream's, on its own port.
+
+**Benchmark** measures this PC with the model and picks the flags from the numbers. It first runs
+upstream's `ft bench bw` as it is, so the profile the engine reads is measured with this version,
+then PCIe, memory and SSD rates and the model's experts on the CPU at each thread count and on the
+GPU, then, optionally, starts the model again and again with one setting changed per run (expert
+kernels, where experts run, the KV cache, prefill, pipeline split, MTP, context length). Every run
+reads the same prompts, and a change is kept only when a second run confirms it. Every reading is
+drawn as it arrives; the result is a profile in one click, and the profile editor's recommended
+settings follow it.
+
+**Launch profiles** pick the model from `~/models` and the Hugging Face cache and the flags from
+`ft serve`'s own parser, with what each one does. **Recommended** fills in the flags for this PC's
+GPUs, RAM and cores and the checkpoint's config, says why for each, and marks which ones the
+profile already has. Once the model has been benchmarked, it is the benchmark's result.
+
+![Profile editor with recommended settings](assets/kai-console-profile-editor.png)
+
+**The dashboard** shows generation and prompt speed over time, VRAM per GPU split into weights, KV
+cache, expert cache and GDN state, and host RAM.
+
+![Dashboard](assets/kai-console-dashboard.png)
+
+**How experts are served** shows, per layer, how often a routed expert was not on the GPU, and what
+to change about it. With a measurement run it also shows how often each expert was picked, and
+what a bigger cache would hold.
+
+![Expert heatmap](assets/kai-console-heatmap.png)
+
+Other PCs on the LAN can watch everything; starting, stopping and editing from them needs the token
+the console shows on this PC. `ft serve` serves the same dashboard read-only on its own port.
+English or Japanese, following the browser. See [docs/web-console.md](docs/web-console.md).
+
+## What the benchmark chooses from
+
+Upstream FreeToken serves one model on one GPU, on Ampere (RTX 30 series) or newer. Underneath the
+console, this fork changes the engine in nine ways. The benchmark picks among their flags for you;
+the right-hand column is for when you want to set one yourself. They are independent — take one,
+ignore the rest.
 
 | | What it does | How you ask for it |
 |---|---|---|
@@ -24,7 +137,6 @@ This fork adds ten things on top of it. They are independent — take one, ignor
 | 7 | **A KV cache 1.9x or 3.6x smaller**, stored as block-quantized codes: 1.25 GiB down to 0.35 GiB at 64k on a 6 GB card. It buys VRAM, not speed — past a few thousand tokens of context it costs about a third of the decode rate. Plain paged-attention models and gpt-oss on the Triton backend, and Qwen3.8-Flash-Next on its own sparse backend — where the cost above does not apply: measured on two RTX 3060s, `q4_0` decode is flat from 8k to 125k of context (−1.4%) while the KV drops 1.55 GiB to 0.47 GiB per rank, because its attention reads a fixed budget of tokens however long the context is. On gpt-oss use `q8_0`: it runs gpt-oss-120b at 128k of context on two RTX 3060s, and `q4_0` breaks its answers. | `--kv-cache-dtype q4_0` (gpt-oss: `q8_0`) |
 | 8 | **The checkpoint's bf16 dense weights served as fp8.** Attention, GDN, shared expert, lm_head and the embedding are quantized per output row at load and read W8A16; the router, hyper-connection, QSA indexer, PLE and GDN gates stay bf16. Qwen3.8-Flash-Next's resident dense weights go from 4.9 GB per card to 2.9 GB, and the freed VRAM goes to the expert cache. | `--dense-quant fp8` |
 | 9 | **A prefill chunk sized to the VRAM that is actually free.** Upstream's fixed 8192 needs 0.97 GiB of transient on a 35B MoE; a 6 GB card does not have it, so long prompts crawled and sometimes died. The transient is measured at startup; the chunk itself is solved before every prefill, against the VRAM free at that moment, with `--max-prefill-length` left as the ceiling. Running the GDN and attention over pieces of a chunk, and the MoE over all of it, makes the chunk wider still: a 20k-token prompt went 490 → 722 tok/s on a 2060 and 437 → 546 on two 3060s. | automatic, `--prefill-chunk-budget`; `--prefill-mixer-pieces 2` |
-| 10 | **A browser console instead of the desktop app.** Upstream's desktop app is built for upstream's engine and does not know these flags. `ft mgr` serves a dashboard (speed, VRAM per GPU, host RAM, the expert cache per layer), launch profiles with every `ft serve` flag explained, settings recommended for the PC it runs on, a benchmark that measures the PC with the model and picks the flags from the numbers, and changes suggested from the running server's own measurements. Other PCs on the LAN can watch; operating from them takes a token. | `ft mgr`, then `http://127.0.0.1:1901/ui/` |
 
 Everything else is upstream FreeToken.
 
@@ -125,88 +237,12 @@ The last prefill chunk cannot overlap — its sampled token is the one decoding 
 short prompt sees less of the two-rank speed-up than a long one. [docs/pipeline.md](docs/pipeline.md)
 has the chunk-by-chunk timings.
 
-## Is this for you?
-
-**You have two GPUs and upstream will only use one.** See [docs/pipeline.md](docs/pipeline.md).
-`--pp-size 2` needs neither NCCL nor peer access, so it works on consumer boards where P2P is
-unavailable and on a card sitting in a chipset PCIe 4.0 x4 slot.
-
-**You have 64 GB of RAM and the model wants 128.** See [docs/bank-ram.md](docs/bank-ram.md).
-Read it before you conclude the design is slow: one `read_ahead_kb` setting outside the engine is
-worth 2.5x on its own.
-
-**You have an RTX 2060, 2070, 2080, or another Turing (sm_75) card** and upstream fails with
-`an illegal memory access was encountered`, `cudaErrorNoKernelImageForDevice`, or
-`BatchPrefillWithPagedKVCache failed with error unspecified launch failure`. See
-[docs/turing.md](docs/turing.md), which gives all six symptoms, their causes and their fixes.
-Other Turing cards (RTX 2070/2080, T4) should behave like the 2060 but are unverified.
-
-**You want image input on a small card** — Qwen3.8-Flash-Next, Qwen3.6-35B-A3B, Ornith-1.5-35B-A3B.
-Upstream's vision tower lives on the GPU; `--mm-encoder-weights cpu` keeps it off. See
-[docs/image-input.md](docs/image-input.md).
-
-**You are on Ampere or newer.** Nothing here is taken away from you: every Turing change is behind
-a compute-capability check, and the layer split, the bank mapping, image input, `--spec-mtp` and
-`--host-embedding` are architecture-independent. See the "Ampere and newer" section of
-[docs/kai.md](docs/kai.md).
-
-## The web console
-
-`ft mgr` is `ft daemon` with a console served to the browser: nothing to install on the machine
-you look from. `ft daemon` itself stays upstream's, on its own port.
-
-```bash
-ft mgr --host 0.0.0.0     # then open http://127.0.0.1:1901/ui/
-```
-
-![Dashboard](assets/kai-console-dashboard.png)
-
-**Launch profiles** pick the model from `~/models` and the Hugging Face cache and the flags from
-`ft serve`'s own parser, with what each one does. **Recommended** fills in the flags for this PC's
-GPUs, RAM and cores and the checkpoint's config, says why for each, and marks which ones the
-profile already has.
-
-![Profile editor with recommended settings](assets/kai-console-profile-editor.png)
-
-**How experts are served** shows, per layer, how often a routed expert was not on the GPU, and what
-to change about it. With a measurement run it also shows how often each expert was picked, and
-what a bigger cache would hold.
-
-![Expert heatmap](assets/kai-console-heatmap.png)
-
-**Benchmark** measures this PC with the model and picks the flags from the numbers: PCIe, memory
-and SSD rates, the model's experts computed on the CPU at each thread count and moved to the GPU,
-then, optionally, the model itself started again and again with one setting changed per run
-(expert kernels, where experts run, the KV cache, prefill, pipeline split, MTP, context length),
-keeping only what measured faster. Every reading is drawn as it arrives; the result is a profile in
-one click.
-
-![Benchmark running](assets/kai-console-benchmark.png)
-
-Other PCs on the LAN can watch everything; starting, stopping and editing from them needs the token
-the console shows on this PC. `ft serve` serves the same dashboard read-only on its own port.
-English or Japanese, following the browser. See [docs/web-console.md](docs/web-console.md).
-
-## Install
-
-Source install, same as upstream, plus Pillow for image decoding. torchvision is deliberately not
-required (without it the Qwen VL image processor is loaded as its Pillow backend).
-
-```bash
-git clone https://github.com/yuuki-net/FreeToken-Kai.git && cd FreeToken-Kai
-uv venv && source .venv/bin/activate
-uv pip install -e ".[accel]"
-uv pip install pillow
-```
-
-CUDA kernels are JIT-compiled on first use (CUDA 13 toolkit with `nvcc`, as upstream).
-
 ## Docs
 
 | | |
 |---|---|
+| [docs/web-console.md](docs/web-console.md) | The browser console (`ft mgr`): the benchmark, launch profiles and recommended settings, the dashboard, the expert heatmap, operating from another PC |
 | [docs/kai.md](docs/kai.md) | What the fork adds, tested configurations, Ampere and newer, every flag |
-| [docs/web-console.md](docs/web-console.md) | The browser console (`ft mgr`): dashboard, launch profiles, recommended settings, the benchmark, the expert heatmap, operating from another PC |
 | [docs/pipeline.md](docs/pipeline.md) | Two GPUs, one model (`--pp-size`) |
 | [docs/bank-ram.md](docs/bank-ram.md) | Half the host RAM (`--moe-bank-ram`), and the `read_ahead_kb` that is worth 2.5x |
 | [docs/prefill-chunk.md](docs/prefill-chunk.md) | The prefill chunk: sized to free VRAM (`--prefill-chunk-budget`), and made wider (`--prefill-mixer-pieces`) |

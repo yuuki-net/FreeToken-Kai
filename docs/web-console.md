@@ -76,10 +76,12 @@ A profile is a model, a port and the flags for `ft serve`, kept in `~/.freetoken
   description of the selected flag in the right pane. A `ft serve` line from a launch script can be
   pasted in.
 - **Recommended**: the flags this fork's measurements point to for this PC's GPUs, RAM and cores
-  and the checkpoint's `config.json`, each with its reason. They are compared with the profile:
-  **not set**, **different value** (current -> recommended) and **already set**. **Apply all**
-  applies only the first two. The context length it proposes is one that starts on the card, not
-  a prediction of the most that fits.
+  and the checkpoint's `config.json`, each with its reason. Once the model has been benchmarked on
+  this PC, the benchmark's measured flags take their place (see [Benchmark](#benchmark)). They are
+  compared with the profile: **not set**, **different value** (current -> recommended), **drop**
+  (a flag the benchmark removed) and **already set**. **Apply all** applies all but the last. The
+  context length the rules propose is one that starts on the card, not a prediction of the most
+  that fits.
 - **From measurements** (while the server runs): changes read off the running server, each
   applicable with one click: collecting expert statistics, more RAM for the expert banks, more
   expert slots from free VRAM, a longer context once the free VRAM is known, or a shorter one to
@@ -89,13 +91,21 @@ A profile is a model, a port and the flags for `ft serve`, kept in `~/.freetoken
 
 ## Benchmark
 
+![Benchmark running](../assets/kai-console-benchmark.png)
+
 **Benchmark** in the header measures this PC with a model and settles the flags on the numbers,
 drawn live on a speedometer while it runs. It needs the GPU: the server `ft mgr` runs is stopped
 first and started again with its own settings at the end, whether the run finished, failed or was
 cancelled. A server started outside `ft mgr` is not touched, and the benchmark refuses to start
 while one holds the GPU.
 
-1. **Hardware** (a few minutes, `webui/hwbench.py` in a child process): PCIe transfer per GPU
+1. **Upstream's measurement** (a few minutes per GPU): `ft bench bw --gpu <n>` runs as it is, the
+   same command the desktop app runs, on every GPU. It rewrites the profile the engine reads
+   (`~/.cache/freetoken/benchbw/<gpu-uuid>.json`: hybrid or offload per expert format, and the
+   hybrid fetch split), so everything after it runs on figures measured with this version. The
+   version is written into the profile; the setup card lists each GPU's profile with the version
+   that measured it, and a profile from the desktop app or an older `ft bench bw` shows none.
+2. **Hardware** (a few minutes, `webui/hwbench.py` in a child process): PCIe transfer per GPU
    against the link's theoretical rate, the memory read rate, reading the model's own file from the
    SSD with its page cache dropped, the model's experts computed on the CPU at each thread count,
    the experts moved to each GPU, and both at once. These are upstream's `ft bench bw` kernels
@@ -103,34 +113,70 @@ while one holds the GPU.
    - `--moe-strategy`: `hybrid` when computing on the CPU is more than twice the transfer to the
      slowest GPU, `offload` otherwise (upstream's rule).
    - `--moe-cpu-threads`: the fewest threads within 95% of the best, not the maximum.
-   - The figures are also merged into the GPU's `ft bench bw` profile, which the engine reads for
-     the hybrid fetch split (`--moe-hybrid-max-fetch -1`, the default).
-2. **Real runs** (optional; about an hour on two RTX 3060s in the standard mode, two in the
-   thorough one). Setting A is the recommended settings plus the above. Each later run changes one
-   thing from the best so far (`webui/search.py`) and is kept only when it measured faster; what is
+   - These figures stay in the result; the profile is `ft bench bw`'s alone.
+3. **Real runs** (optional). Setting A is the recommended settings plus the above. Each later run
+   is a fresh `ft serve` with one thing changed from the best so far (`webui/search.py`); what is
    kept is carried on and can open or close later candidates (a chunk budget of 0.9 is tried only
-   after 0.75 was kept). Each run is a fresh `ft serve`:
-   - prompt processing: two prompts of 16,384 tokens cut from this repository's own documents and
-     code, each opened with a unique line so nothing comes from the prefix cache;
-   - generation: the median of three 300-token generations continuing prose, and, for a model with
-     MTP weights, three more continuing Python, since MTP drafts far better on code.
-   - **Standard** tries what has helped on some machine: offload instead of hybrid, the CPU thread
-     count, each expert kernel, a 16-bit KV cache, prefill overlap, a chunk budget of 0.75, four
-     prefill pieces, moving the pipeline split one layer, pinned PLE, MTP 3 and 5.
-   - **Thorough** adds what has not helped so far: no hybrid fetch, the linear kernels, a q4_0 KV
-     cache, device-side copies of cache hits, chunk budget 0.9, one piece, a 16k prefill length,
-     no host embedding, bf16 dense weights, the split moved two layers, `--pp-send-ahead` and
-     `--pp-prefill-group`.
+   after 0.75 was kept).
+   - **Prompt processing**: two prompts cut from this repository's own documents and code, trimmed
+     with the model's tokenizer to 16,384 tokens or to what the context allows. Every run reads the
+     same two texts: on two RTX 3060s one 16k excerpt ran at 509 tok/s and another at 636 under the
+     same flags, so different text per run would outweigh most settings. Only the first line differs
+     per run, so nothing comes from the prefix cache.
+   - **Generation**: one untimed warm-up, then the best of three 300-token generations continuing
+     prose, and, for a model with MTP weights, the same on Python, where MTP drafts far better. An
+     MTP model is measured on Python in every run, not only the MTP ones, and a verdict compares
+     prose with prose and code with code. The
+     first 60 tokens of each are not timed (the expert cache is still filling for that text), and
+     the best rather than the median counts because other programs on a PC in daily use only ever
+     slow a run down.
+   - **Kept**: a change is kept when prompt processing gains 5% or generation gains 3% while the
+     other holds (90% for prompt processing, 97% for generation), whatever the change was tried for.
+     A 16-bit KV cache is tried for generation, yet on two RTX 3060s it doubled prompt processing.
+   - **Measured twice**: a change that clears the bar is started and measured again, and is kept
+     only when that run clears it too. The slower figures of the two become the bar for what
+     follows, so one lucky run cannot raise it.
+   - **Generation that swings**: a change that gained prompt processing but fell short on
+     generation, by no more than 20%, is judged again against the current settings started once
+     more right then. On an RTX 2060
+     that also drives the display, generation for the same flags ranged from 28 to 38 tok/s between
+     starts.
+   - **A run that fails** is marked failed and the next one starts. A server whose backend died
+     cannot answer the stop's accounting request, so the switch is then forced; a prompt is given up
+     when its progress counter stands still for 5 minutes or cannot be read for 1 minute.
+   - **Standard** tries the settings with the largest effects on the machines this fork was measured
+     on (an RTX 2060 and two RTX 3060s): offload instead of hybrid, the CPU thread count, each
+     expert kernel this PC can run, a 16-bit KV cache, prefill overlap, a chunk budget of 0.75, four
+     prefill pieces, moving the pipeline split one layer, pinned PLE, MTP 3 and 5. Other hardware can
+     differ, which is what thorough is for.
+   - **Thorough** adds the finer settings, which did not help on those machines: computing every
+     missing expert on the CPU, the linear kernels, a q4_0 KV cache, device-side copies of cache
+     hits, chunk budget 0.9, one piece, a 16k prefill length, no host embedding, bf16 dense weights,
+     the split moved two layers, `--pp-send-ahead` and `--pp-prefill-group`.
+   - Kernels this PC cannot run are not started: marlin without vLLM, b12x below sm_120. They are
+     listed with the reason among what was not measured.
    - **Main use** (prose, code or both) decides a change that helps one and hurts the other, such
      as MTP.
    - Longer context tiers come last, on everything kept, and are kept while generation stays
-     within 5% and prompt processing within 10%. A pre-Ampere card that cannot load the model in
-     float16 is retried without `--dtype`.
+     within 5% and prompt processing within 10%. A pre-Ampere card whose model does not load in
+     float16 is retried without `--dtype` (only a failed load, not a failed measurement).
    - Not searched, with the reason on the result page: `--memory-ratio` (the risk is later VRAM use
      by other programs, which a benchmark cannot see), `--max-running-req` and
      `--cuda-graph-max-bs` (throughput, not one person's speed), `--moe-cpu-layers` and
      `--attention-backend` (auto already picks what starts), and the settings that decide what fits
      rather than how fast.
+   - Time depends on the GPUs and the model: two RTX 3060s with Flash-Next take about 1.5-2 hours in
+     standard mode and about 3 in thorough mode (29 starts of about 6 minutes each), an RTX 2060
+     with Ornith about an hour in standard mode. While it runs, the header shows the time left,
+     worked out from the runs so far.
+
+While it runs, the dial shows the reading being taken, the chart under it the readings of that step
+over time (or per thread count), and the list one row per run with its figures and verdict; the
+candidates not tried yet are listed below as planned.
+
+The recommended settings in a profile follow the last benchmark of that model: its measured flags
+and reasons win over the rules, changes it tried and did not keep are not offered, and a flag it
+dropped is offered for removal. A benchmark from another version asks to be run again.
 
 The result lists each flag as **measured** or **rule** with its reason, and can be saved as a new
 profile, merged into a profile for the same model, or started directly. The last result per model
@@ -156,8 +202,10 @@ is kept in `~/.freetoken/mgr/tune/`.
 Every rank writes a small JSON file every 2 seconds to `$TMPDIR/freetoken-webstats-<port>/`
 (`scheduler/webstats.py`). A file rather than the reply stream, because under `--pp-size` only
 rank 0 talks to the HTTP server. Device counters are copied without blocking decode, behind a
-CUDA event, and read on a later tick. The server (`server/kai_api.py`) sums the ranks into
-`/v1/stats`'s `kai` block and `/v1/kai/experts`. The per-expert counts go to a separate file every
+CUDA event, and read on a later tick. Each rank also reports the VRAM of its own KV cache, expert cache and GDN
+state, read from its allocated pools, so under `--pp-size` every GPU's bar is split, not only the
+first one's. The server (`server/kai_api.py`) sums the ranks into `/v1/stats`'s `kai` block and
+`/v1/kai/experts`. The per-expert counts go to a separate file every
 10 seconds and are returned only with `?freq=true`.
 
 ## Limits
