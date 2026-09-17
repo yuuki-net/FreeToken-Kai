@@ -127,6 +127,7 @@ def kai_block(state: Any) -> dict | None:
             "rank": r.get("rank"), "index": g.get("index"), "name": g.get("name"),
             "total_bytes": g["total_bytes"], "used_bytes": used, "reserved_bytes": g["reserved_bytes"],
             "layers": [lr[0], lr[1] - 1] if lr else None,
+            "pools": r.get("pools"),
             "age_s": round(now - r.get("time", now), 1),
         })
     return {

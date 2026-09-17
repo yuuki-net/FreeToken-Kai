@@ -157,6 +157,7 @@ class WebStatsPublisher:
             snap["kv"] = {"used_pages": used, "total_pages": total, "page_size": cfg.page_size}
         except Exception:  # noqa: BLE001
             pass
+        snap["pools"] = _pool_bytes(eng)
         snap["prefill_chunk"] = getattr(eng, "_prefill_chunk_logged", None) or getattr(s, "prefill_budget", None)
         if cache is not None:
             snap["moe_static"] = {
@@ -196,7 +197,7 @@ class WebStatsPublisher:
             "time": time.time(), "started": self.started,
             "layer_range": list(getattr(cfg, "pp_layer_range", None) or []) or None,
             "spec_k": int(getattr(cfg, "spec_mtp", 0) or 0),
-            "gpu": snap.get("gpu"), "kv": snap.get("kv"), "moe": snap.get("moe_static"),
+            "gpu": snap.get("gpu"), "pools": snap.get("pools"), "kv": snap.get("kv"), "moe": snap.get("moe_static"),
             "prefill_chunk": snap.get("prefill_chunk"),
             "cumulative": cum, "windows": windows,
         }
@@ -218,6 +219,23 @@ class WebStatsPublisher:
             "cumulative": {"seconds": now - self._freq_history[0][0], "freq": freq.tolist()},
             "windows": windows,
         })
+
+
+def _pool_bytes(engine: Any) -> dict | None:
+    """VRAM of this rank's own cache pools, from its allocated tensors (the same figures the
+    rebuild log prints). None when they cannot be read; never raises."""
+    try:
+        from freetoken.kvcache.cache_status import compute_cache_pools, compute_cache_unit_bytes
+
+        pools, unit = compute_cache_pools(engine), compute_cache_unit_bytes(engine)
+        return {
+            "kv": pools["num_pages"] * pools["page_size"] * unit["kv_bytes_per_token"]
+            + pools["num_swa_pages"] * pools["swa_page_size"] * unit["swa_bytes_per_token"],
+            "moe": pools["moe_cache_size"] * unit["moe_bytes_per_expert"],
+            "mamba": pools["num_mamba_slots"] * unit["mamba_bytes_per_slot"],
+        }
+    except Exception:  # noqa: BLE001 -- the dashboard falls back to rank 0's geometry
+        return None
 
 
 def _write_json(path: str, doc: dict) -> None:

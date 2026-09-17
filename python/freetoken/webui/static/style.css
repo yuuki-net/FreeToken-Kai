@@ -127,18 +127,30 @@ dialog.pe input, dialog.pe select, dialog.pe textarea { box-sizing: border-box; 
 .bm-flag code { font-family: var(--mono); font-size: 12px; font-weight: 600; white-space: nowrap; }
 table.bm-trials td.win, table.bm-trials th.win { background: var(--ok-bg); }
 .bm-steps { max-height: 560px; overflow-y: auto; position: relative; }
+/* setup: a heading and its note on their own lines, choices whose text wraps beside the control */
+.bm-group { display: flex; flex-direction: column; gap: 2px; }
+.bm-group > .muted { margin-bottom: 4px; }
+.bm-choice { display: grid; grid-template-columns: 18px 1fr; column-gap: 8px; align-items: start; padding: 2px 0; cursor: pointer; }
+.bm-choice > input { margin: 3px 0 0; }
+.bm-choice > span { display: flex; flex-direction: column; gap: 1px; min-width: 0; }
 .bm-steps li.two { align-items: flex-start; }
 .bm-steps li.two .grow { min-width: 0; }
 .bm-steps li.two .val2 { display: block; margin-top: 2px; font-size: 12px; font-weight: 400; color: var(--fg2); font-variant-numeric: tabular-nums; }
 .bm-steps li.planned { color: var(--fg3); }
+.bm-steps li.two .bm-row-title { display: block; }
+.bm-steps li.two .bm-row-detail { display: block; font-size: 12px; font-weight: 400; color: var(--fg3); line-height: 1.45; }
+.bm-now-sub { font-size: 12px; color: var(--fg3); margin-top: 2px; }
 .heat-strip { display: flex; gap: 1px; height: 28px; border-radius: 4px; overflow: hidden; }
 .heat-cell { flex: 1; min-width: 0; }
 .heat-ticks { display: flex; gap: 1px; font-size: 10px; color: var(--fg3); height: 14px; white-space: nowrap; }
 .heat-scale { display: inline-block; width: 120px; height: 10px; border-radius: 2px; background: linear-gradient(90deg, var(--tile), var(--c-ssd)); box-shadow: inset 0 0 0 1px var(--line); }
-.legend.one-line { flex-wrap: nowrap; gap: 10px; white-space: nowrap; overflow: hidden; }
+.legend.one-line { gap: 4px 12px; white-space: nowrap; }
 .icon-btn { width: 30px; height: 30px; padding: 0; display: inline-flex; align-items: center; justify-content: center; }
 .icon-btn svg { width: 16px; height: 16px; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
 .icon-btn.go { color: var(--accent); }
 .icon-btn.go svg, .icon-btn.stop svg { fill: currentColor; stroke: none; }
 .icon-btn:disabled.go { color: var(--fg3); }
 .demo-flag { position: fixed; right: 12px; bottom: 12px; z-index: 9; }
+
+/* Japanese wraps between phrases, not inside a word (Chrome 119+; others keep the default) */
+:lang(ja) body { word-break: auto-phrase; }

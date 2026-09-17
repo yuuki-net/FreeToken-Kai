@@ -12,21 +12,28 @@
 
   <section class="card" id="bm-setup">
     <h2 data-i18n="bm_title"></h2>
-    <p class="hint" data-i18n="bm_hint"></p>
+    <p class="hint" style="white-space:pre-line" data-i18n="bm_hint"></p>
     <div class="stack" style="gap:10px;max-width:720px">
       <label class="small"><span data-i18n="pe_model"></span>
         <select id="bm-model" style="width:100%;margin-top:2px"></select></label>
-      <label class="small" style="display:flex;gap:8px;align-items:flex-start">
-        <input type="checkbox" id="bm-trials" checked style="margin-top:4px">
-        <span><b data-i18n="bm_trials"></b><br><span class="muted" data-i18n="bm_trials_hint"></span></span></label>
-      <div id="bm-opts" class="small" style="display:flex;gap:24px;flex-wrap:wrap">
-        <div><div class="muted" data-i18n="bm_mode"></div>
-          <label><input type="radio" name="bm-mode" value="standard" checked> <span data-i18n="bm_mode_standard"></span></label><br>
-          <label><input type="radio" name="bm-mode" value="thorough"> <span data-i18n="bm_mode_thorough"></span></label></div>
-        <div><div class="muted" data-i18n="bm_use"></div>
-          <label><input type="radio" name="bm-use" value="both" checked> <span data-i18n="bm_use_both"></span></label><br>
-          <label><input type="radio" name="bm-use" value="code"> <span data-i18n="bm_use_code"></span></label><br>
-          <label><input type="radio" name="bm-use" value="prose"> <span data-i18n="bm_use_prose"></span></label></div>
+      <label class="bm-choice small">
+        <input type="checkbox" id="bm-trials" checked>
+        <span><b data-i18n="bm_trials"></b><span class="muted" data-i18n="bm_trials_hint"></span><span class="muted" data-i18n="bm_trials_off"></span></span></label>
+      <div id="bm-profiles" class="bm-group small"></div>
+      <div id="bm-opts" class="stack small" style="gap:12px">
+        <div class="bm-group">
+          <b data-i18n="bm_mode"></b><span class="muted" data-i18n="bm_mode_time"></span>
+          <label class="bm-choice"><input type="radio" name="bm-mode" value="standard" checked>
+            <span><span data-i18n="bm_mode_standard"></span><span class="muted" data-i18n="bm_mode_standard_sub"></span></span></label>
+          <label class="bm-choice"><input type="radio" name="bm-mode" value="thorough">
+            <span><span data-i18n="bm_mode_thorough"></span><span class="muted" data-i18n="bm_mode_thorough_sub"></span></span></label>
+        </div>
+        <div class="bm-group">
+          <b data-i18n="bm_use"></b><span class="muted" data-i18n="bm_use_sub"></span>
+          <label class="bm-choice"><input type="radio" name="bm-use" value="both" checked><span data-i18n="bm_use_both"></span></label>
+          <label class="bm-choice"><input type="radio" name="bm-use" value="code"><span data-i18n="bm_use_code"></span></label>
+          <label class="bm-choice"><input type="radio" name="bm-use" value="prose"><span data-i18n="bm_use_prose"></span></label>
+        </div>
       </div>
       <div id="bm-warn" class="small" hidden></div>
       <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
@@ -48,7 +55,7 @@
       <div class="card bm-gauge-wrap">
         <canvas id="bm-gauge" style="display:block;margin:0 auto;width:100%;max-width:460px;height:290px"></canvas>
         <div class="bm-now" id="bm-now"></div>
-        <canvas id="bm-spark" style="width:100%;height:70px;margin-top:6px"></canvas>
+        <canvas id="bm-spark" style="width:100%;height:170px;margin-top:10px"></canvas>
       </div>
       <div class="card">
         <ul class="bm-steps" id="bm-steps"></ul>

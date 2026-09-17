@@ -315,41 +315,6 @@ def derive(m: dict, threshold: float = 2.0) -> list[dict]:
     return notes
 
 
-def update_bench_profile(gpu: dict, fmt: str, wl, m: dict) -> str | None:
-    """Merge this model's figures into the GPU's ``ft bench bw`` profile, keeping other formats."""
-    from freetoken.moe.bench_profile import default_profile_path
-    from freetoken.moe.benchbw import _atomic_write_json
-
-    cpu, g, ov = m.get("cpu_moe"), (m.get("gather") or {}).get(str(gpu["index"])), m.get("overlap")
-    if not (g and cpu):
-        return None
-    path = default_profile_path(gpu.get("uuid"))
-    try:
-        with open(path) as fh:
-            prof = json.load(fh)
-    except (OSError, ValueError):
-        prof = {"version": 4, "threshold": 2.0, "dtypes": {}, "dtype_kernels": {}, "workloads": {}}
-    rec = "hybrid" if cpu["best_gbs"] > 2.0 * g["gbs"] else "offload"
-    prof.setdefault("dtypes", {})[fmt] = rec
-    prof.setdefault("dtype_kernels", {})[fmt] = {
-        "expert_bytes": cpu.get("expert_bytes"), "cpu_moe_gbs": cpu["best_gbs"], "pcie_gather_gbs": g["gbs"],
-        "cpu_moe_overlap_gbs": (ov or {}).get("cpu_gbs"), "pcie_gather_overlap_gbs": (ov or {}).get("pcie_gbs"),
-        "ratio": round(cpu["best_gbs"] / g["gbs"], 3) if g["gbs"] else None, "recommended": rec,
-        "note": f"ft mgr benchmark, {wl.name}",
-    }
-    prof["gpu"] = {"index": gpu["index"], "name": gpu["name"], "uuid": gpu.get("uuid")}
-    prof["epoch"] = int(time.time())
-    prof.setdefault("ceilings", {}).update({
-        k: v for k, v in {
-            "cpu_stream_read_gbs": (m.get("ram") or {}).get("read_gbs"),
-            "pcie_linear_h2d_gbs": ((m.get("pcie") or {}).get(str(gpu["index"])) or {}).get("h2d_gbs"),
-            "pcie_linear_d2h_gbs": ((m.get("pcie") or {}).get(str(gpu["index"])) or {}).get("d2h_gbs"),
-        }.items() if v is not None
-    })
-    _atomic_write_json(path, prof)
-    return path
-
-
 # ------------------------------------------------------------------ run
 def run(model_path: str) -> dict:
     wl, fmt = workload_of(model_path)
@@ -394,13 +359,8 @@ def run(model_path: str) -> dict:
         if cpu_capable and gpus and m.get("cpu_moe"):
             m["overlap"] = guarded("overlap", step_overlap, fmt, wl, gpus[0]["index"], m["cpu_moe"]["threads"])
     notes = derive(m)
-    profile = None
-    if wl is not None and gpus:
-        try:
-            profile = update_bench_profile(gpus[0], fmt, wl, m)
-        except Exception:  # noqa: BLE001 -- the record is a convenience, the result stands without it
-            profile = None
-    result = {"measurements": m, "notes": notes, "bench_profile": bool(profile)}
+    # upstream's profile is ft bench bw's alone (the job runs it first): these figures stay in the result
+    result = {"measurements": m, "notes": notes}
     emit("result", **result)
     return result
 

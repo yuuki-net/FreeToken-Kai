@@ -31,8 +31,10 @@ if (FT.demo) {
         spec: { k: 2, tokens_per_step: 2.42, accept_rate: 0.71 },
         prefill: { chunk: 4096, auto: true },
         gpus: [
-          { rank: 0, index: 0, name: "NVIDIA GeForce RTX 3060", total_bytes: 12 * GiB, used_bytes: 11.2 * GiB, reserved_bytes: 10.6 * GiB, layers: [0, 23] },
-          { rank: 1, index: 1, name: "NVIDIA GeForce RTX 3060", total_bytes: 12 * GiB, used_bytes: 10.8 * GiB, reserved_bytes: 10.7 * GiB, layers: [24, 47] },
+          { rank: 0, index: 0, name: "NVIDIA GeForce RTX 3060", total_bytes: 12 * GiB, used_bytes: 11.2 * GiB, reserved_bytes: 10.6 * GiB, layers: [0, 23],
+            pools: { kv: 1.2 * GiB, moe: 4.6 * GiB, mamba: 0.3 * GiB } },
+          { rank: 1, index: 1, name: "NVIDIA GeForce RTX 3060", total_bytes: 12 * GiB, used_bytes: 10.8 * GiB, reserved_bytes: 10.7 * GiB, layers: [24, 47],
+            pools: { kv: 1.2 * GiB, moe: 5.1 * GiB, mamba: 0.3 * GiB } },
         ],
       },
     }),

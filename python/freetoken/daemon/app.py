@@ -548,11 +548,19 @@ def build_app(
             from freetoken.webui.recommend import recommend as build
 
             try:
-                return await run(console_pool, build, model)
+                rec = await run(console_pool, build, model)
             except ValueError as exc:
                 raise HTTPException(status_code=400, detail=str(exc))
             except Exception as exc:  # noqa: BLE001
                 raise HTTPException(status_code=500, detail=f"could not build a recommendation: {exc}")
+            # measured on this PC beats the rules: otherwise the two pages disagree about the same model
+            tune = getattr(app.state, "tune", None)
+            if tune is not None:
+                from freetoken.webui.models import resolve_model
+                from freetoken.webui.tuner import with_benchmark
+
+                rec = with_benchmark(rec, tune.last(resolve_model(model)))
+            return rec
 
         @app.get("/serve-flags", dependencies=auth)
         async def serve_flags():
@@ -605,6 +613,12 @@ def build_app(
         @app.get("/tune/status", dependencies=auth)
         async def tune_status(since: int = 0):
             return tune.status(since)
+
+        @app.get("/tune/profiles", dependencies=auth)
+        async def tune_profiles():
+            from freetoken.webui.tuner import bench_profiles
+
+            return await run(console_pool, bench_profiles)
 
         @app.get("/tune/last", dependencies=auth)
         async def tune_last(model: str):

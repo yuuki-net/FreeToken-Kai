@@ -121,9 +121,9 @@
     const mamba = (geo.num_mamba_slots || 0) * (ub.mamba_per_slot || 0);
     const moe = (geo.moe_cache_size || 0) * (ub.moe_per_expert || 0);
     if (kaiGpus?.length) {
-      // pools are known for rank 0's allocation; under pp the other ranks size theirs the same way
-      rows = kaiGpus.map((g) => ({ ...g, pools: g.rank === 0 ? { kv, moe, mamba } : {} }));
-      $("#gpu-hint").textContent = t(kaiGpus.length > 1 ? "dash_gpu_hint_multi" : "dash_gpu_hint_measured");
+      // each rank reports its own pools; a server from before that knew only rank 0's, from the geometry
+      rows = kaiGpus.map((g) => ({ ...g, pools: g.pools || (g.rank === 0 ? { kv, moe, mamba } : {}) }));
+      $("#gpu-hint").textContent = t(kaiGpus.length < 2 ? "dash_gpu_hint_measured" : kaiGpus.every((g) => g.pools) ? "dash_gpu_hint_multi" : "dash_gpu_hint_multi_first");
     } else {
       const g = (stats.gpus || [])[0];
       if (!g) { root.innerHTML = `<div class="muted small">${esc(t("dash_gpu_none"))}</div>`; return; }

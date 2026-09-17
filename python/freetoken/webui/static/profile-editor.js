@@ -277,6 +277,12 @@ const FTProfileEditor = (() => {
     function setFlag(flag, value) {
       const f = meta?.byName.get(flag);
       let row = rows.find((r) => (f && r.meta === f) || r.spelling === flag);
+      if (value === null) {  // the recommendation drops this flag
+        if (row) rows.splice(rows.indexOf(row), 1);
+        selected = Math.min(selected, rows.length - 1);
+        renderRows(); renderList();
+        return;
+      }
       if (!row) { row = { spelling: f?.flag || flag, meta: f || null, value: "", extra: [] }; rows.push(row); }
       row.value = value ?? "";
       selected = rows.indexOf(row);
@@ -312,6 +318,7 @@ const FTProfileEditor = (() => {
     function recState(n) {
       const f = meta?.byName.get(n.flag);
       const row = rows.find((r) => (f && r.meta === f) || r.spelling === n.flag);
+      if (n.removed) return { state: row ? "remove" : "set" };
       if (!row) return { state: "add" };
       const want = String(n.value ?? "").trim(), have = String(row.value ?? "").trim();
       if (f?.kind === "bool" || !want || homePath(want) === homePath(have)) return { state: "set" };
@@ -328,15 +335,15 @@ const FTProfileEditor = (() => {
       ].filter(Boolean).join(" · ");
       const notes = rec.notes.map((n) => ({ ...n, ...recState(n) }));
       const todo = notes.filter((n) => n.state !== "set"), done = notes.filter((n) => n.state === "set");
-      const pair = (n) => [{ flag: n.flag, value: n.value || "" }];
-      const flagText = (n) => `${esc(n.flag)}${n.value ? " " + esc(homePath(n.value)) : ""}`;
+      const pair = (n) => [{ flag: n.flag, value: n.removed ? null : n.value || "" }];
+      const flagText = (n) => (n.removed ? `<s>${esc(n.flag)}</s>` : `${esc(n.flag)}${n.value ? " " + esc(homePath(n.value)) : ""}`);
       const item = (n) => {
-        const badge = n.state === "set" ? "pe_rec_set" : n.state === "change" ? "pe_rec_change" : "pe_rec_add";
+        const badge = n.state === "set" ? (n.removed ? "pe_rec_absent" : "pe_rec_set") : n.state === "change" ? "pe_rec_change" : n.state === "remove" ? "pe_rec_remove" : "pe_rec_add";
         const pill = `<span class="pill ${n.state === "set" ? "" : "warn"}" style="font-size:11px;padding:0 8px">${esc(t(badge))}</span>`;
         const change = n.state === "change"
           ? `<div class="small" style="margin-top:2px">${esc(t("pe_rec_now"))} <code>${esc(homePath(n.have))}</code> → <code>${esc(homePath(n.value))}</code></div>` : "";
         const action = n.state === "set" ? ""
-          : `<button type="button" style="flex-shrink:0" data-set='${esc(JSON.stringify(pair(n)))}'>${esc(t(n.state === "change" ? "pe_rec_do_change" : "pe_apply"))}</button>`;
+          : `<button type="button" style="flex-shrink:0" data-set='${esc(JSON.stringify(pair(n)))}'>${esc(t(n.state === "change" ? "pe_rec_do_change" : n.state === "remove" ? "pe_rec_do_remove" : "pe_apply"))}</button>`;
         return `<div class="kv" style="align-items:flex-start;gap:12px;padding:6px 0;${n.state === "set" ? "opacity:.6" : ""}">
             <span style="flex:1;min-width:0"><span style="display:flex;gap:8px;align-items:center;flex-wrap:wrap"><code>${flagText(n)}</code>${pill}</span>
               ${change}<div class="small muted" style="margin-top:2px">${esc(FTI18N.lang === "en" && n.why_en ? n.why_en : n.why)}</div></span>${action}
@@ -350,7 +357,11 @@ const FTProfileEditor = (() => {
       advice(t("pe_recommend"), `<div class="small muted">${esc(host)}</div>
         <div style="margin-top:10px;display:flex;gap:12px;align-items:center">${applyAll}
           <span class="small"><b>${esc(summary)}</b></span></div>
-        <div class="small muted" style="margin-top:6px">${esc(t("pe_recommend_note"))}</div>
+        <div class="small ${rec.benchmark ? "" : "muted"}" style="margin-top:6px">${esc(rec.benchmark
+          ? t("pe_recommend_bench", { when: rec.benchmark.finished ? new Date(rec.benchmark.finished * 1000).toLocaleString(FTI18N.lang === "ja" ? "ja-JP" : "en-US") : "—" })
+          : t("pe_recommend_note"))}</div>
+        ${rec.benchmark && rec.benchmark.version !== rec.benchmark.current
+          ? `<div class="small warn-text" style="margin-top:4px">${esc(t("pe_recommend_bench_old", { then: rec.benchmark.version || "—", now: rec.benchmark.current }))}</div>` : ""}
         <div style="margin-top:8px;max-height:240px;overflow:auto">
           ${todo.map(item).join("")}
           ${done.length && todo.length ? `<div class="pe-cat" style="position:static;padding:6px 0 2px">${esc(t("pe_rec_set_head"))}</div>` : ""}

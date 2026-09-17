@@ -5,13 +5,14 @@ reason it is not measured. A candidate is one change against the best settings f
 tuner keeps it only when the measurement says so (``keep``). Which candidates apply depends on the
 model (MoE, GDN, MTP head, expert format), the host (GPUs, their links, RAM) and the base flags.
 
-"standard" runs the candidates that have moved speed somewhere in this fork's measurements;
+"standard" runs the candidates that moved speed in this fork's measurements (an RTX 2060, two RTX 3060s);
 "thorough" adds the ones that have not, or only rarely, so a machine unlike ours gets the chance.
 
 stdlib only: the manager imports this."""
 
 from __future__ import annotations
 
+import importlib.util
 from dataclasses import dataclass, field
 
 # the expert formats whose kernels --quant-backend can pick, as ft serve names them
@@ -78,7 +79,46 @@ def expert_format(quant: str | None) -> str | None:
     return None
 
 
-def plan(args: list[str], facts: dict, hw: dict, mode: str = "standard") -> list[Candidate]:
+def installed_modules() -> set[str]:
+    """The optional packages some kernels need; ft serve runs in the same environment as ft mgr."""
+    out = set()
+    for name in ("vllm", "flashinfer"):
+        try:
+            if importlib.util.find_spec(name) is not None:
+                out.add(name)
+        except (ImportError, ValueError):
+            pass
+    return out
+
+
+def kernel_unusable(name: str, hw: dict, modules: set[str]) -> tuple[str, str] | None:
+    """Why a kernel cannot run on this PC (the same checks the engine makes when it loads), or None."""
+    caps = [g.get("compute_cap") for g in ((hw or {}).get("measurements") or {}).get("gpus") or [] if g.get("compute_cap")]
+    if name == "marlin" and "vllm" not in modules:
+        return "vLLM が入っていないので使えない。", "vLLM is not installed."
+    if name == "b12x":
+        if caps and min(caps) < 12.0:
+            return f"sm_120 以上の GPU が必要（この GPU は sm_{int(min(caps) * 10)}）。", f"Needs an sm_120 GPU or newer (this one is sm_{int(min(caps) * 10)})."
+        if "flashinfer" not in modules:
+            return "flashinfer が入っていないので使えない。", "flashinfer is not installed."
+    return None
+
+
+def unavailable(facts: dict, hw: dict, modules: set[str] | None = None) -> list[dict]:
+    """The kernels left out of the plan, for the page's list of what was not measured."""
+    modules = installed_modules() if modules is None else modules
+    fmt = expert_format(facts.get("quant")) if facts.get("num_experts") else None
+    out = []
+    for kind, table in (("moe", MOE_KERNELS), ("linear", LINEAR_KERNELS)):
+        for name in table.get(fmt or "", ()):
+            why = kernel_unusable(name, hw, modules)
+            if why:
+                out.append({"flag": f"--quant-backend {kind}.{fmt}={name}", "why": why[0], "why_en": why[1]})
+    return out
+
+
+def plan(args: list[str], facts: dict, hw: dict, mode: str = "standard", modules: set[str] | None = None) -> list[Candidate]:
+    modules = installed_modules() if modules is None else modules
     m = (hw or {}).get("measurements") or {}
     is_moe = bool(facts.get("num_experts"))
     model_type = facts.get("model_type")
@@ -120,9 +160,13 @@ def plan(args: list[str], facts: dict, hw: dict, mode: str = "standard") -> list
         # --- kernels for the expert format
         fmt = expert_format(facts.get("quant"))
         for name in MOE_KERNELS.get(fmt or "", ()):
+            if kernel_unusable(name, hw, modules):
+                continue
             add(Candidate(f"kernel_moe_{name}", {"--quant-backend": f"moe.{fmt}={name}"}, goal="either",
                           what_ja=f"エキスパートの {fmt} カーネルを {name} にする", what_en=f"run the {fmt} experts with the {name} kernel"))
         for name in LINEAR_KERNELS.get(fmt or "", ()):
+            if kernel_unusable(name, hw, modules):
+                continue
             add(Candidate(f"kernel_linear_{name}", {"--quant-backend": f"linear.{fmt}={name}"}, goal="either", thorough=True,
                           what_ja=f"エキスパート以外の {fmt} 層のカーネルを {name} にする（その形式の層があるときだけ差が出る）",
                           what_en=f"run the non-expert {fmt} layers with the {name} kernel (only matters when there are such layers)"))

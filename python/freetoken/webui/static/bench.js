@@ -4,9 +4,10 @@
 
 FTI18N.add({
   bm_title: "ベンチマークで設定を決める",
-  bm_hint: "この PC とモデルで実際に測り、その結果から ft serve のフラグを決めます。PCIe・メモリ・SSD の速さ、CPU と GPU でのエキスパート処理の速さを測り、必要ならモデルを起動して、効きそうな設定を 1 つずつ実測で比べます。終わったら結果をそのままプロファイルにできます。",
+  bm_hint: "この PC とモデルで実際に測り、その結果から ft serve のフラグを決めます。\nPCIe・メモリ・SSD と、CPU・GPU でのエキスパート処理の速さを測り、モデルを起動して設定を比べます。\n終わったら、結果をそのままプロファイルにできます。",
   bm_trials: "モデルを起動して実測する（おすすめ）",
-  bm_trials_hint: "モデルを何度も起動して、カーネル・エキスパートの置き方・KV・プロンプト処理・MTP・コンテキスト長などを 1 つずつ変え、速くなったものだけを残します。外すとハードウェアだけ測ります（数分）。",
+  bm_trials_hint: "モデルを何度も起動して、設定を 1 つずつ変え、速くなったものだけを残します。",
+  bm_trials_off: "外すと、ハードウェアだけ測ります（数分）。",
   bm_start: "測定を始める", bm_last: "前回の結果を見る", bm_last_when: "前回: {when}",
   bm_running_title: "測定中", bm_cancel: "中止",
   bm_confirm: "測定を始めます。GPU を使うので、動いているサーバ（{model}）は止まり、終わったら同じ設定で起動し直します。",
@@ -16,7 +17,13 @@ FTI18N.add({
   bm_view_only: "この画面から測定を始めるには、この PC で開くかトークンが必要です。",
   bm_external: "ft mgr の管理外で起動したサーバが動いていて、GPU を使っています。止めてから測定してください。",
   bm_busy: "ほかの測定が動いています。",
-  bm_ph_stop: "動いているサーバを止めています", bm_ph_hw: "ハードウェアを測っています", bm_ph_trial: "モデルを起動して測っています",
+  bm_ph_stop: "動いているサーバを止めています", bm_ph_upstream: "upstream の測定（ft bench bw）をしています", bm_ph_hw: "ハードウェアを測っています",
+  bm_s_upstream: "upstream のハードウェア測定（ft bench bw・GPU {gpu}）",
+  bm_prof_title: "エンジンが読む upstream の測定値（ft bench bw）", bm_prof_line: "GPU {gpu} · {name}: 版 {version} で測定（{when}）",
+  bm_prof_unknown: "GPU {gpu} · {name}: 測った版の記録なし（デスクトップアプリか古い ft bench bw）、{when}",
+  bm_prof_none: "まだありません。", bm_prof_stale: "今の版（{current}）では測っていません。",
+  bm_prof_rerun: "ベンチマークは毎回、最初に ft bench bw をそのまま実行してこの値を作り直します。",
+  bm_upstream_tile: "upstream の測定（ft bench bw）", bm_upstream_sub: "版 {version} で測り直し", bm_ph_trial: "モデルを起動して測っています",
   bm_ph_restore: "元のサーバを起動し直しています", bm_ph_done: "終わりました", bm_ph_cancelled: "中止しました", bm_ph_error: "エラーで止まりました",
   bm_s_gpu: "GPU を調べる", bm_s_pcie: "PCIe の転送速度（GPU {gpu}）", bm_s_ram: "メモリの読み出し速度", bm_s_ssd: "SSD からモデルを読む速度",
   bm_s_cpu_moe: "CPU でのエキスパート計算（スレッド数ごと）", bm_s_gather: "GPU へのエキスパート転送（GPU {gpu}）", bm_s_overlap: "CPU 計算と GPU 転送を同時に",
@@ -44,21 +51,23 @@ FTI18N.add({
   bm_flags_note: "「実測」はこの測定の数字から、「目安」は GPU・RAM・モデルの構成から決めた値です。",
   bm_saved: "プロファイルを保存しました。",
   bm_empty_hint: "モデルを選んで「測定を始める」を押してください。", bm_loading_models: "モデルを読み込み中…",
-  bm_mode: "測り方", bm_mode_standard: "標準（これまでに効いたことがある設定を全部。3060×2 で 1 時間前後）",
-  bm_mode_thorough: "徹底（効いたことがない設定も全部。2 時間前後）",
-  bm_use: "主な使い方（MTP のように、文章の種類で効き方が変わる設定の採否に使います）",
+  bm_mode: "測り方", bm_mode_time: "かかる時間は GPU とモデルしだいです（例: RTX 3060×2 と Flash-Next で、標準 1.5〜2 時間・徹底 3 時間前後）。測定中は、それまでの 1 回の長さから残り時間を出します。",
+  bm_mode_standard: "標準", bm_mode_standard_sub: "エキスパートの置き方とスレッド数、カーネル、KV、プロンプト処理のチャンクと片分け、層の分け方、MTP",
+  bm_mode_thorough: "徹底", bm_mode_thorough_sub: "標準に加えて、細かい設定も全部（足りないエキスパートを CPU だけで計算する、KV q4_0、GPU 内のエキスパートの使い回し、埋め込みの置き場、dense の精度、2 枚目への先送りなど）",
+  bm_use: "主な使い方", bm_use_sub: "MTP のように、文章の種類で効き方が変わる設定を採用するかどうかに使います。",
   bm_use_both: "両方", bm_use_code: "コード・ツール呼び出し（エージェント）", bm_use_prose: "文章・会話",
-  bm_time_standard: "30 分〜1 時間", bm_time_thorough: "1〜2 時間",
-  bm_planned: "予定", bm_fig_prefill: "プロンプト", bm_fig_prose: "文章", bm_fig_code: "コード", bm_row_loading: "読み込み", bm_row_prefill: "プロンプト処理", bm_row_decode: "生成（文章）", bm_row_decode_code: "生成（コード）",
-  bm_dec_kept: "採用", bm_dec_rejected: "不採用", bm_dec_failed: "失敗", bm_dec_base: "基準",
+  bm_time_standard: "30 分〜2 時間（GPU とモデルしだい）", bm_time_thorough: "1〜3 時間以上（GPU とモデルしだい）",
+  bm_planned: "予定", bm_eta: "残り約 {min} 分", bm_eta_soon: "残りわずか", bm_axis_threads: "スレッド数", bm_fig_prefill: "プロンプト", bm_fig_prose: "文章", bm_fig_code: "コード", bm_row_loading: "読み込み", bm_row_prefill: "プロンプト処理", bm_row_decode: "生成（文章）", bm_row_decode_code: "生成（コード）",
+  bm_dec_kept: "採用", bm_dec_rejected: "不採用", bm_dec_failed: "失敗", bm_dec_base: "基準", bm_dec_recheck: "速かったのでもう一度測る", bm_dec_rebase: "生成だけ落ちたので基準を測り直す", bm_dec_tiebreak: "結果が割れたので 3 回目を測る",
   bm_col_decode_code: "生成（コード）", bm_col_decision: "判定",
   bm_skipped_title: "測らなかった項目と理由",
   bm_plan_note: "{n} 個の候補を 1 つずつ試します（採用したものによって、あとの候補が増減します）。",
 }, {
   bm_title: "Benchmark to pick the settings",
-  bm_hint: "Measure this PC with the model and pick ft serve's flags from the numbers: PCIe, memory and SSD rates, how fast experts are computed on the CPU and moved to the GPU, and, if you like, the model itself started to compare the settings that matter one at a time. The result becomes a profile in one click.",
+  bm_hint: "Measure this PC with the model and pick ft serve's flags from the numbers.\nPCIe, memory and SSD rates and how fast experts run on the CPU and reach the GPU are measured, then the model is started to compare settings.\nThe result becomes a profile in one click.",
   bm_trials: "Start the model and measure it (recommended)",
-  bm_trials_hint: "Starts the model again and again, changing one thing at a time (kernels, where experts run, the KV cache, prefill, MTP, context) and keeps only what measured faster. Unticked, only the hardware is measured (a few minutes).",
+  bm_trials_hint: "Starts the model again and again, changes one setting at a time and keeps only what measured faster.",
+  bm_trials_off: "Unticked, only the hardware is measured (a few minutes).",
   bm_start: "Start", bm_last: "Show the last result", bm_last_when: "Last: {when}",
   bm_running_title: "Measuring", bm_cancel: "Cancel",
   bm_confirm: "The measurement uses the GPU, so the running server ({model}) stops and is started again with the same settings afterwards.",
@@ -68,7 +77,13 @@ FTI18N.add({
   bm_view_only: "Starting a benchmark from this page needs this PC or the token.",
   bm_external: "A server started outside ft mgr is running and holds the GPU. Stop it first.",
   bm_busy: "Another benchmark is running.",
-  bm_ph_stop: "Stopping the running server", bm_ph_hw: "Measuring the hardware", bm_ph_trial: "Measuring the model",
+  bm_ph_stop: "Stopping the running server", bm_ph_upstream: "Running upstream's measurement (ft bench bw)", bm_ph_hw: "Measuring the hardware",
+  bm_s_upstream: "Upstream's hardware measurement (ft bench bw, GPU {gpu})",
+  bm_prof_title: "Upstream's measurements the engine reads (ft bench bw)", bm_prof_line: "GPU {gpu} · {name}: measured with {version} ({when})",
+  bm_prof_unknown: "GPU {gpu} · {name}: no record of the version (the desktop app or an older ft bench bw), {when}",
+  bm_prof_none: "None yet.", bm_prof_stale: "Not measured with this version ({current}).",
+  bm_prof_rerun: "Every benchmark first runs ft bench bw as it is and rebuilds these.",
+  bm_upstream_tile: "Upstream's measurement (ft bench bw)", bm_upstream_sub: "measured again with {version}", bm_ph_trial: "Measuring the model",
   bm_ph_restore: "Starting the previous server again", bm_ph_done: "Done", bm_ph_cancelled: "Cancelled", bm_ph_error: "Stopped on an error",
   bm_s_gpu: "Look at the GPUs", bm_s_pcie: "PCIe transfer (GPU {gpu})", bm_s_ram: "Memory read", bm_s_ssd: "Reading the model from the SSD",
   bm_s_cpu_moe: "Experts computed on the CPU, by thread count", bm_s_gather: "Experts moved to the GPU (GPU {gpu})", bm_s_overlap: "CPU compute and GPU transfer together",
@@ -96,13 +111,14 @@ FTI18N.add({
   bm_flags_note: "“measured” values come from this run's numbers, “rule” values from the GPU, RAM and the model's config.",
   bm_saved: "The profile was saved.",
   bm_empty_hint: "Pick a model and press Start.", bm_loading_models: "Loading models…",
-  bm_mode: "How much to try", bm_mode_standard: "Standard (every setting that has helped somewhere; about an hour on two 3060s)",
-  bm_mode_thorough: "Thorough (also the settings that have never helped here; about two hours)",
-  bm_use: "Main use (decides settings like MTP whose effect depends on the text)",
+  bm_mode: "How much to try", bm_mode_time: "The time depends on the GPUs and the model (two RTX 3060s with Flash-Next: 1.5-2 hours standard, about 3 thorough). While it runs, the time left is worked out from the runs so far.",
+  bm_mode_standard: "Standard", bm_mode_standard_sub: "where experts run and CPU threads, kernels, the KV cache, prefill chunks and pieces, the layer split, MTP",
+  bm_mode_thorough: "Thorough", bm_mode_thorough_sub: "standard plus every finer setting (computing all missing experts on the CPU, a q4_0 KV cache, reusing experts already on the GPU, where embeddings live, dense precision, sending ahead to the next GPU, and more)",
+  bm_use: "Main use", bm_use_sub: "Decides settings like MTP whose effect depends on the kind of text.",
   bm_use_both: "Both", bm_use_code: "Code and tool calls (agents)", bm_use_prose: "Prose and chat",
-  bm_time_standard: "30 minutes to an hour", bm_time_thorough: "one to two hours",
-  bm_planned: "planned", bm_fig_prefill: "prompt", bm_fig_prose: "prose", bm_fig_code: "code", bm_row_loading: "loading", bm_row_prefill: "prompt", bm_row_decode: "generation (prose)", bm_row_decode_code: "generation (code)",
-  bm_dec_kept: "kept", bm_dec_rejected: "not kept", bm_dec_failed: "failed", bm_dec_base: "base",
+  bm_time_standard: "30 minutes to 2 hours (depends on the GPUs and the model)", bm_time_thorough: "1 to 3 hours or more (depends on the GPUs and the model)",
+  bm_planned: "planned", bm_eta: "about {min} min left", bm_eta_soon: "almost done", bm_axis_threads: "threads", bm_fig_prefill: "prompt", bm_fig_prose: "prose", bm_fig_code: "code", bm_row_loading: "loading", bm_row_prefill: "prompt", bm_row_decode: "generation (prose)", bm_row_decode_code: "generation (code)",
+  bm_dec_kept: "kept", bm_dec_rejected: "not kept", bm_dec_failed: "failed", bm_dec_base: "base", bm_dec_recheck: "faster: measuring again", bm_dec_rebase: "generation alone fell: measuring the base again", bm_dec_tiebreak: "the runs disagree: a third run",
   bm_col_decode_code: "Generation (code)", bm_col_decision: "Verdict",
   bm_skipped_title: "Not measured, and why",
   bm_plan_note: "{n} candidates, one at a time (what is kept can open or close later ones).",
@@ -116,11 +132,11 @@ FTI18N.add({
   const lang = () => FTI18N.lang;
 
   // ---------------------------------------------------------------- run view state
-  let steps = new Map(), order = [], current = null, run = null, seq = 0, startedAt = null, trialCtx = {};
+  let steps = new Map(), order = [], current = null, run = null, seq = 0, startedAt = null, trialCtx = {}, eta = null, done = false;
   const gauge = { shown: 0, target: 0, max: 10, unit: "GB/s", label: "" };
 
   function resetRun() {
-    steps = new Map(); order = []; current = null; seq = 0; startedAt = null; trialCtx = {};
+    steps = new Map(); order = []; current = null; seq = 0; startedAt = null; trialCtx = {}; eta = null; done = false;
     gauge.shown = gauge.target = 0;
     $("#bm-steps").innerHTML = "";
   }
@@ -158,7 +174,7 @@ FTI18N.add({
   const fmtVal = (v, unit) => v == null ? "—" : unit === "%" ? `${Math.round(v)}%` : unit === "tok/s" ? `${v >= 100 ? Math.round(v) : v.toFixed(1)} tok/s` : `${v.toFixed(1)} GB/s`;
 
   function hwLabel(id) {
-    const m = /^(pcie|gather)(\d+)$/.exec(id);
+    const m = /^(pcie|gather|upstream)(\d+)$/.exec(id);
     return m ? t(`bm_s_${m[1]}`, { gpu: m[2] }) : t(`bm_s_${id}`);
   }
 
@@ -170,14 +186,30 @@ FTI18N.add({
       const val = s.run ? runNote(s) : s.planned ? t("bm_planned") : s.state === "done" && s.value != null ? fmtVal(s.value, s.unit) : (s.note || running);
       const cls = s.decision === "rejected" || s.decision === "failed" ? "skip" : s.state;
       if (s.run || s.planned) {
-        const mark = s.decision ? ` <span class="pill ${{ kept: "ok", base: "info", rejected: "mute", failed: "bad" }[s.decision]}">${esc(t(`bm_dec_${s.decision}`))}</span>` : "";
-        return `<li class="${cls} two${s.planned ? " planned" : ""}"><span class="ico">${ico}</span><span class="grow"><span>${esc(s.label)}</span>${mark}
-          <span class="val2">${esc(val || "")}</span></span></li>`;
+        const mark = s.decision ? ` <span class="pill ${{ kept: "ok", base: "info", recheck: "info", rebase: "info", tiebreak: "info", rejected: "mute", failed: "bad" }[s.decision]}">${esc(t(`bm_dec_${s.decision}`))}</span>` : "";
+        return `<li class="${cls} two${s.planned ? " planned" : ""}"><span class="ico">${ico}</span><span class="grow"><span class="bm-row-title">${esc(s.label)}${mark}</span>
+          ${s.detail ? `<span class="bm-row-detail">${esc(s.detail)}</span>` : ""}<span class="val2">${esc(val || "")}</span></span></li>`;
       }
       return `<li class="${cls}"><span class="ico">${ico}</span><span>${esc(s.label)}</span><span class="val">${esc(val || "")}</span></li>`;
     }).join("");
     const ul = $("#bm-steps"), el = ul.querySelector("li.run");
     if (el && (el.offsetTop < ul.scrollTop || el.offsetTop + el.offsetHeight > ul.scrollTop + ul.clientHeight)) ul.scrollTop = el.offsetTop - ul.clientHeight / 3;
+  }
+
+  // "X（Y）" or "X。Y" -> X on the first line, Y under it: the explanations are long and wrap badly inline
+  function splitWhat(text) {
+    const s = String(text || "");
+    let m = /^(.+?)。(.+)$/.exec(s);
+    if (m) return { title: m[1], detail: m[2] };
+    m = /^(.+?)（(.+)）$/.exec(s) || /^(.+?) \((.+)\)$/.exec(s);
+    if (m) return { title: m[1], detail: m[2].replace(/）\s*（/g, " · ").replace(/\)\s*\(/g, " · ") };
+    m = /^(.+?): (.+)$/.exec(s);  // English: "one CPU thread fewer (7): the core left free ..."
+    return m && lang() === "en" ? { title: m[1], detail: m[2] } : { title: s, detail: "" };
+  }
+
+  // the caption under the dial: what is measured now, and for a run what that run changed
+  function setNow(main, detail = "") {
+    $("#bm-now").innerHTML = `<div>${esc(main)}</div>${detail ? `<div class="bm-now-sub">${esc(detail)}</div>` : ""}`;
   }
 
   function focus(id) {
@@ -186,7 +218,7 @@ FTI18N.add({
     gauge.unit = s.unit; gauge.label = s.label;
     gauge.target = 0;
     gauge.max = niceMax(Math.max(s.max || 0, ...s.samples.map((x) => x.v)) || (s.unit === "tok/s" ? 50 : s.unit === "%" ? 100 : 5), s.unit);
-    $("#bm-now").textContent = s.label;
+    setNow(s.label, s.caption);
     drawSpark();
   }
 
@@ -200,12 +232,12 @@ FTI18N.add({
 
   function sample(id, v, extra = {}) {
     const s = steps.get(id) || addStep(id, id, unitOf(id));
-    s.samples.push({ v, ...extra });
+    s.samples.push({ v, at: Date.now(), ...extra });
     if (current !== id) focus(id);
     gauge.target = v;
     if (v > gauge.max * 0.95) gauge.max = niceMax(v, s.unit);
-    $("#bm-now").textContent = extra.threads ? `${s.label} · ${t("bm_threads", { n: extra.threads })}` : s.label;
-    if (s.unit === "%") s.note = t("bm_loading_pct", { v: Math.round(v) });
+    setNow(extra.threads ? `${s.label} · ${t("bm_threads", { n: extra.threads })}` : s.label, s.caption);
+    if (s.unit === "%") s.note = id.startsWith("upstream") ? `${Math.round(v)}%${extra.label ? " · " + extra.label : ""}` : t("bm_loading_pct", { v: Math.round(v) });
     renderSteps();
     drawSpark();
   }
@@ -216,6 +248,7 @@ FTI18N.add({
     if (e.k === "phase") {
       $("#bm-phase").textContent = t(`bm_ph_${e.phase}`) + (e.message ? ` — ${e.message}` : "");
       if (["done", "cancelled", "error"].includes(e.phase)) {
+        done = true;
         for (const s of steps.values()) if (s.state === "run") s.state = e.phase === "done" ? "done" : "failed";
         for (const id of order.filter((id) => steps.get(id).planned)) { steps.delete(id); order.splice(order.indexOf(id), 1); }
       }
@@ -223,7 +256,7 @@ FTI18N.add({
     } else if (e.k === "hw") {
       if (e.kind === "plan") for (const s of e.steps) addStep(s.id, hwLabel(s.id), s.unit || "GB/s", s.max);
       else if (e.kind === "step") { const s = steps.get(e.id) || addStep(e.id, hwLabel(e.id), "GB/s"); s.state = "run"; focus(e.id); renderSteps(); }
-      else if (e.kind === "sample") sample(e.id, e.value, e.threads ? { threads: e.threads } : {});
+      else if (e.kind === "sample") sample(e.id, e.value, e.threads ? { threads: e.threads } : e.label ? { label: e.label } : {});
       else if (e.kind === "done") {
         const s = steps.get(e.id); if (!s) return;
         s.state = "done"; s.value = e.id === "gpu" ? null : e.value;
@@ -236,27 +269,43 @@ FTI18N.add({
         s.state = "skip"; s.note = t(`bm_skip_${e.reason}`) || e.reason; renderSteps();
       }
     } else if (e.k === "plan") {
-      for (const it of e.items) {
-        const s = addStep(`plan:${it.key}`, lang() === "en" ? it.what_en : it.what, "tok/s");
-        s.planned = true;
+      // what is still to come: rows no longer in the plan go, new candidates are added at the end
+      const still = new Set(e.items.map((it) => `plan:${it.key}`));
+      for (const id of order.filter((id) => steps.get(id)?.planned && !still.has(id))) {
+        steps.delete(id); order.splice(order.indexOf(id), 1);
       }
-      $("#bm-now").textContent = t("bm_plan_note", { n: e.items.length });
+      for (const it of e.items) {
+        if (steps.has(`plan:${it.key}`)) continue;
+        const w = splitWhat(lang() === "en" ? it.what_en : it.what);
+        const s = addStep(`plan:${it.key}`, w.title, "tok/s");
+        Object.assign(s, { planned: true, detail: w.detail });
+      }
+      if (!e.update) setNow(t("bm_plan_note", { n: e.items.length }));
+      eta = e.eta_s != null ? { s: e.eta_s, at: Date.now() } : eta;
+      renderSteps();
     } else if (e.k === "decision") {
       const row = steps.get(e.trial);
-      if (row) { row.decision = e.decision; row.state = e.decision === "kept" ? "done" : "skip"; renderSteps(); }
+      if (row) { row.decision = e.decision; row.state = ["kept", "recheck", "rebase", "base", "tiebreak"].includes(e.decision) ? "done" : "skip"; renderSteps(); }
     } else if (e.k === "trial") {
       const T = e.trial;
       if (e.step === "load" && e.state === "start") {
         trialCtx[T] = e.change || null;
-        const what = (lang() === "en" ? e.what_en : e.what) || changeText(e.change);
-        const label = `${t("bm_col_setting")} ${T}: ${what}`;
-        const planned = e.key && order.indexOf(`plan:${e.key}`);
-        if (planned != null && planned >= 0) { steps.delete(`plan:${e.key}`); order.splice(planned, 1, T); }
-        const row = steps.get(T) || addStep(T, label, "tok/s", null, planned != null && planned >= 0);
-        if (!order.includes(T)) order.push(T);
-        Object.assign(row, { id: T, label, run: true, state: "run", since: Date.now() });
+        const w = splitWhat((lang() === "en" ? e.what_en : e.what) || changeText(e.change));
+        const label = `${t("bm_col_setting")} ${T}: ${w.title}`;
+        const planned = e.key ? order.indexOf(`plan:${e.key}`) : -1;
+        if (planned >= 0) { steps.delete(`plan:${e.key}`); order.splice(planned, 1, T); }
+        const row = steps.get(T) || addStep(T, label, "tok/s", null, true);
+        if (!order.includes(T)) {
+          let last = -1;
+          order.forEach((id, i) => { if (!steps.get(id)?.planned) last = i; });
+          order.splice(last + 1, 0, T);
+        }
+        Object.assign(row, { id: T, label, detail: w.detail, run: true, state: "run", since: Date.now() });
         steps.set(T, row);
-        for (const k of SUBS) addStep(`${T}.${k}`, `${label} · ${t(`bm_row_${k === "load" ? "loading" : k}`)}`, unitOf(`${T}.${k}`), k === "load" ? 100 : null, true);
+        for (const k of SUBS) {
+          const sub = addStep(`${T}.${k}`, `${t("bm_col_setting")} ${T} · ${t(`bm_row_${k === "load" ? "loading" : k}`)}`, unitOf(`${T}.${k}`), k === "load" ? 100 : null, true);
+          sub.caption = w.title;
+        }
       }
       const row = steps.get(T);
       if (e.state === "failed") {
@@ -369,6 +418,7 @@ FTI18N.add({
     ctx.fillText(t("bm_progress", { done: fmt.num(est), total: fmt.num(p.total) }), cx, y + 20);
   }
 
+  // the readings of the step on the dial, with axes: values on the left, seconds (or threads) below
   function drawSpark() {
     const cv = $("#bm-spark");
     const s = current && steps.get(current);
@@ -378,21 +428,70 @@ FTI18N.add({
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     // a load percentage only ever climbs: a line of it says nothing the dial does not
     if (!s || !s.samples.length || s.unit === "%") return;
-    const vals = s.samples.map((x) => x.v), max = Math.max(...vals) * 1.1 || 1;
+    const vals = s.samples.map((x) => x.v);
+    const top = niceMax(Math.max(...vals) || 1, s.unit);
+    const exp = Math.pow(10, Math.floor(Math.log10(top) + 1e-9));
+    const lead = Math.round((top / exp) * 10) / 10;
+    const divs = [2.5, 5, 10].includes(lead) ? 5 : 4;
+    const L = 46, R = 12, T = 18, B = 22, pw = w - L - R, ph = h - T - B;
+    const y = (v) => T + ph * (1 - v / top);
+    const num = (v) => (s.unit === "tok/s" ? (v >= 100 || Number.isInteger(v) ? String(Math.round(v)) : v.toFixed(1))
+      : v >= 10 || Number.isInteger(v) ? String(Math.round(v)) : v.toFixed(1));
+    ctx.font = "11px system-ui, sans-serif";
+    ctx.lineWidth = 1;
+    // horizontal grid and the value axis
+    for (let k = 0; k <= divs; k++) {
+      const v = (top * k) / divs, yy = Math.round(y(v)) + 0.5;
+      ctx.strokeStyle = css(k === 0 ? "--fg3" : "--line");
+      ctx.beginPath(); ctx.moveTo(L, yy); ctx.lineTo(w - R, yy); ctx.stroke();
+      ctx.fillStyle = css("--fg3"); ctx.textAlign = "right"; ctx.textBaseline = "middle";
+      ctx.fillText(num(v), L - 6, yy);
+    }
+    ctx.strokeStyle = css("--fg3");
+    ctx.beginPath(); ctx.moveTo(L + 0.5, T); ctx.lineTo(L + 0.5, T + ph); ctx.stroke();
+    ctx.fillStyle = css("--fg3"); ctx.textAlign = "left"; ctx.textBaseline = "top";
+    ctx.fillText(s.unit, 2, 0);
+
     if (s.samples[0].threads) {
-      // the thread sweep: one bar per thread count
-      const bw = w / vals.length;
+      // the thread sweep: one bar per thread count, its value on top
+      const bw = pw / vals.length;
       s.samples.forEach((x, i) => {
-        const bh = (h - 16) * x.v / max;
-        ctx.fillStyle = css("--accent"); ctx.fillRect(i * bw + 4, h - 14 - bh, bw - 8, bh);
-        ctx.fillStyle = css("--fg3"); ctx.font = "10px system-ui"; ctx.textAlign = "center";
-        ctx.fillText(x.threads, i * bw + bw / 2, h - 2);
+        const x0 = L + i * bw, bh = (ph * x.v) / top;
+        ctx.fillStyle = css("--accent"); ctx.fillRect(x0 + bw * 0.18, T + ph - bh, bw * 0.64, bh);
+        ctx.fillStyle = css("--fg2"); ctx.textAlign = "center"; ctx.textBaseline = "bottom";
+        ctx.fillText(x.v < 100 ? x.v.toFixed(1) : String(Math.round(x.v)), x0 + bw / 2, T + ph - bh - 2);
+        ctx.fillStyle = css("--fg3"); ctx.textBaseline = "top";
+        ctx.fillText(x.threads, x0 + bw / 2, T + ph + 5);
       });
+      ctx.textAlign = "right"; ctx.textBaseline = "top";
+      ctx.fillText(t("bm_axis_threads"), w - R, 0);
       return;
     }
+
+    // over time: seconds since the step's first reading
+    const t0 = s.samples[0].at || 0;
+    const span = Math.max(1, ((s.samples[s.samples.length - 1].at || t0) - t0) / 1000);
+    const xAt = (x) => (s.samples.length > 1 ? L + (pw * ((x.at || t0) - t0)) / 1000 / span : L + pw / 2);
+    const step = [1, 2, 5, 10, 15, 30, 60, 120, 300, 600].find((d) => span / d <= 6) || 600;
+    ctx.fillStyle = css("--fg3"); ctx.textBaseline = "top";
+    for (let sec = 0; sec <= span + 1e-6; sec += step) {
+      const xx = Math.round(L + (pw * sec) / span) + 0.5;
+      ctx.strokeStyle = css("--line"); ctx.beginPath(); ctx.moveTo(xx, T + ph); ctx.lineTo(xx, T + ph + 4); ctx.stroke();
+      ctx.textAlign = sec === 0 ? "left" : xx > w - R - 20 ? "right" : "center";
+      ctx.fillText(sec >= 60 && sec % 60 === 0 ? `${sec / 60} min` : `${sec} s`, xx, T + ph + 6);
+    }
     ctx.strokeStyle = css("--accent"); ctx.lineWidth = 2; ctx.beginPath();
-    vals.forEach((v, i) => { const x = vals.length > 1 ? w * i / (vals.length - 1) : w / 2, y = h - 4 - (h - 8) * v / max; i ? ctx.lineTo(x, y) : ctx.moveTo(x, y); });
+    s.samples.forEach((x, i) => (i ? ctx.lineTo(xAt(x), y(x.v)) : ctx.moveTo(xAt(x), y(x.v))));
     ctx.stroke();
+    if (s.samples.length <= 24) {
+      ctx.fillStyle = css("--accent");
+      s.samples.forEach((x) => { ctx.beginPath(); ctx.arc(xAt(x), y(x.v), 2.5, 0, Math.PI * 2); ctx.fill(); });
+    }
+    // the latest reading, next to its point
+    const last = s.samples[s.samples.length - 1], lx = xAt(last), ly = y(last.v);
+    ctx.fillStyle = css("--fg"); ctx.font = "600 11px system-ui, sans-serif";
+    ctx.textAlign = lx > w - R - 60 ? "right" : "left"; ctx.textBaseline = ly < T + 14 ? "top" : "bottom";
+    ctx.fillText(`${num(last.v)} ${s.unit}`, lx + (ctx.textAlign === "right" ? -6 : 6), ly + (ctx.textBaseline === "top" ? 4 : -4));
   }
 
   (function loop() { drawGauge(); requestAnimationFrame(loop); })();
@@ -400,7 +499,9 @@ FTI18N.add({
     if (!$("#bm-run").hidden && [...steps.values()].some((s) => s.state === "run" && s.since && !s.note)) renderSteps();
     if (startedAt && !$("#bm-run").hidden) {
       const s = Math.max(0, Math.round(Date.now() / 1000 - startedAt));
-      $("#bm-elapsed").textContent = `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
+      const left = eta && !done ? Math.max(0, eta.s - (Date.now() - eta.at) / 1000) : null;
+      const etaText = left == null ? "" : ` · ${left < 90 ? t("bm_eta_soon") : t("bm_eta", { min: Math.round(left / 60) })}`;
+      $("#bm-elapsed").textContent = `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}${etaText}`;
     }
   }, 500);
 
@@ -451,6 +552,24 @@ FTI18N.add({
   if (!FT.canWrite) { const w = $("#bm-warn"); w.hidden = false; w.textContent = t("bm_view_only"); }
 
   let lastResult = null;
+  async function loadProfiles() {
+    const box = $("#bm-profiles");
+    if (demo) { box.hidden = true; return; }
+    let doc;
+    try { doc = await FT.raw("/tune/profiles"); } catch { box.hidden = true; return; }
+    const when = (e) => e ? new Date(e * 1000).toLocaleString(lang() === "ja" ? "ja-JP" : "en-US") : "—";
+    const lines = (doc.profiles || []).map((p) => {
+      const name = (p.gpu || "").replace(/^NVIDIA\s+/, "");
+      const text = p.version ? t("bm_prof_line", { gpu: p.index, name, version: p.version, when: when(p.epoch) })
+        : t("bm_prof_unknown", { gpu: p.index, name, when: when(p.epoch) });
+      const stale = p.version !== doc.current ? ` <span class="warn-text">${esc(t("bm_prof_stale", { current: doc.current }))}</span>` : "";
+      return `<div>${esc(text)}${stale}</div>`;
+    });
+    box.innerHTML = `<b>${esc(t("bm_prof_title"))}</b><span class="muted">${esc(t("bm_prof_rerun"))}</span>
+      ${lines.join("") || `<div>${esc(t("bm_prof_none"))}</div>`}`;
+  }
+  loadProfiles();
+
   async function loadLast() {
     lastResult = null;
     $("#bm-last").hidden = true; $("#bm-last-when").textContent = "";
@@ -510,6 +629,8 @@ FTI18N.add({
       hw.ssd.read_ahead_kb > 512 ? `<div class="s warn-text" style="margin-top:4px">${esc(t("bm_ssd_ra", { n: hw.ssd.read_ahead_kb }))}</div>` : "");
     if (hw.cpu_moe) tile(t("bm_cpu"), gbs(hw.cpu_moe.best_gbs), t("bm_cpu_sub", { n: hw.cpu_moe.threads, cores: hw.cpu_moe.cores }));
     for (const [gpu, g] of Object.entries(hw.gather || {})) if (g) tile(t("bm_gather", { gpu }), gbs(g.gbs), t("bm_gather_sub"));
+    if (r.upstream?.length) tile(t("bm_upstream_tile"), r.upstream.map((u) => `GPU ${u.gpu}`).join(", "),
+      t("bm_upstream_sub", { version: r.upstream[0].version }));
     if (hw.overlap?.fetch_fraction != null) tile(t("bm_overlap"), `${(hw.overlap.pcie_gbs + hw.overlap.cpu_gbs).toFixed(1)} <small>GB/s</small>`,
       t("bm_overlap_sub", { pct: fmt.pct(hw.overlap.fetch_fraction, 0) }));
 
@@ -520,7 +641,7 @@ FTI18N.add({
     const decisionPill = (x) => {
       const d = x.decision || (x.ok ? null : "failed");
       if (!d) return "";
-      const kind = d === "kept" ? "ok" : d === "base" ? "info" : d === "failed" ? "bad" : "mute";
+      const kind = d === "kept" ? "ok" : ["base", "recheck", "rebase", "tiebreak"].includes(d) ? "info" : d === "failed" ? "bad" : "mute";
       return `<span class="pill ${kind}">${esc(t(`bm_dec_${d}`))}</span>`;
     };
     const whatOf = (x) => (x.what ? (lang() === "en" ? x.what[1] : x.what[0]) : changeText(x.change));

@@ -18,6 +18,7 @@ def _rank(rank, active, miss, faults, layer_range):
         "v": 1, "rank": rank, "size": 2, "time": time.time(), "spec_k": 0,
         "layer_range": layer_range,
         "gpu": {"index": rank, "name": "RTX 3060", "total_bytes": 12 * GiB, "free_bytes": 1 * GiB, "reserved_bytes": 10 * GiB},
+        "pools": {"kv": (1 + rank) * GiB, "moe": 5 * GiB, "mamba": GiB // 4},
         "moe": {"decode_target": "gpu", "cache_size": 700, "num_layers": 2, "num_experts": 64, "collect_stats": True},
         "prefill_chunk": 4096,
         "windows": {"60": {"seconds": 60.0, "layer_active": active, "layer_miss": miss, "major_faults": faults,
@@ -46,6 +47,7 @@ def test_kai_block_sums_ranks(tmp_path, monkeypatch):
     assert k["prefix_reuse_rate"] == 0.75
     assert [g["layers"] for g in k["gpus"]] == [[0, 23], [24, 47]]
     assert [g["used_bytes"] for g in k["gpus"]] == [11 * GiB, 11 * GiB]
+    assert [g["pools"]["kv"] for g in k["gpus"]] == [GiB, 2 * GiB]  # each rank its own, not rank 0's for all
 
 
 def test_experts_doc_orders_layers_by_rank(tmp_path, monkeypatch):
