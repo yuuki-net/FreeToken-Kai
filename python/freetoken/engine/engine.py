@@ -387,6 +387,40 @@ def _remap_weights(weights, remap, model_state: Dict[str, torch.Tensor]):
         yield from remap(key, weight, model_state)
 
 
+_MTP_PER_EXPERT_RE = re.compile(r"^mtp\.layers\.\d+\.mlp\.experts\.\d+\.")
+
+
+def _mtp_experts_unreadable(model_path: str, got: list[str]) -> str:
+    """Why --spec-mtp found no draft-head experts it could use, from the checkpoint's key names.
+
+    The head's experts are read as the two stacked bf16 tensors ``mtp.layers.0.mlp.experts.
+    {gate_up,down}_proj`` (the RadixArk Qwen3.8-Flash-Next-NVFP4 release). NVIDIA's release stores
+    them per expert, 128x128 block-fp8 (``...experts.N.gate_proj.weight`` + ``weight_scale_inv``);
+    the reader skips those as routed experts, so the capture came back empty -- which used to
+    surface as "missing from the checkpoint" although the tensors are there."""
+    try:
+        from freetoken.models.loader import safetensors_weight_map
+
+        keys = [k for k in safetensors_weight_map(model_path) if k.startswith("mtp.")]
+    except Exception:  # noqa: BLE001 -- only here to word the error; FTW dirs have no index
+        keys = []
+    per_expert = [k for k in keys if _MTP_PER_EXPERT_RE.match(k)]
+    if per_expert:
+        fmt = "block-fp8" if any(k.endswith("weight_scale_inv") for k in per_expert) else "per-expert"
+        return (
+            f"--spec-mtp: this checkpoint stores the MTP draft head's experts one per expert in "
+            f"{fmt} ({per_expert[0]}, {len(per_expert)} tensors), a layout the draft head does not "
+            "read yet: it reads the two stacked bf16 tensors mtp.layers.0.mlp.experts."
+            "{gate_up,down}_proj of the RadixArk Qwen3.8-Flash-Next-NVFP4 release. Start without "
+            "--spec-mtp (--spec-mtp 0), or use that release."
+        )
+    return (
+        f"--spec-mtp: the checkpoint has no MTP draft-head experts the head can read "
+        f"(captured {got or 'none'}; {len(keys)} mtp.* tensors in the index). Start without "
+        "--spec-mtp (--spec-mtp 0)."
+    )
+
+
 def _drop_unknown_mtp(weights, model_state: Dict[str, torch.Tensor]):
     """The reader keeps the checkpoint's mtp.* head; a process that did not build the draft
     head (spec off, or not the last pipeline rank) drops those tensors here."""
@@ -1166,9 +1200,8 @@ class Engine:
         from freetoken.moe.legacy_format import canonical_role
 
         raw = self._mtp_raw
-        assert set(raw) == {"gate_up_proj", "down_proj"}, (
-            f"--spec-mtp: MTP experts missing from the checkpoint: got {sorted(raw)}"
-        )
+        if set(raw) != {"gate_up_proj", "down_proj"}:
+            raise ValueError(_mtp_experts_unreadable(self.config.model_path, sorted(raw)))
         gate_up, down = raw["gate_up_proj"], raw["down_proj"]
         if gate_up.shape[-1] != down.shape[-2]:  # [E, H, 2I] / [E, I, H] storage -> [E, 2I, H] / [E, H, I]
             gate_up, down = gate_up.transpose(1, 2).contiguous(), down.transpose(1, 2).contiguous()
