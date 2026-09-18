@@ -1022,9 +1022,12 @@ class OffloadMoeCache:
             active = int(self.stat_active.item())
             missing = int(self.stat_missing.item())
             calls = int(self.stat_calls.item())
+            fetched = int(self.stat_fetched.item())
         else:
             active, missing, calls = (int(x) for x in self.lru_stats.sum(0))
-        fetched = int(self.stat_fetched.item())
+            # plain offload fetches every miss over PCIe; stat_fetched is the hybrid split's
+            # counter and stays 0 here, which read as "every miss computed on the CPU"
+            fetched = missing
         return {
             "layer_calls": calls,
             "active_per_layer": (active / calls) if calls else 0.0,
@@ -1051,10 +1054,11 @@ class OffloadMoeCache:
             steps = self.stat_steps_layer.tolist()
             missing = self.stat_missing_layer.tolist()
             active = self.stat_active_layer.tolist()
+            fetched = self.stat_fetched_layer.tolist()
         else:
             cols = self.lru_stats.t().tolist()
             active, missing, steps = cols[Stat.ACTIVE], cols[Stat.MISS], cols[Stat.CALLS]
-        fetched = self.stat_fetched_layer.tolist()
+            fetched = list(missing)  # plain offload: every miss comes over PCIe
         per_layer = []
         for L in range(self.num_layers):
             s, m, a, f = steps[L], missing[L], active[L], fetched[L]
