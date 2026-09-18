@@ -1,7 +1,8 @@
 """--host-embedding on a model that does not honor it says so.
 
-Only the Qwen3.5-MoE family builds a pinned-RAM embedding for the flag; on Qwen3.8-Flash-Next
-it changed nothing (-0.01 GiB on a 12 GB single-card start) and nothing said so.
+Only the Qwen3.5-MoE and Qwen3.8-Flash-Next families build a pinned-RAM embedding for the flag;
+elsewhere it changes nothing, and Flash-Next once changed nothing (-0.01 GiB on a 12 GB
+single-card start) with nothing said about it.
 """
 from __future__ import annotations
 

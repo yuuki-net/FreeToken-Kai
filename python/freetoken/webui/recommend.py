@@ -256,9 +256,7 @@ def recommend(model: str, *, extra_dirs: list[str] | None = None) -> dict:
         add("--dense-quant", "fp8",
             "エキスパート以外の bf16 の重みを読み込み時に fp8 にします。常駐分が 1 枚あたり 4.9 → 2.9 GB になり、空いた VRAM がエキスパートの枠に回ります。",
             "Quantizes the bf16 non-expert weights to fp8 at load: resident weights go from 4.9 to 2.9 GB per card, and the freed VRAM goes to the expert cache.")
-    # qwen3_5_moe only: qwen4_exp builds its table in VRAM whatever the flag says (the engine
-    # warns), so recommending it there bought nothing
-    if facts.get("model_type") == "qwen3_5_moe" and vram <= 8 * GiB:
+    if facts.get("model_type") in ("qwen3_5_moe", "qwen4_exp") and vram <= 8 * GiB:
         add("--host-embedding", None, "埋め込み表を RAM に置いて、その分の VRAM を KV に回します。",
             "Keep the embedding table in RAM and give its VRAM to the KV cache.")
 

@@ -391,10 +391,10 @@ def _host_embedding_ignored(config, host_prefixes: tuple[str, ...]) -> str | Non
     """The warning for --host-embedding on a model that does not build a host embedding.
 
     The flag marks the model config (``embed_host``); only the model families that read that
-    mark move the table to pinned RAM, and the rest built it in VRAM with no word -- on
-    Qwen3.8-Flash-Next the flag was measured to free nothing (a 12 GB single-card start, -0.01
-    GiB), and a fork running Kai took it for working. Returns None when the table did move, when
-    the flag is off, or on a pipeline rank that does not own the table."""
+    mark move the table to pinned RAM (Qwen3.5-MoE, Qwen3.8-Flash-Next), and the rest built it in
+    VRAM with no word -- Flash-Next did so until it read the mark, measured to free nothing on a
+    12 GB single-card start (-0.01 GiB), and a fork running Kai took it for working. Returns None
+    when the table did move, when the flag is off, or on a pipeline rank that does not own it."""
     if not getattr(config, "host_embedding", False) or not getattr(config, "pp_is_first", True):
         return None
     if "model.embed_tokens." in host_prefixes:
@@ -402,7 +402,8 @@ def _host_embedding_ignored(config, host_prefixes: tuple[str, ...]) -> str | Non
     arch = getattr(getattr(config, "model_config", None), "model_type", None) or "this model"
     return (
         f"--host-embedding has no effect on {arch}: its embedding table is built in VRAM as "
-        "usual (only Qwen3.5-MoE family models move it to pinned RAM). Drop the flag, or count "
+        "usual (only the Qwen3.5-MoE and Qwen3.8-Flash-Next families move it to pinned RAM). Drop "
+        "the flag, or count "
         "the table in the VRAM budget."
     )
 

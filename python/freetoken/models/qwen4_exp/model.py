@@ -207,11 +207,17 @@ class Qwen4ExpModel(BaseOP):
         start, end = (0, config.num_layers) if pp is None else (pp.start, pp.end)
         self._pp_first = start == 0
         self._pp_last = end == config.num_layers
-        embed_cls = (
-            Fp8VocabParallelEmbedding
-            if getattr(config, "embed_quant", "none") == "fp8_pertensor"
-            else VocabParallelEmbedding
-        )
+        if getattr(config, "embed_host", False):
+            # --host-embedding: the table stays in pinned host memory (in the model dtype, not
+            # --dense-quant's fp8) and the GPU gathers the looked-up rows in place. Frees the
+            # table's VRAM -- 0.6 GiB of it under --dense-quant fp8 on Flash-Next -- for the expert cache
+            # and KV, for 1.3 GB of pinned RAM (guides/23 §7).
+            assert not config.tie_word_embeddings, "host embedding needs an untied lm_head"
+            embed_cls = HostEmbedding
+        elif getattr(config, "embed_quant", "none") == "fp8_pertensor":
+            embed_cls = Fp8VocabParallelEmbedding
+        else:
+            embed_cls = VocabParallelEmbedding
         self.embed_tokens = (
             embed_cls(num_embeddings=config.vocab_size, embedding_dim=config.hidden_size)
             if self._pp_first
@@ -410,11 +416,15 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
     @property
     def host_resident_prefixes(self) -> tuple[str, ...]:
         """State-dict key prefixes the engine materializes in pinned host memory instead of
-        on the device (the draft head's own embedding copy)."""
+        on the device: the input embedding table under --host-embedding, and the draft head's
+        own embedding copy on a rank without the table."""
+        prefixes = []
+        if getattr(self.model.embed_tokens, "host_resident", False):
+            prefixes.append("model.embed_tokens.")
         mtp = self.mtp
         if mtp is not None and getattr(mtp.embed_tokens, "host_resident", False):
-            return ("mtp.embed_tokens.",)
-        return ()
+            prefixes.append("mtp.embed_tokens.")
+        return tuple(prefixes)
 
     def remap_loaded_weight(
         self, name: str, tensor: torch.Tensor, model_state: dict
