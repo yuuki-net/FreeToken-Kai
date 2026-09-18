@@ -149,3 +149,12 @@ def test_unknown_model_name_is_refused(tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(tmp_path))
     with pytest.raises(ValueError):
         rec.recommend("no-such-model-folder")
+
+
+def test_host_embedding_is_not_recommended_where_it_does_nothing(tmp_path, monkeypatch):
+    # qwen4_exp builds its embedding table in VRAM whatever --host-embedding says
+    _host(monkeypatch, [("NVIDIA GeForce RTX 2060", 6, 7.5)], ram_gib=160, cores=12)
+    flash = dict(GDN_MOE, model_type="qwen4_exp", num_hidden_layers=48, num_experts=512, hidden_size=2560,
+                 moe_intermediate_size=640, vision_config=None)
+    f = _flags(rec.recommend(_model(tmp_path, "Flash-Next", weight_gib=135, **flash)))
+    assert "--host-embedding" not in f
