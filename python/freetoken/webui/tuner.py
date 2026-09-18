@@ -17,7 +17,12 @@ generation on code three times when an MTP head is in play (its acceptance depen
 Which generation figure decides follows the use the person picked: prose, code, or both.
 
 The engine the manager was running is stopped first and started again at the end, whatever
-happened. Progress is a list of events the page polls."""
+happened. Progress is a list of events the page polls.
+
+A run can also pick up from the model's last result (``from_last``): the hardware stage is taken
+from that result, its chosen settings are measured once more as today's base, and only the
+candidates it has not tried are run -- the ones a newer build added, or the thorough ones after a
+standard run. Every result records the keys tried so far, so these runs add up."""
 
 from __future__ import annotations
 
@@ -50,6 +55,51 @@ MODES = ("standard", "thorough")
 
 class Busy(Exception):
     pass
+
+
+class NoLastResult(ValueError):
+    pass
+
+
+def prior_trials(prev: dict | None) -> tuple[set[str], set[str]]:
+    """(keys tried, keys kept) by a saved result -- its own record, or, for a result saved before
+    runs kept one, what its trials say."""
+    if not prev:
+        return set(), set()
+    if "tried" in prev:
+        return set(prev["tried"]), set(prev.get("kept") or ())
+    trials = [t for t in prev.get("trials") or [] if t.get("key") and t.get("key") != "base_again"]
+    return {t["key"] for t in trials}, {t["key"] for t in trials if t.get("decision") == "kept"}
+
+
+def closed_groups(prev: dict, tried: set[str], facts: dict, hw: dict) -> set[str]:
+    """The groups ``tried`` closes. A result records them itself (its ``tried`` holds groups too);
+    for an older one they are read off the plans its first and final settings open: a group whose
+    member was kept (four prefill pieces) closes the member that would undo it (one piece) even
+    though the final settings no longer offer the kept one."""
+    groups: dict[str, str] = {}
+    for args in (prev.get("base_args"), prev.get("args")):
+        if args:
+            for c in search.plan(list(args), facts, hw, "thorough"):
+                groups.setdefault(c.key, c.group)
+    return {groups[k] for k in tried if k in groups}
+
+
+def last_refusal(prev: dict | None, gpus: list[int]) -> str | None:
+    """Why ``prev`` cannot be picked up from, or None when it can."""
+    if not prev:
+        return "no_last"
+    if not prev.get("args") or not prev.get("hw") or not any(t.get("decision") == "base" for t in prev.get("trials") or []):
+        return "last_incomplete"  # a hardware-only run, or one saved without its measured base
+    if len(prev.get("upstream") or []) != len(gpus):
+        return "last_other_gpus"
+    return None
+
+
+def host_facts(rec: dict) -> dict:
+    host = rec.get("host") or {}
+    return dict(host.get("model") or {}, ram_total=(host.get("memory") or {}).get("total"),
+                weight_bytes=host.get("weight_bytes"))
 
 
 # ------------------------------------------------------------------ flags as data
@@ -418,7 +468,15 @@ class TuneJob:
                     "events": [e for e in self.events if e["seq"] > since], "seq": self._seq}
 
     # ---- control
-    def start(self, model: str, trials: bool = True, port: int | None = None, mode: str = "standard", use: str = "both") -> dict:
+    def start(self, model: str, trials: bool = True, port: int | None = None, mode: str = "standard", use: str = "both",
+              from_last: bool = False) -> dict:
+        prev = None
+        if from_last:
+            trials = True  # picking up is only ever about the runs
+            prev = self.last(model)
+            why = last_refusal(prev, self._gpu_indices() or [0])
+            if why:
+                raise NoLastResult(why)
         with self._lock:
             if self.state == "running":
                 raise Busy("a benchmark is already running")
@@ -428,10 +486,33 @@ class TuneJob:
         self._cancel.clear()
         mode = mode if mode in MODES else "standard"
         use = use if use in USES else "both"
-        self._thread = threading.Thread(target=self._run, args=(model, trials, port or self.default_port, mode, use),
+        self._thread = threading.Thread(target=self._run, args=(model, trials, port or self.default_port, mode, use, prev),
                                         name="ft-mgr-benchmark", daemon=True)
         self._thread.start()
         return {"started": True}
+
+    def pending(self, model: str, mode: str = "standard") -> dict:
+        """What a run picking up from the last result would try, before any measurement: the
+        candidates the last result's settings open that it has not tried. Ones that only open
+        after a change is kept cannot be known in advance and are not listed."""
+        prev = self.last(model)
+        why = last_refusal(prev, self._gpu_indices() or [0])
+        if why:
+            return {"available": False, "reason": why, "items": []}
+        mode = mode if mode in MODES else "standard"
+        rec = self._recommend(model) if self._recommend else {}
+        tried, kept = prior_trials(prev)
+        facts, hw = host_facts(rec), prev.get("hw") or {}
+        tried |= closed_groups(prev, tried, facts, hw)
+        args = list(prev["args"])
+        plan = search.plan(args, facts, hw, mode)
+        # a candidate the settings already carry (the chunk ceiling four pieces set) is skipped by the
+        # run without a start, so it is not listed either
+        items = [{"key": c.key, "what": c.what_ja, "what_en": c.what_en, "change": c.change()} for c in plan
+                 if c.key not in tried and c.group not in tried and (c.after is None or c.after in kept)
+                 and set_flags(args, search.merge_changes(args, c.changes), c.drop) != args]
+        return {"available": True, "items": items, "last": {"finished": prev.get("finished"), "mode": prev.get("mode"),
+                                                            "version": prev.get("freetoken_version")}}
 
     def cancel(self) -> dict:
         self._cancel.set()
@@ -458,7 +539,8 @@ class TuneJob:
             raise InterruptedError("cancelled")
 
     # ---- the job
-    def _run(self, model: str, trials: bool, port: int, mode: str = "standard", use: str = "both") -> None:
+    def _run(self, model: str, trials: bool, port: int, mode: str = "standard", use: str = "both",
+             last: dict | None = None) -> None:
         prev = self.manager.status()
         prev_cfg = (prev.get("model"), prev.get("port"), list(self.manager.serve_args())) if prev.get("running") else None
         result: dict = {"model": model, "port": port, "started": time.time(), "trials": [], "mode": mode, "use": use,
@@ -469,23 +551,41 @@ class TuneJob:
                 self._ev("phase", phase="stop")
                 self.manager.stop()
             self._check()
-            # upstream's own measurement first, exactly as the desktop app runs it: the engine reads
-            # this profile (hybrid or offload, the fetch split), so it is settled before anything else
-            self._ev("phase", phase="upstream")
-            result["upstream"] = self._upstream()
-            self._check()
-            self._ev("phase", phase="hw")
-            hw = self._hardware(model)
-            result["hw"] = hw
-            self._check()
-            rec = self._recommend(model) if self._recommend else {"flags": [], "notes": []}
-            args, notes = self._apply_hw(rec, hw)
-            result["base_args"] = list(args)
+            rec = None
+            if last is not None:
+                # picking up: the hardware stage and the settings it led to are the last result's
+                result["from_last"] = {"started": last.get("started"), "finished": last.get("finished"),
+                                       "mode": last.get("mode"), "version": last.get("freetoken_version")}
+                # the runs this result builds on, oldest first, so the record of what was measured stays whole
+                result["earlier"] = list(last.get("earlier") or []) + [
+                    {"started": last.get("started"), "finished": last.get("finished"), "mode": last.get("mode"),
+                     "version": last.get("freetoken_version"), "chosen": last.get("chosen"), "trials": last.get("trials") or []}]
+                result["upstream"], hw = last.get("upstream"), last["hw"]
+                result["hw"], result["base_args"] = hw, list(last.get("base_args") or last["args"])
+                args, notes = list(last["args"]), [dict(n) for n in last.get("notes") or []]
+                self._ev("phase", phase="from_last", finished=last.get("finished"))
+            else:
+                # upstream's own measurement first, exactly as the desktop app runs it: the engine reads
+                # this profile (hybrid or offload, the fetch split), so it is settled before anything else
+                self._ev("phase", phase="upstream")
+                result["upstream"] = self._upstream()
+                self._check()
+                self._ev("phase", phase="hw")
+                hw = self._hardware(model)
+                result["hw"] = hw
+                self._check()
+                rec = self._recommend(model) if self._recommend else {"flags": [], "notes": []}
+                args, notes = self._apply_hw(rec, hw)
+                result["base_args"] = list(args)
             if trials:
-                host = rec.get("host") or {}
-                facts = dict(host.get("model") or {}, ram_total=(host.get("memory") or {}).get("total"),
-                             weight_bytes=host.get("weight_bytes"))
-                args, notes = self._trials(model, port, args, notes, result, facts, hw, mode, use)
+                if rec is None:
+                    rec = self._recommend(model) if self._recommend else {"flags": [], "notes": []}
+                facts = host_facts(rec)
+                prior = None
+                if last is not None:
+                    done, kept = prior_trials(last)
+                    prior = (done | closed_groups(last, done, facts, hw), kept)
+                args, notes = self._trials(model, port, args, notes, result, facts, hw, mode, use, prior=prior)
             result["args"] = [a for a in args if a != "--moe-collect-stats"]
             result["notes"] = notes
             result["finished"] = time.time()
@@ -642,7 +742,7 @@ class TuneJob:
 
     # ---- real runs
     def _trials(self, model: str, port: int, args: list[str], notes: list[dict], result: dict,
-                facts: dict, hw: dict, mode: str, use: str):
+                facts: dict, hw: dict, mode: str, use: str, prior: tuple[set[str], set[str]] | None = None):
         self._ev("phase", phase="trial")
         self._tokenizer = self._load_tokenizer(model)
         labels = _labels()
@@ -669,8 +769,12 @@ class TuneJob:
         if not a["ok"]:
             raise RuntimeError(f"the server did not start with the measured flags: {a.get('error')}")
         best, best_args = a, base
-        tried: set[str] = set()
-        kept: set[str] = set()
+        # picking up: what the earlier runs tried counts as tried here (and closes its group), and what
+        # they kept opens the candidates that wait on it
+        prior_tried, prior_kept = prior or (set(), set())
+        tried: set[str] = set(prior_tried)  # candidate keys and the groups they close
+        kept: set[str] = set(prior_kept)
+        kept_now = False
         first = True
         while True:
             self._check()
@@ -679,7 +783,8 @@ class TuneJob:
             # the page lists what is still to come, and about how long it takes; sent again before every run
             self._ev("plan", items=[{"key": x.key, "what": x.what_ja, "what_en": x.what_en, "change": x.change()} for x in pending],
                      mode=mode, use=use, update=not first,
-                     eta_s=self._eta(len(pending), len(context_candidates(best.get("geometry") or {}, facts.get("max_context")))))
+                     eta_s=self._eta(len(pending), 0 if prior is not None and not kept_now else
+                                     len(context_candidates(best.get("geometry") or {}, facts.get("max_context")))))
             first = False
             if not pending:
                 break
@@ -740,10 +845,13 @@ class TuneJob:
             if won:
                 best, best_args = measured, cand_args
                 kept.add(c.key)
+                kept_now = True
 
-        # longer contexts last, on everything kept: a tier is kept while generation holds 95%
+        # longer contexts last, on everything kept: a tier is kept while generation holds 95%. Picking up
+        # with nothing newly kept, the last result's tiers still stand and are not run again
         model_max = facts.get("max_context")
-        for tier in context_candidates(best.get("geometry") or {}, model_max):
+        tiers = context_candidates(best.get("geometry") or {}, model_max) if (prior is None or kept_now) else []
+        for tier in tiers:
             self._check()
             c = search.Candidate(f"context_{tier}", {"--kv-reserve-tokens": str(tier), "--max-seq-len-override": str(tier)},
                                  gain=0.95, hold_prefill=0.9,
@@ -751,6 +859,7 @@ class TuneJob:
             cand_args = set_flags(best_args, c.changes)
             t = self._trial(next(labels), model, port, cand_args, change=c.change(), key=c.key, what=(c.what_ja, c.what_en),
                             code=measure_code)
+            tried.add(c.key)
             won = keep(best, t, c, use)
             t["decision"] = "kept" if won else ("failed" if not t.get("ok") else "rejected")
             result["trials"].append(t)
@@ -766,6 +875,9 @@ class TuneJob:
             notes.append({"flag": "--max-seq-len-override", "value": tokens, "source": "rule",
                           "why": "宣伝する長さと実際に入る長さをそろえます。", "why_en": "The advertised context matches what actually fits."})
         result["chosen"] = best["label"]
+        # what every run so far has tried (keys and the groups they closed) and kept, for the next run
+        # that picks up from this one
+        result["tried"], result["kept"] = sorted(tried), sorted(kept)
         return best_args, notes
 
     def _eta(self, candidates: int, tiers: int) -> int | None:

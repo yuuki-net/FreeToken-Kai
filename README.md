@@ -97,6 +97,12 @@ reads the same prompts, and a change is kept only when a second run confirms it.
 drawn as it arrives; the result is a profile in one click, and the profile editor's recommended
 settings follow it.
 
+**Pick up from the last result** measures only what the last benchmark of the model has not tried:
+the settings it chose are run once more as today's base, then only the new candidates -- the ones
+a newer build added, or the thorough ones after a standard run. The page lists them before you
+start, and says so when there are none. The hardware figures are the last result's, and the
+context-length step runs again only when a new change is kept.
+
 **Launch profiles** pick the model from `~/models` and the Hugging Face cache and the flags from
 `ft serve`'s own parser, with what each one does. **Recommended** fills in the flags for this PC's
 GPUs, RAM and cores and the checkpoint's config, says why for each, and marks which ones the

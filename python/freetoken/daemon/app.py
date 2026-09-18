@@ -66,6 +66,7 @@ class TuneBody(BaseModel):
     port: int | None = None
     mode: str = "standard"  # "thorough" adds the candidates that rarely win
     use: str = "both"  # which generation decides: "prose", "code" or "both"
+    from_last: bool = False  # pick up from the model's last result: only the candidates it has not tried
 
 
 class BenchBody(BaseModel):
@@ -574,7 +575,7 @@ def build_app(
                 raise HTTPException(status_code=500, detail=f"could not read ft serve flags: {exc}")
 
         # ---- the benchmark: measure this PC with a model, settle the flags on the numbers (webui/tuner.py)
-        from freetoken.webui.tuner import Busy, TuneJob
+        from freetoken.webui.tuner import Busy, NoLastResult, TuneJob
 
         def _recommend_quiet(model: str) -> dict:
             from freetoken.webui.recommend import recommend as build
@@ -602,9 +603,11 @@ def build_app(
                 if doc.get("reachable") and doc.get("status") in ("ok", "loading"):
                     return JSONResponse(status_code=409, content={"error": "a server started outside ft mgr is running", "code": "external_serve"})
             try:
-                return tune.start(model, body.trials, body.port, mode=body.mode, use=body.use)
+                return tune.start(model, body.trials, body.port, mode=body.mode, use=body.use, from_last=body.from_last)
             except Busy as exc:
                 return JSONResponse(status_code=409, content={"error": str(exc), "code": "busy"})
+            except NoLastResult as exc:
+                return JSONResponse(status_code=409, content={"error": str(exc), "code": str(exc)})
 
         @app.post("/tune/cancel", dependencies=auth)
         async def tune_cancel():
@@ -619,6 +622,17 @@ def build_app(
             from freetoken.webui.tuner import bench_profiles
 
             return await run(console_pool, bench_profiles)
+
+        @app.get("/tune/pending", dependencies=auth)
+        async def tune_pending(model: str, mode: str = "standard"):
+            """What picking up from the model's last result would try (nothing is run)."""
+            from freetoken.webui.models import resolve_model
+
+            try:
+                path = resolve_model(model)
+            except ValueError:
+                return {"available": False, "reason": "no_last", "items": []}
+            return await run(console_pool, tune.pending, path, mode)
 
         @app.get("/tune/last", dependencies=auth)
         async def tune_last(model: str):

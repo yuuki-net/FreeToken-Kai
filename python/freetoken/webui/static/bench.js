@@ -14,6 +14,15 @@ FTI18N.add({
   bm_confirm_none: "測定を始めます。測定中は GPU を使います。",
   bm_confirm_time: "かかる時間の目安: {min}。途中で中止できます。",
   bm_time_hw: "数分", bm_time_trials: "10〜25 分",
+  bm_fromlast: "前回の続きから", bm_fromlast_hint: "前回の結果の設定から始めて、まだ試していない候補だけを測ります（ハードウェアの測定は前回のものを使います）。新しい版で増えた候補や、標準のあとの徹底の分だけを測るときに。",
+  bm_fromlast_items: "未測定の候補 {n} 件: {list}", bm_fromlast_nothing: "未測定の候補はありません。前回の結果のままで足ります。",
+  bm_fromlast_more: "（採用された候補しだいで、あとから増えることがあります）",
+  bm_time_fromlast: "基準の測り直し 1 回と候補 {n} 件ぶん（1 件あたり、これまでの 1 回の測定と同じくらい）",
+  bm_ph_from_last: "前回の結果から続けています",
+  bm_from_last_note: "{when} の結果から続けた測定です（まだ試していなかった候補だけ）。それ以前の測定は下に畳んであります。",
+  bm_earlier: "{when} の測定（{mode}、{n} 回）",
+  bm_no_last: "このモデルの前回の結果がありません。", bm_last_incomplete: "前回はモデルを測っていない（ハードウェアだけの）結果なので、続けられません。",
+  bm_last_other_gpus: "前回と GPU の数が違うので、続けられません。",
   bm_view_only: "この画面から測定を始めるには、この PC で開くかトークンが必要です。",
   bm_external: "ft mgr の管理外で起動したサーバが動いていて、GPU を使っています。止めてから測定してください。",
   bm_busy: "ほかの測定が動いています。",
@@ -74,6 +83,15 @@ FTI18N.add({
   bm_confirm_none: "The measurement uses the GPU.",
   bm_confirm_time: "Expected time: {min}. You can cancel at any point.",
   bm_time_hw: "a few minutes", bm_time_trials: "10-25 minutes",
+  bm_fromlast: "Pick up from the last result", bm_fromlast_hint: "Start from the settings the last result chose and measure only the candidates it has not tried (the hardware figures are the last result's). For the candidates a newer build added, or the thorough ones after a standard run.",
+  bm_fromlast_items: "{n} untested: {list}", bm_fromlast_nothing: "Nothing untested: the last result still stands.",
+  bm_fromlast_more: "(a kept change can open more along the way)",
+  bm_time_fromlast: "one run of the current settings plus {n} candidates (each about as long as a run so far)",
+  bm_ph_from_last: "Picking up from the last result",
+  bm_from_last_note: "Picked up from the result of {when}: only the candidates it had not tried. The earlier runs are folded below.",
+  bm_earlier: "Run of {when} ({mode}, {n} runs)",
+  bm_no_last: "This model has no last result.", bm_last_incomplete: "The last result measured only the hardware, so there is nothing to pick up from.",
+  bm_last_other_gpus: "The last result had a different number of GPUs, so it cannot be picked up from.",
   bm_view_only: "Starting a benchmark from this page needs this PC or the token.",
   bm_external: "A server started outside ft mgr is running and holds the GPU. Stop it first.",
   bm_busy: "Another benchmark is running.",
@@ -580,10 +598,28 @@ FTI18N.add({
       $("#bm-last-when").textContent = t("bm_last_when", { when: new Date(lastResult.finished * 1000).toLocaleString(lang() === "ja" ? "ja-JP" : "en-US") });
     }
   }
-  $("#bm-model").onchange = loadLast;
+  let pendingDoc = null;
+  async function loadPending() {
+    pendingDoc = null;
+    const row = $("#bm-fromlast-row");
+    row.hidden = true;
+    if (demo) return;
+    const mode = document.querySelector('input[name="bm-mode"]:checked')?.value || "standard";
+    try { pendingDoc = await FT.raw(`/tune/pending?model=${encodeURIComponent($("#bm-model").value)}&mode=${mode}`); } catch { return; }
+    if (!pendingDoc?.available) { $("#bm-fromlast").checked = false; return; }
+    row.hidden = false;
+    const items = pendingDoc.items || [];
+    const name = (it) => lang() === "ja" ? (it.what || it.key) : (it.what_en || it.key);
+    $("#bm-fromlast-items").textContent = items.length
+      ? `${t("bm_fromlast_items", { n: items.length, list: items.map(name).join(" / ") })}\n${t("bm_fromlast_more")}`
+      : t("bm_fromlast_nothing");
+  }
+  $("#bm-model").onchange = () => { loadLast(); loadPending(); };
+  for (const r of document.querySelectorAll('input[name="bm-mode"]')) r.addEventListener("change", loadPending);
   $("#bm-trials").onchange = () => { $("#bm-opts").hidden = !$("#bm-trials").checked; };
   $("#bm-last").onclick = () => { show("result"); renderResult(lastResult); };
   loadLast();
+  loadPending();
 
   $("#bm-start").onclick = async () => {
     const trials = $("#bm-trials").checked;
@@ -594,16 +630,18 @@ FTI18N.add({
     $("#bm-start").disabled = false;
     const mode = document.querySelector('input[name="bm-mode"]:checked')?.value || "standard";
     const use = document.querySelector('input[name="bm-use"]:checked')?.value || "both";
+    const fromLast = trials && !$("#bm-fromlast-row").hidden && $("#bm-fromlast").checked;
+    const time = fromLast ? t("bm_time_fromlast", { n: (pendingDoc?.items || []).length }) : t(trials ? `bm_time_${mode}` : "bm_time_hw");
     const msg = [running ? t("bm_confirm", { model: modelName(running) }) : t("bm_confirm_none"),
-      t("bm_confirm_time", { min: t(trials ? `bm_time_${mode}` : "bm_time_hw") })].join("\n\n");
+      t("bm_confirm_time", { min: time })].join("\n\n");
     if (!await FT.ask(msg, { title: t("bm_title"), ok: t("bm_start") })) return;
     if (demo) { DemoJob.start(trials); run = null; show("run"); return; }
     try {
-      await FT.raw("/tune/start", { method: "POST", json: { model: $("#bm-model").value, trials, mode, use } });
+      await FT.raw("/tune/start", { method: "POST", json: { model: $("#bm-model").value, trials, mode, use, from_last: fromLast } });
       run = null; show("run");
     } catch (e) {
       const code = e.body?.code;
-      FT.notice(code === "external_serve" ? t("bm_external") : code === "busy" ? t("bm_busy") : (e.body?.detail || e.body?.error || e.message), t("bm_title"));
+      FT.notice(code === "external_serve" ? t("bm_external") : code === "busy" ? t("bm_busy") : ["no_last", "last_incomplete", "last_other_gpus"].includes(code) ? t(`bm_${code}`) : (e.body?.detail || e.body?.error || e.message), t("bm_title"));
     }
   };
   $("#bm-cancel").onclick = () => (demo ? DemoJob.cancel() : FT.raw("/tune/cancel", { method: "POST", json: {} }).catch(() => {}));
@@ -645,9 +683,7 @@ FTI18N.add({
       return `<span class="pill ${kind}">${esc(t(`bm_dec_${d}`))}</span>`;
     };
     const whatOf = (x) => (x.what ? (lang() === "en" ? x.what[1] : x.what[0]) : changeText(x.change));
-    const trialTable = okTrials.length ? `<div class="card"><h2>${esc(t("bm_trials_title"))}</h2>
-      <p class="hint">${esc(t("bm_trials_hint2"))}</p>
-      <div class="tablewrap"><table class="bm-trials"><thead><tr><th>${esc(t("bm_col_setting"))}</th><th>${esc(t("bm_col_change"))}</th><th>${esc(t("bm_col_decision"))}</th>
+    const tableOf = (okTrials, chosen) => `<div class="tablewrap"><table class="bm-trials"><thead><tr><th>${esc(t("bm_col_setting"))}</th><th>${esc(t("bm_col_change"))}</th><th>${esc(t("bm_col_decision"))}</th>
         <th class="num">${esc(t("bm_col_ctx"))}</th><th class="num">${esc(t("bm_col_slots"))}</th><th class="num">${esc(t("bm_col_load"))}</th>
         <th class="num">${esc(t("bm_col_prefill"))}</th><th class="num">${esc(t("bm_col_decode"))}</th>${anyCode ? `<th class="num">${esc(t("bm_col_decode_code"))}</th>` : ""}<th class="num">${esc(t("bm_col_hit"))}</th></tr></thead>
       <tbody>${okTrials.map((x) => {
@@ -662,7 +698,14 @@ FTI18N.add({
           <td class="num ${win}">${fmtVal(x.decode_tps, "tok/s")}</td>
           ${anyCode ? `<td class="num ${win}">${fmtVal(x.decode_code_tps, "tok/s")}</td>` : ""}
           <td class="num ${win}">${fmt.pct(x.hit_rate)}</td></tr>`;
-      }).join("")}</tbody></table></div></div>` : "";
+      }).join("")}</tbody></table></div>`;
+    const when = (e) => new Date((e || 0) * 1000).toLocaleString(lang() === "ja" ? "ja-JP" : "en-US");
+    // a run that picked up from the last result: the runs it builds on, newest first, folded
+    const earlier = (r.earlier || []).slice().reverse().map((e) => `<details style="margin-top:12px"><summary class="small">${esc(t("bm_earlier",
+      { when: when(e.finished), mode: t(`bm_mode_${e.mode || "standard"}`), n: (e.trials || []).length }))}</summary>${tableOf(e.trials || [], e.chosen)}</details>`).join("");
+    const fromNote = r.from_last ? `<p class="small muted">${esc(t("bm_from_last_note", { when: when(r.from_last.finished) }))}</p>` : "";
+    const trialTable = okTrials.length ? `<div class="card"><h2>${esc(t("bm_trials_title"))}</h2>
+      <p class="hint">${esc(t("bm_trials_hint2"))}</p>${fromNote}${tableOf(okTrials, chosen)}${earlier}</div>` : "";
 
     const rank = (n) => (n.rejected ? 2 : n.source === "measured" ? 0 : 1);
     const notes = (r.notes || []).slice().sort((a, b) => rank(a) - rank(b));

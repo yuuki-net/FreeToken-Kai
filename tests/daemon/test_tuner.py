@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import io
 import json
+import os
 
 import pytest
 
@@ -802,3 +803,121 @@ def test_cancel_restores_and_reports(tmp_path):
     job._cancel.set()
     job._run("/models/M", True, 1919)
     assert job.state == "cancelled" and m.cfg == prev
+
+
+# ------------------------------------------------------------------ picking up from the last result
+def _no_hw(argv, env=None):
+    raise AssertionError(f"picking up must not measure the hardware again: {argv}")
+
+
+def _pickup_job(tmp_path, m, serve, rec=DENSE_REC):
+    job = _job(tmp_path, m, serve, rec=rec)
+    return job
+
+
+def test_picking_up_runs_only_what_the_last_run_did_not_try(tmp_path):
+    m = FakeManager()
+    serve = FakeServe(m, effects={"--kv-reserve-tokens=32768": (0.5, 1.0, 0.5)})
+    job = _pickup_job(tmp_path, m, serve)
+    first = _run(job, mode="standard")["result"]
+    assert first["tried"] and "budget_075" in first["tried"]
+    expected = [x["key"] for x in job.pending("/models/M", "thorough")["items"]]
+    assert expected, "the thorough plan should hold candidates a standard run did not try"
+    assert job.pending("/models/M", "standard")["items"] == []
+
+    job._spawn = _no_hw
+    job.start("/models/M", True, mode="thorough", from_last=True)
+    job._thread.join(30)
+    st = job.status()
+    assert st["state"] == "done", st["error"]
+    r = st["result"]
+    keys = [t.get("key") for t in r["trials"] if t.get("decision") != "base"]
+    assert [k for k in keys if not k.startswith("context_")] == expected
+    assert not any(k.startswith("context_") for k in keys)  # nothing new kept: the last tiers stand
+    assert r["from_last"]["finished"] == first["finished"] and r["hw"] == first["hw"]
+    assert set(first["tried"]) | set(expected) <= set(r["tried"])
+    base = [t for t in r["trials"] if t.get("decision") == "base"][0]
+    assert dict(tuner.parse_flags(base["args"]))["--kv-reserve-tokens"] == dict(tuner.parse_flags(first["args"]))["--kv-reserve-tokens"]
+    assert json.load(open(tmp_path / "tune" / "M.json"))["from_last"]  # the saved result is this one
+    # and a third pick-up has nothing left
+    assert job.pending("/models/M", "thorough")["items"] == []
+
+
+def test_a_new_win_when_picking_up_runs_the_context_tiers_again(tmp_path):
+    m = FakeManager()
+    serve = FakeServe(m, effects={"--kv-reserve-tokens=32768": (0.5, 1.0, 0.5)})
+    job = _pickup_job(tmp_path, m, serve)
+    _run(job, mode="standard")
+    new = job.pending("/models/M", "thorough")["items"][0]
+    flag, value = new["change"]["flag"], new["change"]["value"]
+    serve.effects[f"{flag}={value}" if value is not None else flag] = (1.0, 1.4, 1.0)
+    job._spawn = _no_hw
+    job.start("/models/M", True, mode="thorough", from_last=True)
+    job._thread.join(30)
+    r = job.status()["result"]
+    assert any(t.get("key") == new["key"] and t.get("decision") == "kept" for t in r["trials"])
+    assert any((t.get("key") or "").startswith("context_") for t in r["trials"])
+    assert new["key"] in r["kept"]
+
+
+def test_nothing_to_pick_up_from_is_refused_before_anything_stops(tmp_path):
+    m = FakeManager(running=("/models/Old", 1919, ["--old"]))
+    job = _pickup_job(tmp_path, m, FakeServe(m))
+    with pytest.raises(tuner.NoLastResult) as exc:
+        job.start("/models/M", True, from_last=True)
+    assert str(exc.value) == "no_last" and m.calls == []  # the running engine was left alone
+    assert job.pending("/models/M")["available"] is False
+
+
+def test_a_result_saved_before_the_record_still_counts_its_trials():
+    old = {"trials": [{"key": None, "decision": "base"}, {"key": "budget_075", "decision": "kept"},
+                      {"key": "max_prefill_16k", "decision": "rejected"}, {"key": "base_again", "decision": "base"}]}
+    assert tuner.prior_trials(old) == ({"budget_075", "max_prefill_16k"}, {"budget_075"})
+    assert tuner.last_refusal({"args": ["--x"], "hw": {}, "trials": []}, [0]) == "last_incomplete"
+    assert tuner.last_refusal({"args": ["--x"], "hw": {"a": 1}, "upstream": [{}], "trials": [{"decision": "base"}]}, [0, 1]) \
+        == "last_other_gpus"
+
+
+def test_a_kept_change_closes_the_one_that_would_undo_it_in_an_older_result():
+    # an older result has no record of groups: the plan its first settings opened says that the kept
+    # strategy_offload closed the "strategy" group, so strategy_hybrid -- offered by the final
+    # (offload) settings -- is not listed as untested
+    rec = _moe_rec()
+    facts, hw = tuner.host_facts(rec), {"measurements": {}}
+    base = list(rec["flags"])
+    final = tuner.set_flags(base, {"--moe-strategy": "offload"}, drop=("--moe-cpu-layers", "--moe-cpu-threads"))
+    offered = {c.key: c.group for c in search.plan(final, facts, hw, "thorough")}
+    assert offered.get("strategy_hybrid") == "strategy"
+    prev = {"base_args": base, "args": final, "trials": [{"key": None, "decision": "base"},
+                                                         {"key": "strategy_offload", "decision": "kept"}]}
+    tried, _ = tuner.prior_trials(prev)
+    assert "strategy" in tuner.closed_groups(prev, tried, facts, hw)
+
+
+def test_a_candidate_the_settings_already_carry_is_not_listed(tmp_path):
+    # four prefill pieces set the chunk ceiling to 16384, so "raise the ceiling to 16384" changes
+    # nothing: the run skips it without a start, and the list shown before must not count it
+    m = FakeManager()
+    job = _pickup_job(tmp_path, m, FakeServe(m))
+    args = DENSE_REC["flags"] + ["--max-prefill-length", "16384"]
+    os.makedirs(tmp_path / "tune")
+    with open(tmp_path / "tune" / "M.json", "w") as fh:
+        json.dump({"args": args, "base_args": DENSE_REC["flags"], "hw": {"measurements": {}}, "upstream": [{"gpu": 0}],
+                   "trials": [{"key": None, "decision": "base"}], "tried": ["budget_075"], "kept": [],
+                   "finished": 1.0, "mode": "standard"}, fh)
+    items = [x["key"] for x in job.pending("/models/M", "thorough")["items"]]
+    assert "max_prefill_16k" not in items
+
+
+def test_picking_up_keeps_the_earlier_runs_on_record(tmp_path):
+    m = FakeManager()
+    serve = FakeServe(m, effects={"--kv-reserve-tokens=32768": (0.5, 1.0, 0.5)})
+    job = _pickup_job(tmp_path, m, serve)
+    first = _run(job, mode="standard")["result"]
+    job._spawn = _no_hw
+    for _ in range(2):
+        job.start("/models/M", True, mode="thorough", from_last=True)
+        job._thread.join(30)
+    r = job.status()["result"]
+    assert [e["finished"] for e in r["earlier"]][0] == first["finished"] and len(r["earlier"]) == 2
+    assert r["earlier"][0]["trials"] == json.loads(json.dumps(first["trials"]))  # as saved
