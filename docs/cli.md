@@ -74,7 +74,7 @@ ft serve --model ... --gpu GPU-9e8d7c6b  # the same card by UUID (a unique prefi
 | Flag | Default | Meaning |
 |---|---|---|
 | `--memory-ratio` | 0.9 | Fraction of free VRAM the engine may use (weights + MoE cache + KV) |
-| `--host-embedding` | off | Keep the input embedding table in pinned host memory and gather its rows over PCIe in place, inside CUDA graphs too. Frees about 1 GB on a 250k-token vocabulary, which becomes KV pages on a small card. Qwen3.5-MoE family |
+| `--host-embedding` | off | Keep the input embedding table in pinned host memory and gather its rows over PCIe in place, inside CUDA graphs too. Frees about 1 GB on a 250k-token vocabulary, which becomes KV pages on a small card. Qwen3.5-MoE and Qwen3.8-Flash-Next families (on Flash-Next the host copy stays in the model dtype: about 0.6 GiB of VRAM for 1.3 GB of pinned RAM under `--dense-quant fp8`) |
 | `--num-pages` / `--num-tokens` | auto | KV capacity override in pages / tokens (mutually exclusive; auto sizes from VRAM left after weights and MoE cache) |
 | `--page-size` | 1 | KV page size; DSV4 forces 128, the TRTLLM backend needs 16/32/64, SWA models require 1 |
 | `--cache-type` | radix | `radix` (prefix reuse; SWA/GDN-aware variants picked automatically) or `naive` |

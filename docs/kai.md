@@ -322,7 +322,12 @@ ft serve ... --host-embedding --kv-reserve-tokens 65536 --max-seq-len-override 6
 Measured on the 2060 (Ornith, fp16, hybrid): 65,606 KV tokens allocated (1.25 GiB) with
 0.44 GiB of VRAM still free after the graphs, decode 37-39 tok/s, host RAM +1 GB (pinned; it
 counts against the pin quota, so two or three more bank layers decode on the CPU). Untied
-vocabularies only (Ornith's is untied); Qwen3.5-MoE family.
+vocabularies only (Ornith's is untied); Qwen3.5-MoE and Qwen3.8-Flash-Next families.
+
+On Qwen3.8-Flash-Next the table stays in the model dtype on the host, while `--dense-quant fp8`
+would hold it as fp8 in VRAM: the trade is about 0.6 GiB of VRAM for 1.3 GB of pinned RAM. Until
+this build, Flash-Next ignored the flag (the table stayed in VRAM, and the engine now warns for a
+model that does). Not yet measured on a card.
 
 ## Environment variables added by this fork
 
