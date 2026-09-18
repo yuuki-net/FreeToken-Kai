@@ -12,7 +12,9 @@ start passed, which is why it went unseen.
 
 ``wait_for_ranks`` puts a ``monitored_barrier`` with its own, long timeout in front of such a
 collective: the early rank waits there, the collective then runs with every rank present, and a
-wait long enough to notice is logged with what was being waited for.
+wait long enough to notice is logged with what was being waited for. The barrier runs on a twin
+of the group that carries the long timeout, because on the group itself only rank 0 would get it
+(``_join_group``): the fix above covered a late rank 1 and not a late rank 0.
 """
 
 from __future__ import annotations
@@ -30,6 +32,31 @@ logger = init_logger(__name__)
 # below this a wait is ordinary startup jitter and not worth a line
 _LOG_AFTER_S = 10.0
 
+# group -> its twin with the join timeout, built on the first wait (every rank passes the waits in
+# the same order, so every member builds it at the same point)
+_join_groups: dict[dist.ProcessGroup, dist.ProcessGroup] = {}
+
+
+def _join_group(group: dist.ProcessGroup, timeout: float) -> dist.ProcessGroup:
+    """The same ranks as ``group`` under the join timeout.
+
+    ``monitored_barrier``'s own timeout only bounds rank 0's wait: every other rank sends to rank
+    0 and waits for its reply under the GROUP's timeout. So on ``group`` (60 s) a rank 0 that is
+    still loading when rank 1 arrives is not waited for -- rank 1 gives up after 60 s ("received
+    errors while waiting for send/recv from rank 0"), whatever ``timeout`` says. Seen with
+    ``--pp-layers 34`` on two RTX 3060s, where the heavier rank 0 loaded for over a minute.
+    """
+    joined = _join_groups.get(group)
+    if joined is None:
+        joined = dist.new_group(
+            ranks=dist.get_process_group_ranks(group),
+            backend="gloo",
+            timeout=timedelta(seconds=timeout),
+            use_local_synchronization=True,
+        )
+        _join_groups[group] = joined
+    return joined
+
 
 def wait_for_ranks(group: dist.ProcessGroup | None, what: str) -> float:
     """Block until every rank of ``group`` reaches this call, for up to
@@ -42,7 +69,9 @@ def wait_for_ranks(group: dist.ProcessGroup | None, what: str) -> float:
         return 0.0
     timeout = float(ENV.RANK_JOIN_TIMEOUT_SECONDS.value)
     started = time.monotonic()
-    dist.monitored_barrier(group=group, timeout=timedelta(seconds=timeout), wait_all_ranks=True)
+    dist.monitored_barrier(
+        group=_join_group(group, timeout), timeout=timedelta(seconds=timeout), wait_all_ranks=True
+    )
     waited = time.monotonic() - started
     if waited >= _LOG_AFTER_S:
         logger.info(
