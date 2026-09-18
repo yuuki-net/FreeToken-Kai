@@ -89,6 +89,18 @@ Fourteen is what the arithmetic says: 4 VRAM cache slots + 24 host slots hold 28
 conversation there costs two. A hit restored from RAM is as fast as one from VRAM; the copy back
 up is a few milliseconds.
 
+On two RTX 3060s with Qwen3.8-Flash-Next-NVFP4 (`--pp-size 2`), twenty-four different 703-token
+prompts, the same way, alternating twice:
+
+| | Conversations kept | Time to first token, hit | miss | Decode |
+|---|---|---|---|---|
+| off (default) | **5** of 24 | 0.30-0.41 s | 7.3-7.4 s | 19.15-19.18 tok/s |
+| `--linear-state-host-slots 24` | **24** of 24 | 0.49-0.50 s | (none) | 19.07-19.27 tok/s |
+
+All twenty-four stayed reusable, so 24 host slots are not the ceiling there. A hit restored from
+RAM costs about 0.15 s more than one from VRAM on these cards, a fifteenth of the re-prefill it
+saves, and decode is unchanged.
+
 - **Cost.** One GDN state of pinned RAM per slot (1.44 GiB for 24 on Ornith; with `--pp-size`
   each rank holds only its own GDN layers). It counts against the pin budget, so on WSL, where
   pinning is capped, the expert banks get that much less: on the 2060 `--moe-cpu-layers auto`
