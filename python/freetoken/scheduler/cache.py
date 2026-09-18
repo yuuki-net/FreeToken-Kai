@@ -115,8 +115,13 @@ class CacheManager:
 
     @property
     def mamba_available_size(self) -> int:
-        """Hybrid only: free GDN state slots + evictable (unlocked) tree snapshots."""
-        return self.linear_state_pool.num_free_slots + self.prefix_cache.mamba_evictable_size
+        """Hybrid only: free GDN state slots + evictable (unlocked) tree snapshots. With a host
+        tier only the snapshots on the device count: a host one gives no device slot back."""
+        pool = self.linear_state_pool
+        if not pool.host_slots:
+            return pool.num_free_slots + self.prefix_cache.mamba_evictable_size
+        on_device = self.prefix_cache.count_snapshots(lambda s: not pool.is_host(s), unlocked=True)
+        return pool.num_free_slots + on_device
 
     @property
     def swa_available_size(self) -> int:
@@ -139,13 +144,33 @@ class CacheManager:
 
     def ensure_mamba_slots(self, n: int) -> None:
         """Free GDN state slots until >= ``n`` are available by tombstoning LRU tree snapshots
-        (evict_mamba), returning their slots + any freed KV to the pools."""
-        while self.linear_state_pool.num_free_slots < n:
-            er = self.prefix_cache.evict_mamba(n - self.linear_state_pool.num_free_slots)
+        (evict_mamba), returning their slots + any freed KV to the pools.
+
+        With a host tier (--linear-state-host-slots) a device snapshot is first moved down to
+        the host instead of thrown away, the host making room for it by dropping its own least
+        recently used snapshot; only when nothing can move does a device snapshot get evicted.
+        Every choice here is a function of the tree and the slot counts, which every pipeline
+        rank's replica shares, so the ranks keep choosing the same snapshots with no message."""
+        pool, pc = self.linear_state_pool, self.prefix_cache
+        while pool.num_free_slots < n:
+            need = n - pool.num_free_slots
+            if pool.host_slots:
+                short = need - pool.num_free_host_slots
+                if short > 0:
+                    self._drop_mamba(pc.evict_mamba(short, where=pool.is_host))
+                if pc.move_mamba(min(need, pool.num_free_host_slots),
+                                 lambda s: not pool.is_host(s), pool.demote):
+                    continue
+                er = pc.evict_mamba(need, where=lambda s: not pool.is_host(s))
+            else:
+                er = pc.evict_mamba(need)
             if not er.mamba_slots:
                 break
-            self.linear_state_pool.free(er.mamba_slots)
-            self._free(er.kv_indices)
+            self._drop_mamba(er)
+
+    def _drop_mamba(self, er) -> None:
+        self.linear_state_pool.free(er.mamba_slots)
+        self._free(er.kv_indices)
 
     def snapshot_toolcall_anchor(self, reqs: List[Req]) -> None:
         """Freeze each decoding request's GDN state at its tool-call anchor, into the ping-pong
@@ -733,9 +758,15 @@ class CacheManager:
             # exceed the (non-padding) pool capacity; the remainder is held by running requests.
             pool = self.linear_state_pool
             tree_slots = pc.mamba_evictable_size + pc.mamba_protected
-            assert pool.num_free_slots + tree_slots <= pool.num_slots - 1, (
-                f"GDN-slot leak: free({pool.num_free_slots}) + tree({tree_slots}) > "
+            host_slots = pc.count_snapshots(pool.is_host) if pool.host_slots else 0
+            assert pool.num_free_slots + tree_slots - host_slots <= pool.num_slots - 1, (
+                f"GDN-slot leak: free({pool.num_free_slots}) + tree({tree_slots - host_slots}) > "
                 f"capacity({pool.num_slots - 1})"
+            )
+            # the host tier holds tree snapshots and nothing else, so it balances exactly
+            assert pool.num_free_host_slots + host_slots == pool.host_slots, (
+                f"GDN host-slot leak: free({pool.num_free_host_slots}) + tree({host_slots}) != "
+                f"capacity({pool.host_slots})"
             )
         elif self.is_swa:
             pc = self.prefix_cache

@@ -16,7 +16,7 @@ from __future__ import annotations
 import heapq
 import time
 from dataclasses import dataclass
-from typing import List, NamedTuple, Optional, Tuple
+from typing import Callable, List, NamedTuple, Optional, Tuple
 
 import torch
 
@@ -171,12 +171,15 @@ class HybridRadixCache:
                 heapq.heappush(leaves, parent)
         return EvictResult(torch.cat(kv) if kv else self.empty, mamba)
 
-    def evict_mamba(self, num: int) -> EvictResult:
+    def evict_mamba(self, num: int, where: Optional[Callable[[int], bool]] = None) -> EvictResult:
         """Evict GDN snapshots by LRU over UNLOCKED snapshot-bearing nodes -- internal nodes
         too. Internal node -> TOMBSTONE (free the slot, keep KV + children). Leaf node -> free
         both KV and slot and unlink, then cascade-delete any KV-only tombstone leaves it exposes
-        upward (so a leaf always carries a live snapshot -- mirrors sglang)."""
-        cands = [n for n in self._snapshot_nodes() if n.mamba_ref_count == 0]
+        upward (so a leaf always carries a live snapshot -- mirrors sglang). ``where(slot)``
+        narrows the candidates to snapshots whose slot it accepts (the host tier's, or the
+        device's)."""
+        cands = [n for n in self._snapshot_nodes()
+                 if n.mamba_ref_count == 0 and (where is None or where(n.mamba_value))]
         heapq.heapify(cands)
         kv, mamba, freed = [], [], 0
         while freed < num and cands:
@@ -193,6 +196,25 @@ class HybridRadixCache:
                 self._free_node_mamba(node, mamba)  # tombstone internal (or locked-KV) node
                 freed += 1
         return EvictResult(torch.cat(kv) if kv else self.empty, mamba)
+
+    def move_mamba(self, num: int, where: Callable[[int], bool], move: Callable[[int], int]) -> int:
+        """Re-home up to ``num`` UNLOCKED snapshots whose slot ``where`` accepts, least recently
+        used first: ``move(slot)`` returns the snapshot's new slot id, which replaces the old one
+        on the node. The node keeps its KV, children and place in the LRU -- only where its
+        snapshot lives changes. Returns how many moved."""
+        cands = [n for n in self._snapshot_nodes() if n.mamba_ref_count == 0 and where(n.mamba_value)]
+        heapq.heapify(cands)
+        moved = 0
+        while moved < num and cands:
+            node = heapq.heappop(cands)
+            node.mamba_value = move(node.mamba_value)
+            moved += 1
+        return moved
+
+    def count_snapshots(self, where: Callable[[int], bool], *, unlocked: bool = False) -> int:
+        """Snapshots whose slot ``where`` accepts (only the unlocked ones with ``unlocked``)."""
+        return sum(1 for n in self._snapshot_nodes()
+                   if where(n.mamba_value) and not (unlocked and n.mamba_ref_count))
 
     @property
     def full_evictable_size(self) -> int:

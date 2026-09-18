@@ -172,11 +172,12 @@ class PoolLayout:
         return out
 
     def read_state(self, slot: int) -> List[Tuple[str, torch.Tensor]]:
+        # state_views finds the snapshot on either tier (a host one is waited for first)
         out = []
-        for name, buf in self._state_tensors():
-            host = torch.empty((buf.shape[0], *buf.shape[2:]), dtype=buf.dtype)
-            for layer in range(buf.shape[0]):
-                host[layer].copy_(buf[layer, slot])
+        for name, view in self.linear_pool.state_views(slot):
+            host = torch.empty(view.shape, dtype=view.dtype)
+            for layer in range(view.shape[0]):
+                host[layer].copy_(view[layer])
             out.append((name, host))
         return out
 

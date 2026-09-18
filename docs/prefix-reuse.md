@@ -66,6 +66,43 @@ share of what the expert cache has to work with, so the trade is cheaper.
 - **You mostly continue one conversation**: leave it at the default. Continuing a conversation
   hits, and the VRAM is worth more to the expert cache.
 
+## Keeping snapshots in RAM instead (`--linear-state-host-slots`)
+
+Raising the ratio buys conversations with VRAM. `--linear-state-host-slots N` buys them with
+pinned host RAM instead: when the VRAM slots run short, the least recently used snapshot the
+cache holds is copied down to one of N host slots and its VRAM slot is reused, instead of the
+snapshot being thrown away. A later prompt that resumes from it copies it back up first.
+
+```bash
+ft serve ... --linear-state-host-slots 24
+```
+
+Measured on the RTX 2060 with Ornith-1.5-35B-A3B-NVFP4 (`--max-running-req 1`, default ratio),
+sixteen different 473-token prompts sent once and again in reverse:
+
+| | Conversations kept | Time to first token, hit | miss |
+|---|---|---|---|
+| off (default) | **2** of 16 | 0.69 s | 3.00 s |
+| `--linear-state-host-slots 24` | **14** of 16 | 0.64 s | 2.74 s |
+
+Fourteen is what the arithmetic says: 4 VRAM cache slots + 24 host slots hold 28 snapshots, and a
+conversation there costs two. A hit restored from RAM is as fast as one from VRAM; the copy back
+up is a few milliseconds.
+
+- **Cost.** One GDN state of pinned RAM per slot (1.44 GiB for 24 on Ornith; with `--pp-size`
+  each rank holds only its own GDN layers). It counts against the pin budget, so on WSL, where
+  pinning is capped, the expert banks get that much less: on the 2060 `--moe-cpu-layers auto`
+  moved from 21 to 24 CPU layers. Decode did not measurably change: 31.0 / 34.6 tok/s off,
+  34.9 / 28.3 on, alternating (1500 tokens each) -- the spread within one setting is larger than
+  the gap. A card or a quota where the banks are tighter may show a cost; check yours the same way.
+- **Nothing else changes.** Off by default; with it off the cache behaves exactly as before.
+  VRAM use is the same either way.
+- **Pipelines.** Every choice (which snapshot moves down, which one is dropped) follows from the
+  tree and the slot counts, which every `--pp-size` rank's replica shares, so the ranks stay in
+  step without exchanging anything.
+- **With `--prefix-disk-cache`.** Both work together: what reaches the disk is read from either
+  tier.
+
 ## How to tell on your machine
 
 The decode log prints the pool as `#mamba-slot: used/total`, and each prefill prints

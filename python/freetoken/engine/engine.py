@@ -678,6 +678,7 @@ class Engine:
         self._host_tables_bytes += self._mtp_bank_bytes  # the draft head's pinned bank layer
         self._host_tables_bytes += getattr(self, "_host_resident_bytes", 0)  # --host-embedding
         self._host_tables_bytes += self._encoder_pinned_bytes  # the vision tower's streamed blocks
+        self._host_tables_bytes += _linear_state_host_bytes(config)  # --linear-state-host-slots
         if is_offload_moe_strategy(config.moe_strategy):
             self._init_offload_moe_cache(config)
         if hasattr(self.model, "prepare_for_runtime"):
@@ -739,6 +740,14 @@ class Engine:
                 tp_size=config.tp_size,
                 slot_states=config.model_config.slot_states,
             )
+            host_slots = _linear_state_host_slots(config)
+            if host_slots:
+                self.linear_state_pool.enable_host_tier(host_slots)
+                logger.info(
+                    f"GDN snapshots: {host_slots} pinned host slots behind the device ones, "
+                    f"{mem_GB(host_slots * self.linear_state_pool.bytes_per_slot())} "
+                    "(--linear-state-host-slots)"
+                )
             self.ctx.linear_state_pool = self.linear_state_pool
         else:
             self.linear_state_pool = None
@@ -2874,6 +2883,34 @@ def _cpu_moe_executor_viable(model_config) -> bool:
     expert_quant = getattr(model_config, "expert_quant", "none")
     fmt = expert_quant if expert_quant != "none" else (moe_wfmt or "bf16")
     return fmt == "mxfp4" or fmt in _WFMT_IDS
+
+
+def _linear_state_host_slots(config) -> int:
+    """--linear-state-host-slots where it applies (a hybrid GDN model on the hybrid radix cache,
+    the only cache that keeps snapshots), else 0."""
+    n = int(getattr(config, "linear_state_host_slots", 0) or 0)
+    if n <= 0:
+        return 0
+    if config.model_config.linear_attention_group() is None or config.cache_type != "hybrid_radix":
+        logger.warning_rank0(
+            "--linear-state-host-slots is for hybrid GDN models on the hybrid radix cache; ignored"
+        )
+        return 0
+    return n
+
+
+def _linear_state_host_bytes(config) -> int:
+    """Pinned bytes the host tier of the GDN snapshots takes (this rank's GDN layers only)."""
+    n = _linear_state_host_slots(config)
+    if not n:
+        return 0
+    from freetoken.kvcache.linear_state_pool import linear_state_bytes_per_req
+
+    per = linear_state_bytes_per_req(
+        config.model_config.linear_attention_group(), config.tp_size, config.dtype,
+        getattr(config.model_config, "slot_states", ()),
+    )
+    return n * per
 
 
 def _pin_budget_bytes(reserved: int = 0) -> int | None:

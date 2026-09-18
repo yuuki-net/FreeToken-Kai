@@ -772,6 +772,19 @@ def parse_args(
         ),
     )
     parser.add_argument(
+        "--linear-state-host-slots",
+        type=int,
+        default=ServerArgs.linear_state_host_slots,
+        help=(
+            "Hybrid GDN models: pinned host RAM slots for GDN-state snapshots (default 0 = off). "
+            "When the VRAM snapshot slots (--linear-state-cache-ratio) run short, the least "
+            "recently used snapshot moves here instead of being dropped, and a later hit copies "
+            "it back up (a few ms). This raises how many conversations stay reusable without "
+            "spending VRAM: each slot costs one GDN state of pinned RAM (about 62 MiB for 30 GDN "
+            "layers; per pipeline rank, its own layers only) and counts against the pin budget."
+        ),
+    )
+    parser.add_argument(
         "--prefix-disk-cache",
         default=ServerArgs.prefix_disk_cache,
         metavar="DIR",

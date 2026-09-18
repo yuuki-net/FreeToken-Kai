@@ -95,16 +95,101 @@ class LinearStatePool:
         self.padding_slot = 0
         self._free_slots: list[int] = list(range(1, num_slots))
 
-    def _alloc_slot_states(self, num_slots: int) -> dict[str, torch.Tensor]:
+        # Host tier (--linear-state-host-slots): a second, pinned home for snapshots the radix
+        # tree holds but nobody is using. When the device slots run short, the least recently
+        # used unlocked snapshot is copied down here and its device slot goes back to the
+        # free-list, instead of the snapshot being thrown away. A host snapshot is never a live
+        # state: it is only ever the source of a copy_from, which brings it back up. Host slot ids
+        # live above HOST_BASE so a slot id alone says where the state is.
+        self._host_slots = 0
+        self._free_host: list[int] = []
+        self._host_events: dict[int, torch.cuda.Event] = {}
+        self.host_conv_states = self.host_recurrent_states = None
+        self.host_slot_states: dict[str, torch.Tensor] = {}
+
+    def _alloc_slot_states(self, num_slots: int, device=None, pin: bool = False) -> dict[str, torch.Tensor]:
         return {
             spec.name: torch.full(
                 (max(1, len(spec.layer_ids)), num_slots, *spec.shape),
                 spec.fill_value,
                 dtype=spec.dtype if spec.dtype is not None else self._conv_dtype,
-                device=self._device,
+                device=self._device if device is None else device,
+                pin_memory=pin,
             )
             for spec in self._slot_specs
         }
+
+    # ---------------------------------------------------------------- host tier
+    HOST_BASE = 1 << 30
+
+    def enable_host_tier(self, host_slots: int) -> None:
+        """Allocate ``host_slots`` pinned snapshot slots (0 = no host tier). Drops whatever
+        the host tier held, so it is for startup and for an idle rebuild only."""
+        self._host_slots = max(0, int(host_slots))
+        self._free_host = list(range(self._host_slots))
+        self._host_events = {}
+        if self._host_slots == 0:
+            self.host_conv_states = self.host_recurrent_states = None
+            self.host_slot_states = {}
+            return
+        pin = self._device.type == "cuda"
+        n = self._host_slots
+        self.host_conv_states = torch.zeros(
+            (self.conv_states.shape[0], n, *self.conv_states.shape[2:]),
+            dtype=self.conv_states.dtype, pin_memory=pin,
+        )
+        self.host_recurrent_states = torch.zeros(
+            (self.recurrent_states.shape[0], n, *self.recurrent_states.shape[2:]),
+            dtype=self.recurrent_states.dtype, pin_memory=pin,
+        )
+        self.host_slot_states = self._alloc_slot_states(n, device="cpu", pin=pin)
+
+    @property
+    def host_slots(self) -> int:
+        return self._host_slots
+
+    @property
+    def num_free_host_slots(self) -> int:
+        return len(self._free_host)
+
+    def is_host(self, slot: int) -> bool:
+        return slot >= self.HOST_BASE
+
+    def demote(self, slot: int) -> int:
+        """Move the snapshot in device ``slot`` to a free host slot and give ``slot`` back to
+        the device free-list. Returns the host slot id. The copy is queued on the current
+        stream, which every later use of either slot is ordered behind: a forward waits for it
+        before writing the freed device slot, and a copy_from back up queues after it."""
+        assert not self.is_host(slot) and self._free_host, "demote needs a device slot and a free host slot"
+        h = self._free_host.pop()
+        self.host_conv_states[:, h].copy_(self.conv_states[:, slot], non_blocking=True)
+        self.host_recurrent_states[:, h].copy_(self.recurrent_states[:, slot], non_blocking=True)
+        for name, t in self.slot_states.items():
+            self.host_slot_states[name][:, h].copy_(t[:, slot], non_blocking=True)
+        if self._device.type == "cuda":
+            ev = torch.cuda.Event()
+            ev.record()
+            self._host_events[h] = ev
+        self._free_slots.append(slot)
+        return self.HOST_BASE + h
+
+    def state_views(self, slot: int) -> list[tuple[str, torch.Tensor]]:
+        """``(name, [layers, *shape])`` views of one snapshot wherever it lives: conv,
+        recurrent, then the declared slot states by name. A host view is waited for first, so
+        the CPU can read it."""
+        if self.is_host(slot):
+            h = slot - self.HOST_BASE
+            ev = self._host_events.get(h)
+            if ev is not None:
+                ev.synchronize()
+            conv, rec, extra = self.host_conv_states, self.host_recurrent_states, self.host_slot_states
+            i = h
+        else:
+            conv, rec, extra = self.conv_states, self.recurrent_states, self.slot_states
+            i = slot
+        return [("conv", conv[:, i]), ("recurrent", rec[:, i])] + [
+            (f"slot.{n}", extra[n][:, i]) for n in sorted(extra)
+        ]
 
     def has_slot_state(self, name: str) -> bool:
         return name in self.slot_states
@@ -134,8 +219,11 @@ class LinearStatePool:
     def reclaim_all_slots(self) -> None:
         """Restore the free-list to all non-padding slots. Idle-only: the caller (e.g. a
         CacheManager rebuild that discards the tree owning donated snapshots) must guarantee no
-        running request holds a slot, otherwise live state would be handed out twice."""
+        running request holds a slot, otherwise live state would be handed out twice. The host
+        tier only ever holds tree snapshots, so it is emptied too."""
         self._free_slots = list(range(1, self._num_slots))
+        self._free_host = list(range(self._host_slots))
+        self._host_events = {}
 
     def rebuild(self, num_slots: int) -> None:
         """Reallocate the conv + recurrent state tensors for ``num_slots`` slots IN PLACE.
@@ -167,14 +255,21 @@ class LinearStatePool:
         self.slot_states = self._alloc_slot_states(num_slots)
         self._num_slots = num_slots
         self._free_slots = list(range(1, num_slots))
+        self._free_host = list(range(self._host_slots))  # the host tier's tensors keep their size
+        self._host_events = {}
 
     def free(self, slots) -> None:
-        """Return slot ids to the free-list. Accepts an int, list, or 1-D tensor."""
+        """Return slot ids (device or host) to their free-list. Accepts an int, list, or 1-D tensor."""
         if isinstance(slots, torch.Tensor):
             slots = slots.flatten().tolist()
         elif isinstance(slots, int):
             slots = [slots]
-        self._free_slots.extend(int(s) for s in slots)
+        for s in slots:
+            s = int(s)
+            if s >= self.HOST_BASE:
+                self._free_host.append(s - self.HOST_BASE)
+            else:
+                self._free_slots.append(s)
 
     def clear_slots(self, slots) -> None:
         """Zero conv + recurrent state at ``slots`` across all linear layers (fresh sequence)."""
@@ -187,7 +282,15 @@ class LinearStatePool:
 
     def copy_from(self, src: int, dst: int) -> None:
         """Copy a whole-sequence snapshot (conv + recurrent, all layers) from slot ``src`` to
-        ``dst``. Used for COW-on-restore (donated snapshot -> fresh live slot)."""
+        ``dst``. Used for COW-on-restore (donated snapshot -> fresh live slot). ``src`` may be a
+        host snapshot; ``dst`` is always a device slot."""
+        if self.is_host(src):
+            h = src - self.HOST_BASE
+            self.conv_states[:, dst].copy_(self.host_conv_states[:, h], non_blocking=True)
+            self.recurrent_states[:, dst].copy_(self.host_recurrent_states[:, h], non_blocking=True)
+            for name, t in self.slot_states.items():
+                t[:, dst].copy_(self.host_slot_states[name][:, h], non_blocking=True)
+            return
         self.conv_states[:, dst].copy_(self.conv_states[:, src])
         self.recurrent_states[:, dst].copy_(self.recurrent_states[:, src])
         for t in self.slot_states.values():
