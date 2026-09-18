@@ -1,7 +1,8 @@
 """Let a rank that finishes a startup step early wait for the others, for longer than a step would.
 
-The gloo group's timeout (``distributed_timeout``, 60 s) is also what turns a wedged rank into a
-failure while serving, so it stays short. At startup it is wrong: the ranks load different halves
+The gloo group's own timeout bounds each wait while serving (``distributed_timeout``, 60 s, for
+tensor parallel; ``FREETOKEN_RANK_WAIT_TIMEOUT_SECONDS`` for ``--pp-size``, whose steps can run
+longer, see engine ``_pp_group_timeout``). At startup neither fits: the ranks load different halves
 of the model and reach the first collective at different times, and the gap is not bounded by
 anything a step is. Measured on two RTX 3060s (Qwen3.8-Flash-Next, ``--pp-size 2``,
 ``--moe-bank-ram 48G``) right after WSL restarted, with 46 GiB of RAM held by another process: rank

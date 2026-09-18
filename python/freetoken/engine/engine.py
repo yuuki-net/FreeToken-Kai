@@ -1112,11 +1112,17 @@ class Engine:
             from freetoken.distributed import get_pp_info
             from freetoken.distributed.pipeline import PipelineComm
 
+            # Every serving exchange between the ranks (the residual stream, the sampled tokens,
+            # the scheduler's per-step message count) is a gloo send/recv on this group, and gloo
+            # ends a recv at the group's timeout. A step on the first rank can legitimately run
+            # past --distributed-timeout's 60 s, so the group carries _pp_group_timeout instead;
+            # a dead peer still fails at once (gloo sees the closed connection), and a stuck one
+            # is reported by the rank-wait watchdog.
             torch.distributed.init_process_group(
                 backend="gloo",
                 rank=config.tp_info.rank,
                 world_size=config.tp_info.size,
-                timeout=timedelta(seconds=config.distributed_timeout),
+                timeout=timedelta(seconds=_pp_group_timeout(config)),
                 init_method=config.distributed_addr,
             )
             tp_cpu_group = torch.distributed.group.WORLD
@@ -2940,6 +2946,14 @@ def _cpu_moe_executor_viable(model_config) -> bool:
     expert_quant = getattr(model_config, "expert_quant", "none")
     fmt = expert_quant if expert_quant != "none" else (moe_wfmt or "bf16")
     return fmt == "mxfp4" or fmt in _WFMT_IDS
+
+
+def _pp_group_timeout(config) -> float:
+    """Seconds the --pp-size gloo group lets a send/recv block: FREETOKEN_RANK_WAIT_TIMEOUT_SECONDS,
+    never below --distributed-timeout (the group used to carry that alone, 60 s)."""
+    from freetoken.env import ENV
+
+    return max(float(config.distributed_timeout), float(ENV.RANK_WAIT_TIMEOUT_SECONDS.value))
 
 
 def _linear_state_host_slots(config) -> int:

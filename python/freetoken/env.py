@@ -81,10 +81,16 @@ class EnvClassSingleton:
     # Both repeat every max(threshold, 60 s) while the condition lasts.
     ADMISSION_WARN_SECONDS = EnvFloat(30.0)
     RANK_WAIT_WARN_SECONDS = EnvFloat(60.0)
-    # How long a rank that reaches a startup collective early waits for the others (seconds). The
-    # gloo group's own timeout stays at --distributed-timeout for serving; loading can leave the
-    # ranks minutes apart (distributed/rendezvous.py).
+    # How long a rank that reaches a startup collective early waits for the others (seconds);
+    # loading can leave the ranks minutes apart (distributed/rendezvous.py).
     RANK_JOIN_TIMEOUT_SECONDS = EnvFloat(3600.0)
+    # --pp-size: how long a gloo send/recv between the ranks may block while serving (seconds)
+    # before gloo gives up and the server stops. A rank that died is seen at once ("Connection
+    # closed by peer") whatever this is; it only bounds a rank that is alive but not answering,
+    # which RANK_WAIT_WARN_SECONDS already reports. The group used to carry
+    # --distributed-timeout (60 s) here, and a step on one rank that ran past a minute (reported
+    # once, on a first request after a start) took the server down.
+    RANK_WAIT_TIMEOUT_SECONDS = EnvFloat(86400.0)
 
     def __new__(cls):
         # single instance

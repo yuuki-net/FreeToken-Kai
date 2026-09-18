@@ -69,9 +69,16 @@ Ornith-1.5-35B-A3B; `qwen3_5_moe`) and gpt-oss (`gpt_oss`). Others raise
   waiting forever.
 - Every blocking send and receive between the ranks is watched. A wait longer than
   `FREETOKEN_RANK_WAIT_WARN_SECONDS` (60) logs which rank is waiting for what, again every
-  minute while it lasts, and how long it took once it ends. Nothing times out. A wait of tens of
-  seconds can be a long prefill chunk on the other rank; one that keeps growing means that rank
-  has stopped, and its own log (or `py-spy dump`) says where.
+  minute while it lasts, and how long it took once it ends. A wait of tens of seconds can be a
+  long prefill chunk on the other rank; one that keeps growing means that rank has stopped, and
+  its own log (or `py-spy dump`) says where. A rank that exits is seen at once (its connections
+  close); one that is alive but stuck is waited for up to `FREETOKEN_RANK_WAIT_TIMEOUT_SECONDS`
+  (a day). Before, gloo ended any such wait at `--distributed-timeout`'s 60 s, so a step on one
+  rank that ran past a minute stopped the server with `Timed out waiting 60000ms for recv
+  operation`. It was reported once, on the first request after a start of a new build (two
+  RTX 3060s, `--moe-strategy offload` without `--moe-bank-ram`); why that step was so long is not
+  known. An empty Triton cache is not it, at least on an RTX 2060: its kernels compile during the
+  startup warmup, and the longest step of the first 12k-token prompt was 7 s.
 - At startup the ranks load different halves of the model and reach the points where they
   agree on the KV page count and the prefill chunk at different times. Each of those points
   starts with a barrier that waits up to `FREETOKEN_RANK_JOIN_TIMEOUT_SECONDS` (3600) for the
