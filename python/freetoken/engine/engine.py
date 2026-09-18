@@ -387,6 +387,26 @@ def _remap_weights(weights, remap, model_state: Dict[str, torch.Tensor]):
         yield from remap(key, weight, model_state)
 
 
+def _host_embedding_ignored(config, host_prefixes: tuple[str, ...]) -> str | None:
+    """The warning for --host-embedding on a model that does not build a host embedding.
+
+    The flag marks the model config (``embed_host``); only the model families that read that
+    mark move the table to pinned RAM, and the rest built it in VRAM with no word -- on
+    Qwen3.8-Flash-Next the flag was measured to free nothing (a 12 GB single-card start, -0.01
+    GiB), and a fork running Kai took it for working. Returns None when the table did move, when
+    the flag is off, or on a pipeline rank that does not own the table."""
+    if not getattr(config, "host_embedding", False) or not getattr(config, "pp_is_first", True):
+        return None
+    if "model.embed_tokens." in host_prefixes:
+        return None
+    arch = getattr(getattr(config, "model_config", None), "model_type", None) or "this model"
+    return (
+        f"--host-embedding has no effect on {arch}: its embedding table is built in VRAM as "
+        "usual (only Qwen3.5-MoE family models move it to pinned RAM). Drop the flag, or count "
+        "the table in the VRAM budget."
+    )
+
+
 _MTP_PER_EXPERT_RE = re.compile(r"^mtp\.layers\.\d+\.mlp\.experts\.\d+\.")
 
 
@@ -1136,6 +1156,9 @@ class Engine:
         host_prefixes = tuple(getattr(self.model, "host_resident_prefixes", ()))
         if host_prefixes:
             logger.info(f"host-resident weights (pinned RAM, gathered by the GPU in place): {host_prefixes}")
+        note = _host_embedding_ignored(config, host_prefixes)
+        if note:
+            logger.warning(note)
         if config.use_dummy_weight:
             return _make_dummy_weight_state_dict(model_state, device=self.device, host_prefixes=host_prefixes)
         if config.active_encoders and ftw_lacks_vision(config.model_path):
