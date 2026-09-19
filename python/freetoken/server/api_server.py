@@ -59,6 +59,11 @@ _MODEL_SAMPLING: Dict[str, Any] = {}
 # shutdown is treated as expected — no ERROR log, no "failed" latch. See run_backend_supervisor.
 _SHUTTING_DOWN = threading.Event()
 BACKEND_DEATH_EXIT_GRACE_S = 10.0
+# How long an orderly stop waits for open HTTP connections. uvicorn's default is no limit, and a
+# stream that was generating when the stop came never ends -- its scheduler worker has already
+# gone -- so a SIGTERM mid-generation left the API process up until something SIGKILLed it (90 s
+# later under systemd).
+GRACEFUL_SHUTDOWN_S = 5
 
 
 def get_global_state() -> FrontendManager:
@@ -904,7 +909,8 @@ def _serve_and_run_shell(host: str, port: int) -> None:
     netloc = f"[{host}]:{port}" if ":" in host else f"{host}:{port}"
     origin = resolve_server_url(f"http://{netloc}").origin
 
-    server = uvicorn.Server(uvicorn.Config(app, host=host, port=port, access_log=False))
+    server = uvicorn.Server(uvicorn.Config(app, host=host, port=port, access_log=False,
+                                           timeout_graceful_shutdown=GRACEFUL_SHUTDOWN_S))
     thread = threading.Thread(target=server.run, name="freetoken-uvicorn", daemon=True)
     thread.start()
     _install_shell_stop_handlers()
@@ -1044,4 +1050,4 @@ def run_api_server(config: ServerArgs, start_backend: Callable[[], "Any"], run_s
         _serve_and_run_shell(host, port)
         return
     # uvicorn stays on the main thread (signal handling unchanged); ^C reaches the worker group.
-    uvicorn.run(app, host=host, port=port)
+    uvicorn.run(app, host=host, port=port, timeout_graceful_shutdown=GRACEFUL_SHUTDOWN_S)
