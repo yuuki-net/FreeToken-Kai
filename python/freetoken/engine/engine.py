@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import contextlib
+import errno
 import gc
 import math
 import os
@@ -484,6 +486,31 @@ def _quantize_at_load(
     logger.info_rank0(f"--dense-quant: quantized {quantized} dense projections to per-row fp8 at load")
 
 
+class WeightLoadError(RuntimeError):
+    """The checkpoint itself could not be read. Resource and config failures keep their own type."""
+
+
+def _is_resource_failure(exc: Exception) -> bool:
+    if isinstance(exc, (torch.OutOfMemoryError, MemoryError, PinFailed)):
+        return True
+    # an anonymous mmap that does not fit raises ENOMEM, not MemoryError
+    if isinstance(exc, OSError) and exc.errno == errno.ENOMEM:
+        return True
+    # torch has no type for a failed CPU allocation
+    return isinstance(exc, RuntimeError) and "DefaultCPUAllocator" in str(exc)
+
+
+@contextlib.contextmanager
+def _weight_load_context():
+    """Wrap a checkpoint read so the startup failure reason (log and /health) starts with WeightLoadError."""
+    try:
+        yield
+    except Exception as exc:
+        if _is_resource_failure(exc):
+            raise
+        raise WeightLoadError(f"{type(exc).__name__}: {exc}") from exc
+
+
 def _materialize_loaded_weight_state_dict(
     model_state: Dict[str, torch.Tensor],
     weights: Iterable[Tuple[str, torch.Tensor]],
@@ -701,8 +728,7 @@ class Engine:
                 f"pipeline rank {config.tp_info.rank}/{config.tp_info.size}: layers "
                 f"[{config.pp_layer_range[0]}, {config.pp_layer_range[1]}) on {self.device}"
             )
-        self.model.load_state_dict(self._load_weight_state_dict(config))
-        finalize_quant(self.model)
+        self._load_weights(config)
         if config.builds_tower:
             from freetoken.models.blocks import SupportsMultimodal
 
@@ -729,7 +755,8 @@ class Engine:
         # planning sees the pin quota the table already spent.
         self._host_tables_bytes = 0
         if hasattr(self.model, "load_host_tables"):
-            self._host_tables_bytes = int(self.model.load_host_tables(config) or 0)
+            with _weight_load_context():
+                self._host_tables_bytes = int(self.model.load_host_tables(config) or 0)
         self._host_tables_bytes += self._mtp_bank_bytes  # the draft head's pinned bank layer
         self._host_tables_bytes += getattr(self, "_host_resident_bytes", 0)  # --host-embedding
         self._host_tables_bytes += self._encoder_pinned_bytes  # the vision tower's streamed blocks
@@ -1158,6 +1185,17 @@ class Engine:
             assert tp_cpu_group is not None
         return tp_cpu_group
 
+    def _load_weights(self, config: EngineConfig) -> None:
+        if config.active_encoders and not config.use_dummy_weight and ftw_lacks_vision(config.model_path):
+            raise ValueError(
+                f"{config.model_path} holds no vision encoder tensors: it was converted by a build before this "
+                "family served images. Reconvert it with `ft checkpoint`, add the encoder in place with "
+                "scripts/ftw_hotfix.py (docs/ftw-hotfix.md), or start with --text-model-only"
+            )
+        with _weight_load_context():
+            self.model.load_state_dict(self._load_weight_state_dict(config))
+        finalize_quant(self.model)
+
     def _load_weight_state_dict(self, config: EngineConfig) -> Dict[str, torch.Tensor]:
         model_state = self.model.state_dict()
         host_prefixes = tuple(getattr(self.model, "host_resident_prefixes", ()))
@@ -1168,12 +1206,6 @@ class Engine:
             logger.warning(note)
         if config.use_dummy_weight:
             return _make_dummy_weight_state_dict(model_state, device=self.device, host_prefixes=host_prefixes)
-        if config.active_encoders and ftw_lacks_vision(config.model_path):
-            raise ValueError(
-                f"{config.model_path} holds no vision encoder tensors: it was converted by a build before this "
-                "family served images. Reconvert it with `ft checkpoint`, add the encoder in place with "
-                "scripts/ftw_hotfix.py (docs/ftw-hotfix.md), or start with --text-model-only"
-            )
         # _materialize casts each loaded tensor to its model-param dtype (model_state), so
         # models declaring per-tensor dtypes (e.g. DSV4's mixed fp8/fp32/bf16) are preserved;
         # offload models exclude experts (served from the offload cache, not dense weights).
@@ -1452,18 +1484,19 @@ class Engine:
                     kind=method.kind, kernel=method.kernel.name, layout=method.layout(),
                 )
             else:
-                banks = load_expert_banks(
-                    config.model_path,
-                    config.model_config,
-                    method=method,
-                    device=self.device,
-                    dtype=self.dtype,
-                    dummy=config.use_dummy_weight,
-                    parallel=expert_parallel,
-                    decode_target=("cpu" if decode_target in ("cpu", "hybrid") else "gpu"),
-                    layer_residency=requested_residency,
-                    layer_sink=bank_tier.sink if bank_tier else None,
-                )
+                with _weight_load_context():
+                    banks = load_expert_banks(
+                        config.model_path,
+                        config.model_config,
+                        method=method,
+                        device=self.device,
+                        dtype=self.dtype,
+                        dummy=config.use_dummy_weight,
+                        parallel=expert_parallel,
+                        decode_target=("cpu" if decode_target in ("cpu", "hybrid") else "gpu"),
+                        layer_residency=requested_residency,
+                        layer_sink=bank_tier.sink if bank_tier else None,
+                    )
         except PinFailed as exc:
             raise RuntimeError(f"{exc}; {_pin_hint(self._host_tables_bytes)}") from exc
         if bank_tier is not None:
@@ -3089,7 +3122,8 @@ def _adjust_ftw_quant_backend(model_path: str, quant_backend: QuantBackend) -> Q
     from freetoken.checkpoint.ftw import ftw_quant_format
     from freetoken.moe.legacy_format import kind_kernel_for
 
-    fmt = ftw_quant_format(model_path) if model_path else None
+    with _weight_load_context():
+        fmt = ftw_quant_format(model_path) if model_path else None
     if fmt is None:
         return quant_backend
     try:

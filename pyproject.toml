@@ -87,22 +87,16 @@ accel = ["freetoken[fi,sgl]"]
 # in a dedicated environment when you specifically need the Marlin path.
 
 # uv-only provenance pins — pip ignores this section and resolves from PyPI, which
-# works: PyPI's torch 2.11.0 and sglang-kernel 0.4.5 are the same cu130 builds these
-# indexes serve. `explicit = true` scopes each index to the one package that needs it
+# works: PyPI's torch 2.11.0 is the same cu130 build this index serves.
+# `explicit = true` scopes the index to the one package that needs it
 # (the torch index also mirrors stale copies of common deps, e.g. packaging<=24.1,
 # which would otherwise shadow PyPI under uv's first-index strategy).
 [tool.uv.sources]
 torch = { index = "pytorch-cu130" }
-sglang-kernel = { index = "sglang-cu130" }
 
 [[tool.uv.index]]
 name = "pytorch-cu130"
 url = "https://download.pytorch.org/whl/cu130"
-explicit = true
-
-[[tool.uv.index]]
-name = "sglang-cu130"
-url = "https://docs.sglang.io/whl/cu130"
 explicit = true
 
 [tool.setuptools]
