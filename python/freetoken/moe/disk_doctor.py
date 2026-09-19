@@ -36,10 +36,12 @@ MiB = 2**20
 PAGE_CACHE_FACTOR = 0.24
 PAGE_CACHE_REF_SHARE = 0.26
 
-# Decode step with the banks mapped and fully in RAM, where it is known. Hardware-specific:
-# printed with where it came from, and --base-step-ms replaces it.
+# Decode step with the banks fully in RAM and one token per step (--spec-mtp 0), where it is
+# known. Hardware-specific: printed with where it came from, and --base-step-ms replaces it.
+# Flash-Next: 19.33 tok/s (median of two runs, 2026-09-18); it was 59.5 ms (16.8 tok/s) when the
+# disk term was fitted, before the prefill, cache and copy work of 2026-09-13..18.
 KNOWN_BASE_STEP_MS = {
-    "flash-next": (59.5, "2x RTX 3060, --pp-size 2, banks mapped and fully in RAM"),
+    "flash-next": (51.7, "2x RTX 3060, --pp-size 2, --spec-mtp 0, banks fully in RAM"),
 }
 
 
@@ -665,7 +667,9 @@ def run(ns, proc: str = "/proc", sys: str = "/sys", *, gpu_query=None, gpu_rate=
     else:
         rep.say("- disk: no read rate (benchmark skipped or failed; --disk-gbs gives one)")
     if base:
-        rep.say(f"- step = {base:g} ms ({base_note}) + disk; tok/s = 1000 / step")
+        rep.say(f"- step = {base:g} ms ({base_note}) + disk; tok/s = 1000 / step, one token per step. "
+                "With --spec-mtp a step yields several tokens, so the rate is higher by about the "
+                "accepted tokens per step (the decode log's accepted/step)")
     else:
         rep.say("- step: unknown base for this model. Pass --base-step-ms = 1000 / the decode tok/s you get with the "
                 "banks fully in RAM (or with a cap that covers them)")
