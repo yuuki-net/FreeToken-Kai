@@ -49,8 +49,8 @@ def load_freq(paths, first_k_dense: int = 0) -> dict[int, list[int]]:
         rows = d.get("decode_freq")
         if not rows:
             raise ValueError(
-                f"{p}: no decode_freq. Collect with --moe-stats-out and --disable-cuda-graph "
-                "(under a captured graph the histogram counts the warmup routing instead)."
+                f"{p}: no decode_freq. Collect with --moe-stats-out (and without "
+                "--no-moe-collect-stats)."
             )
         start = max(0, int((d.get("layer_range") or [0])[0]) - int(first_k_dense))
         for i, row in enumerate(rows):

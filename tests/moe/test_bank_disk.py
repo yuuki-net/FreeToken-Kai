@@ -97,10 +97,10 @@ def test_load_freq_rejects_mismatched_widths(tmp_path):
         load_freq([str(tmp_path / "a.json"), str(tmp_path / "b.json")])
 
 
-def test_load_freq_rejects_a_graph_captured_run(tmp_path):
+def test_load_freq_rejects_a_run_without_counts(tmp_path):
     p = tmp_path / "s.json"
     p.write_text(json.dumps({"layer_range": [0, 1], "decode_freq": None}), encoding="utf-8")
-    with pytest.raises(ValueError, match="disable-cuda-graph"):
+    with pytest.raises(ValueError, match="no decode_freq"):
         load_freq([str(p)])
 
 

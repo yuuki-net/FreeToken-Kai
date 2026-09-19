@@ -9,6 +9,7 @@ from freetoken.core import Batch, Req, get_global_ctx
 from freetoken.distributed import try_get_world_info
 from freetoken.utils import init_logger, mem_GB
 from freetoken.utils.progress import emit_progress
+from freetoken.utils import decode_sample
 from tqdm import tqdm
 
 if TYPE_CHECKING:
@@ -170,6 +171,9 @@ class GraphRunner:
         # graphs-disabled early return so that config gets the phase too.
         emit_progress("Capturing CUDA graphs / warming up", 0, 0)
         self.graph_map: Dict[int, torch.cuda.CUDAGraph] = {}
+        # --moe-collect-stats: the same graphs with the decode timeline's event records, replayed
+        # for one step now and then (utils/decode_sample.py); empty when there is no timeline
+        self.timed_map: Dict[int, torch.cuda.CUDAGraph] = {}
         if self.max_graph_bs == 0:
             return logger.info_rank0("CUDA graph is disabled.")
 
@@ -225,6 +229,14 @@ class GraphRunner:
                     # CUDA graph capture to replay cold-cache expert copies.
                     with torch.cuda.graph(graph, pool=pool, stream=self.stream):
                         out[:bs] = model.forward()
+                    if decode_sample.TIMELINE is not None:
+                        # a plan the first capture left on the batch would be skipped here and
+                        # read from the first graph's tensors
+                        self.attn_backend.reset_forward_plan(batch)
+                        timed = torch.cuda.CUDAGraph()
+                        with torch.cuda.graph(timed, pool=graph.pool(), stream=self.stream):
+                            out[:bs] = decode_sample.run_forward(model.forward)
+                        self.timed_map[bs] = timed
                     self._reset_moe_offload_cache()
             finally:
                 ctx.pp_hidden_in = None
@@ -239,10 +251,13 @@ class GraphRunner:
     def can_use_cuda_graph(self, batch: Batch) -> bool:
         return batch.is_decode and batch.size <= self.max_graph_bs
 
-    def replay(self, batch: Batch) -> torch.Tensor:
+    def has_timed(self, batch: Batch) -> bool:
+        return batch.padded_size in self.timed_map
+
+    def replay(self, batch: Batch, timed: bool = False) -> torch.Tensor:
         assert self.can_use_cuda_graph(batch)
         self.buffer.copy_from(batch)
-        g = self.graph_map[batch.padded_size]
+        g = (self.timed_map if timed else self.graph_map)[batch.padded_size]
         self.attn_backend.prepare_for_replay(batch)
         g.replay()
         assert self.buffer.out is not None
@@ -264,5 +279,6 @@ class GraphRunner:
         # free-before-alloc cannot reclaim this GPU memory. empty_cache() is left to the
         # caller / next capture (GraphRunner._capture_graphs already runs it).
         self.graph_map = {}
+        self.timed_map = {}
         self.buffer = None
         gc.collect()

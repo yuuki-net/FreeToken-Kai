@@ -39,7 +39,7 @@ def _say_order_without_stats(path, layers, log, warn) -> None:
     warn(
         f"--moe-bank-ram without --moe-bank-stats: layers {_ranges(missing)} are not in the bank file yet "
         "and will be written in checkpoint order -- an arbitrary resident slice. Collect a histogram with "
-        "--moe-stats-out --disable-cuda-graph first, or pass one now."
+        "--moe-stats-out first, or pass one now."
     )
 
 

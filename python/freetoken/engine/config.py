@@ -70,13 +70,12 @@ class EngineConfig:
     # prefetch instead of re-streaming the full layer over PCIe. Needs CUDA >= 12.8
     # (cudaMemcpyBatchAsync); no-op unless moe_cache_size > 2 * num_experts.
     moe_prefill_hit_d2d: bool = False
-    moe_collect_stats: bool = False  # capture decode miss-rate counters into the cuda graph
+    # decode miss-rate counters, per-expert routing histogram and routing ring, captured into
+    # the cuda graph (OffloadMoeCache.enable_stats); --no-moe-collect-stats turns them off
+    moe_collect_stats: bool = True
     # --moe-stats-out: write the decode routing histogram (per layer, per expert), the
-    # realized miss rates and OffloadMoeCache.decode_routing_stats() to this path at
-    # shutdown. Setting it also turns on the per-expert histogram
-    # (OffloadMoeCache.collect_decode_freq), which the cache only accumulates outside a
-    # captured graph -- pass --disable-cuda-graph for a collection run, or the histogram
-    # counts the capture-time warmup routing instead of the real one.
+    # realized miss rates and OffloadMoeCache.decode_routing_stats() to this path at every
+    # idle and at shutdown. Implies moe_collect_stats.
     moe_stats_out: str | None = None
     # --moe-bank-ram: cap on host RAM for the expert banks. Experts beyond the cap are
     # renumbered out of the resident range and read from a cold bank file instead (see

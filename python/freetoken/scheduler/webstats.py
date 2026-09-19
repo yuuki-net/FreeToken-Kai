@@ -12,9 +12,11 @@ has fired. Host-side numbers (VRAM, page faults, bank reads, token totals) are p
 The file also carries windowed deltas (last 60 s / 300 s / since start) of every counter, so the
 page does not have to stay open for rates to exist.
 
-With ``--moe-stats-out`` the cache also counts how often each expert is routed (``decode_freq``,
-layers x experts). That goes to ``rank<N>.experts.json`` every 10 s instead: it is 10k+ numbers,
-too big to rewrite every 2 s or to keep 150 copies of for the windows."""
+The cache also counts how often each expert is routed (``decode_freq``, layers x experts). That
+goes to ``rank<N>.experts.json`` every 10 s instead: it is 10k+ numbers, too big to rewrite every
+2 s or to keep 150 copies of for the windows. The routing ring (the last steps' sets of active
+experts, OffloadMoeCache.route_ring) goes out on the same beat as ``rank<N>.routes.npz``, for the
+console's cache-size estimate (server/kai_api.py replays it)."""
 
 from __future__ import annotations
 
@@ -45,6 +47,7 @@ class WebStatsPublisher:
         self.dir = stats_dir(getattr(cfg, "server_port", None))
         self.path = os.path.join(self.dir, f"rank{self.rank}.json") if self.dir else None
         self.freq_path = os.path.join(self.dir, f"rank{self.rank}.experts.json") if self.dir else None
+        self.routes_path = os.path.join(self.dir, f"rank{self.rank}.routes.npz") if self.dir else None
         self._freq_history: deque[tuple[float, torch.Tensor]] = deque()
         self._freq_last = -FREQ_INTERVAL_S
         self.started = time.time()
@@ -56,7 +59,7 @@ class WebStatsPublisher:
         if self.path:
             try:
                 os.makedirs(self.dir, exist_ok=True)
-                for stale in (self.path, self.freq_path):
+                for stale in (self.path, self.freq_path, self.routes_path):
                     if os.path.exists(stale):
                         os.remove(stale)  # a previous run's file must not pass for this one
             except OSError as exc:
@@ -110,6 +113,9 @@ class WebStatsPublisher:
         if cache is not None and getattr(cache, "collect_decode_freq", False) and now - self._freq_last >= FREQ_INTERVAL_S:
             self._freq_last = now
             dev_tensors["expert_freq"] = cache.decode_freq
+            if getattr(cache, "route_ring", None) is not None:
+                dev_tensors["route_ring"] = cache.route_ring
+                dev_tensors["route_steps"] = cache.route_steps
         ev = None
         if dev_tensors:
             with torch.cuda.stream(eng.stream):
@@ -159,6 +165,9 @@ class WebStatsPublisher:
             pass
         snap["pools"] = _pool_bytes(eng)
         snap["prefill_chunk"] = getattr(eng, "_prefill_chunk_logged", None) or getattr(s, "prefill_budget", None)
+        sampler = getattr(eng, "_decode_sampler", None)
+        if sampler is not None:
+            snap["decode_sample"] = sampler.snapshot()
         if cache is not None:
             snap["moe_static"] = {
                 "decode_target": cache.decode_target,
@@ -177,6 +186,9 @@ class WebStatsPublisher:
         freq = bufs.pop("expert_freq", None)
         if freq is not None:
             self._write_freq(snap["t_mono"], freq.clone())
+        ring, ring_steps = bufs.pop("route_ring", None), bufs.pop("route_steps", None)
+        if ring is not None and ring_steps is not None:
+            self._write_routes(ring, ring_steps)
         cum = dict(snap["counters"])
         for k, b in bufs.items():
             cum["layer_" + k] = [int(x) for x in b.tolist()]
@@ -199,6 +211,7 @@ class WebStatsPublisher:
             "spec_k": int(getattr(cfg, "spec_mtp", 0) or 0),
             "gpu": snap.get("gpu"), "pools": snap.get("pools"), "kv": snap.get("kv"), "moe": snap.get("moe_static"),
             "prefill_chunk": snap.get("prefill_chunk"),
+            "decode_sample": snap.get("decode_sample"),
             "cumulative": cum, "windows": windows,
         }
         _write_json(self.path, doc)
@@ -219,6 +232,23 @@ class WebStatsPublisher:
             "cumulative": {"seconds": now - self._freq_history[0][0], "freq": freq.tolist()},
             "windows": windows,
         })
+
+
+    def _write_routes(self, ring: torch.Tensor, steps: torch.Tensor) -> None:
+        """The routing ring as it stands, with what a replay needs to read it: which layers the
+        GPU cache serves (CPU layers never take a slot) and the cache's size."""
+        import numpy as np
+
+        cache = self.s.engine.moe_offload_cache
+        gpu_layers = [not cache.is_cpu_layer(i) for i in range(cache.num_layers)]
+        tmp = f"{self.routes_path}.tmp.npz"
+        np.savez(
+            tmp,
+            ring=ring.numpy(), steps=steps.numpy(), gpu_layers=np.array(gpu_layers, dtype=bool),
+            num_experts=np.int64(cache.num_experts), cache_size=np.int64(cache.cache_size),
+            decode_target=np.array(cache.decode_target), time=np.float64(time.time()),
+        )
+        os.replace(tmp, self.routes_path)
 
 
 def _pool_bytes(engine: Any) -> dict | None:

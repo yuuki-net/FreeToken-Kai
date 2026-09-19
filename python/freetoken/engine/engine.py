@@ -58,6 +58,7 @@ from freetoken.kvcache.cache_status import _supports_swa_ratio
 from freetoken.kvcache.linear_state_pool import (
     _linear_pool_min_slots, _linear_pool_num_slots, state_pool_bytes,
 )
+from freetoken.utils.decode_sample import run_forward
 
 logger = init_logger(__name__)
 
@@ -1606,12 +1607,24 @@ class Engine:
         # captured and re-run on every decode replay.
         if bank_tier is not None:
             bank_tier.attach(cache, self.device)
-        cache.collect_stats = config.moe_collect_stats
-        # Per-expert routing histogram: the hot/cold placement table for a disk-backed
-        # expert bank is exactly this, ordered. Unlike collect_stats it is a torch-level
-        # scatter in ensure_experts rather than an in-kernel accumulate, so it only sees
-        # real routing when decode runs eagerly (--disable-cuda-graph).
-        cache.collect_decode_freq = bool(config.moe_stats_out)
+        # Counters, the per-expert routing histogram (the hot/cold placement table for a
+        # disk-backed expert bank is exactly this, ordered) and the routing ring: all
+        # device-side, so the captured decode graph records the real routing on every replay.
+        cache.enable_stats(bool(config.moe_collect_stats))
+        # the web console's per-token breakdown: event records captured into the decode graph,
+        # read now and then (utils/decode_sample.py). Before graph capture, which records them.
+        self._decode_sampler = None
+        if config.moe_collect_stats and self.device.type == "cuda":
+            from freetoken.utils import decode_sample
+
+            interval = decode_sample.interval_from_env()
+            if interval > 0:
+                # never replaced once made: every captured graph holds record nodes for these
+                # events, and replaying a graph whose events were freed crashes the process
+                tl = decode_sample.TIMELINE
+                if tl is None or len(tl.marks) < cache.num_layers:
+                    tl = decode_sample.TIMELINE = decode_sample.DecodeTimeline(cache.num_layers)
+                self._decode_sampler = decode_sample.DecodeSampler(tl, interval)
         self._moe_stats_out = config.moe_stats_out
         self._moe_stats_layer_range = getattr(config, "pp_layer_range", None)
         self._moe_stats_rank = (config.tp_info.rank, config.tp_info.size)
@@ -2013,6 +2026,15 @@ class Engine:
             if prof is None:
                 prof = self._spec_profiler = _SpecProfiler()
             prof.start()
+        # --moe-collect-stats: now and then read the timeline this decode step records
+        # (utils/decode_sample.py) -- after the forward, which it waits for
+        decode_step = not batch.is_prefill or batch.spec_verify
+        sampler = getattr(self, "_decode_sampler", None)
+        sampling = sampler is not None and decode_step and sampler.due() and (
+            sg.graph_timed is not None if sg is not None
+            else self.graph_runner.has_timed(batch) if use_graph
+            else True
+        )
         if sg is not None:
             sg.stage(batch)
         with self.ctx.forward_batch(batch), self.model.forward_host_ctx(batch, use_graph or sg is not None):
@@ -2031,14 +2053,18 @@ class Engine:
                 self.ctx.pp_hidden_in = hidden_in
             try:
                 if sg is not None:
-                    logits = sg.replay()
+                    logits = sg.replay(timed=sampling)
+                elif use_graph:
+                    logits = self.graph_runner.replay(batch, timed=sampling)
                 else:
-                    logits = self.graph_runner.replay(batch) if use_graph else self.model.forward()
+                    logits = run_forward(self.model.forward, timed=sampling)
+                if sampling:
+                    sampler.collect(rows)
             finally:
                 self.ctx.pp_hidden_in = None
         if sg is not None:
             # the rollback reads the GDN stashes recorded at capture (rewritten by the replay)
-            self.ctx.spec_stash = sg.stash
+            self.ctx.spec_stash = sg.stash_timed if sampling else sg.stash
         if prof is not None:
             prof.mark("target_forward")
         if self.cpu_moe_executor is not None:

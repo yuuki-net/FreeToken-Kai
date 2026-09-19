@@ -8,6 +8,7 @@ from freetoken.moe import is_offload_moe_strategy
 from freetoken.moe.bank_disk import apply_permutation
 from freetoken.moe.fused import fused_topk
 from freetoken.moe.offload_cache import OffloadMoeCache
+from freetoken.utils import decode_sample as _ds
 
 
 from .base import BaseOP
@@ -294,24 +295,47 @@ class OffloadMoELayer(MoELayer):
         # [num_experts, ...] shape either way -- rows past the resident prefix are file-backed
         # pages that fault in -- so nothing downstream can tell. No-op when nothing was moved.
         apply_permutation(topk_ids, self.expert_perm)
-        if cache.is_cpu_layer(self.layer_id):
+        # --moe-collect-stats: event records at the seams of the expert work, captured into the
+        # decode graph (utils/decode_sample.py); None outside a timed decode forward
+        tl = _ds.timeline()
+        layer = self.layer_id
+        if tl is not None:
+            tl.mark(layer, _ds.START)
+        if cache.collect_stats:
+            # every decode layer, CPU ones included: physical ids, before a kernel rewrites
+            # them to slots (--moe-collect-stats: routing histogram and ring)
+            cache.record_routes(layer, topk_ids)
+        if cache.is_cpu_layer(layer):
             executor = cache.cpu_executor
             assert executor is not None, "CPU MoE executor was not initialized"
-            return executor.decode(self.layer_id, hidden_states, topk_weights, topk_ids)
+            out = executor.decode(layer, hidden_states, topk_weights, topk_ids)
+            if tl is not None:
+                tl.layer_kind(layer, "cpu")
+                tl.mark(layer, _ds.DONE)
+            return out
         if cache.decode_target == "hybrid":
-            return self._decode_hybrid(cache, hidden_states, topk_weights, topk_ids)
-        cache.ensure_experts(self.layer_id, topk_ids)
+            return self._decode_hybrid(cache, hidden_states, topk_weights, topk_ids, tl)
+        cache.ensure_experts(layer, topk_ids)
+        if tl is not None:
+            tl.mark(layer, _ds.ROUTED)
         cache.copy_missing()
-        return self._expert_gemm(
+        if tl is not None:
+            tl.mark(layer, _ds.FETCHED)
+        out = self._expert_gemm(
             cache,
             hidden_states,
             topk_weights,
             topk_ids,
             views=cache.bank_views(),
             n=None,
-            alphas=cache.alphas_for_slots(self.layer_id),
+            alphas=cache.alphas_for_slots(layer),
             is_prefill=False,
         )
+        if tl is not None:
+            tl.layer_kind(layer, "gpu")
+            tl.mark(layer, _ds.COMPUTED)
+            tl.mark(layer, _ds.DONE)
+        return out
 
     def _decode_hybrid(
         self,
@@ -319,6 +343,7 @@ class OffloadMoELayer(MoELayer):
         hidden_states: torch.Tensor,
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
+        tl=None,
     ) -> torch.Tensor:
         """Hybrid decode: GPU computes cache hits + <=K freshly-fetched experts, the CPU
         computes the overflow misses, overlapped, then the partials merge.
@@ -337,19 +362,19 @@ class OffloadMoELayer(MoELayer):
         # here instead: hand those positions expert 0 (rank 0 of the renumbering -- the
         # hottest expert, so all but certainly a hit costing no fetch), then overwrite the
         # slot it returns with -1 so the CPU partial takes them. raw still holds the true
-        # ids, which is what the CPU executor and the routing histogram read.
+        # ids, which is what the CPU executor reads.
         cold = None
         if cache.prefix_pinned_rows is not None:
             cold = raw >= cache.prefix_pinned_rows
             topk_ids.masked_fill_(cold, 0)
-        cache.ensure_experts_hybrid(self.layer_id, topk_ids, freq_ids=raw)  # -> slot or -1
+        cache.ensure_experts_hybrid(self.layer_id, topk_ids)  # -> slot or -1
         if cold is not None:
             topk_ids.masked_fill_(cold, -1)
-        if cache.collect_stats:
-            cache.record_decode_stats_hybrid(self.layer_id)
         on_gpu = topk_ids >= 0
 
         cpu_ids = torch.where(on_gpu, raw.new_full((), -1), raw).contiguous()
+        if tl is not None:
+            tl.mark(self.layer_id, _ds.ROUTED)
         pending = executor.decode_submit(self.layer_id, hidden_states, topk_weights, cpu_ids)
 
         # Measurement knob: FREETOKEN_HYBRID_OVERLAP=0 syncs the CPU pool *before* the
@@ -359,6 +384,8 @@ class OffloadMoELayer(MoELayer):
         )
 
         cache.copy_missing()
+        if tl is not None:
+            tl.mark(self.layer_id, _ds.FETCHED)
         gpu_slots = topk_ids.clamp_min(0)  # -1 -> slot 0 (zero-weighted below)
         gpu_w = torch.where(on_gpu, topk_weights, topk_weights.new_zeros(())).contiguous()
         gpu_routed = self._expert_gemm(
@@ -371,8 +398,14 @@ class OffloadMoELayer(MoELayer):
             alphas=cache.alphas_for_slots(self.layer_id),
             is_prefill=False,
         )
+        if tl is not None:
+            tl.mark(self.layer_id, _ds.COMPUTED)
         cpu_routed = cpu_routed_early if not _HYBRID_OVERLAP else executor.decode_sync(pending)
-        return gpu_routed + cpu_routed
+        out = gpu_routed + cpu_routed
+        if tl is not None:
+            tl.layer_kind(self.layer_id, "gpu")
+            tl.mark(self.layer_id, _ds.DONE)
+        return out
 
     def _prefill_routed(
         self,

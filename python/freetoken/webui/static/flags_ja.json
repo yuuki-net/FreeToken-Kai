@@ -14,7 +14,7 @@
   "common": [
     "--moe-strategy", "--moe-cache-auto", "--kv-reserve-tokens", "--max-seq-len-override", "--kv-cache-dtype",
     "--moe-bank-ram", "--pp-size", "--spec-mtp", "--max-running-requests", "--host", "--memory-ratio",
-    "--moe-cpu-layers", "--prefill-chunk-budget", "--moe-collect-stats"
+    "--moe-cpu-layers", "--prefill-chunk-budget"
   ],
   "flags": {
     "--dtype": {"cat": "model", "ja": "重みと計算のデータ型。", "more": "auto なら FP32/FP16 のモデルは FP16、BF16 のモデルは BF16 で動きます。BF16 のモデルに float16 を指定すると、読み込み時に変換用のコピーが増えて、小さいカードでは入らないことがあります。"},
@@ -34,7 +34,7 @@
     "--disable-pynccl": {"cat": "gpu", "ja": "テンソル並列で PyNCCL を使わない。", "more": "普段は指定しません。"},
     "--memory-ratio": {"cat": "gpu", "ja": "GPU の空きメモリのうち、重み・エキスパート・KV に使ってよい割合。", "more": "残りは作業領域として空けておきます。既定 0.9。デスクトップや他のアプリが VRAM を使う PC では下げると安定します（例: 0.85）。"},
     "--cuda-graph-max-bs": {"cat": "gpu", "ja": "CUDA graph を作る最大バッチサイズ。", "more": "指定しなければ VRAM から自動で決めます。"},
-    "--disable-cuda-graph": {"cat": "measure", "ja": "CUDA graph を使わずに生成する。", "more": "とても遅くなります。--moe-stats-out でエキスパートごとの回数を正しく数える計測のときだけ使います。"},
+    "--disable-cuda-graph": {"cat": "measure", "ja": "CUDA graph を使わずに生成する。", "more": "とても遅くなります。不具合の切り分け用です。"},
     "--attention-backend": {"cat": "gpu", "ja": "attention の計算に使う実装。", "more": "2 つ書くと 1 つ目がプロンプト処理用、2 つ目が生成用。普段は auto。"},
 
     "--max-seq-len-override": {"cat": "context", "ja": "1 つの会話で扱える最大トークン数（コンテキスト長の上限）。", "more": "上げると KV の VRAM が増えます。--kv-reserve-tokens と同じ値にそろえると、宣伝される長さと実際に入る長さが一致します。"},
@@ -96,8 +96,9 @@
     "--tokenizer-count": {"cat": "server", "ja": "トークナイザのプロセス数。", "more": "0 なら 1 つを共用します。"},
     "--shell-mode": {"cat": "server", "ja": "対話シェルとして起動する。", "more": "daemon から起動するときは使いません。"},
 
-    "--moe-collect-stats": {"cat": "measure", "ja": "生成中に、エキスパートが GPU で足りたかどうかを数える。", "more": "Web コンソールの外れ率と改善提案に必要です。2060（gpt-oss-20b、hybrid）で生成が約 2% 遅くなりました。"},
-    "--moe-stats-out": {"cat": "measure", "ja": "エキスパートごとの使用回数と外れ率を、この JSON に書き出す。", "more": "--moe-bank-stats の材料になります。正しく数えるには --disable-cuda-graph と一緒に使います。"},
+    "--moe-collect-stats": {"cat": "measure", "ja": "生成中に、エキスパートが GPU で足りたかどうかと、どのエキスパートが呼ばれたかを数える（既定で有効）。", "more": "Web コンソールの外れ率・ヒートマップ・時間の内訳・枠の試算の材料です。既定で有効なので、付けなくても同じです。RTX 2060 での速度の差は揺れの範囲でした（GPU 上の追加は 1 ステップ約 0.06 ms）。"},
+    "--no-moe-collect-stats": {"cat": "measure", "ja": "生成中の回数の計測をやめる。", "more": "Web コンソールの外れ率・ヒートマップ・時間の内訳・枠の試算が出なくなります。"},
+    "--moe-stats-out": {"cat": "measure", "ja": "エキスパートごとの使用回数と外れ率を、この JSON に書き出す。", "more": "--moe-bank-stats の材料になります。"},
     "--prefill-profile": {"cat": "measure", "ja": "プロンプト処理の時間の内訳をログに出す。", "more": "他ランク待ち・エキスパートの読み込み・GPU の計算などに分けて 1 チャンクごとに出します。計測用。"},
     "--decode-log-interval": {"cat": "measure", "ja": "生成中の状態行（gen throughput など）をログに出す間隔（ステップ数）。", "more": "既定 40。速度を細かく見たいときは 5 など。"}
   }

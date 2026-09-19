@@ -186,16 +186,49 @@ is kept in `~/.freetoken/mgr/tune/`.
 
 ![Expert heatmap](../assets/kai-console-heatmap.png)
 
-- **Per layer** (with `--moe-collect-stats`, about 2% slower generation): the share of routed
+The counters behind this section and the next two are on by default (`--no-moe-collect-stats`
+turns them off; on an RTX 2060 the generation rate with and without them stayed within the run-to-run noise, and the added GPU work measured about 0.06 ms per step).
+
+- **Per layer**: the share of routed
   experts that were not on the GPU over the last 5 minutes, one cell per layer and one strip per
   GPU. In hybrid mode it can show the share computed on the CPU instead. The colour scale follows
   the worst layer. Below it: the average, the worst and best layers, and what to change: grow the
   cache, move layers between GPUs (`--pp-layers`), or give the CPU side more threads.
-- **Per expert** (only with `--moe-stats-out <file>` and `--disable-cuda-graph`, a measurement
-  setup): how often each expert was picked, one row per layer, sorted most picked first with
+- **Per expert**: how often each expert was picked over the last 5 minutes, CPU layers included,
+  one row per layer, sorted most picked first with
   today's cache size drawn as a line. Under it, what a cache of today's size and of twice that
   would hold if filled with the most picked experts, next to the measured rate, and how many
   experts per layer cover 90% of the picks.
+
+## Where a token's time goes
+
+![Where a token's time goes and the GPU cache size estimate](../assets/kai-console-breakdown.png)
+
+Each decode graph is captured twice: as usual, and once more with CUDA events recorded at the start
+and end of the step and at the seams of every MoE layer's expert work. Every 30 seconds of
+generation the second copy runs one step instead of the first, and the card shows where that step's
+GPU time went, as the mean of the last ten readings per GPU: the cache bookkeeping (routing),
+copying missed experts from RAM to the GPU, the expert GEMMs on the GPU, waiting for the experts
+computed on the CPU (a whole CPU layer, or the hybrid CPU share past the GPU's own work), and the
+rest (attention, dense layers, the head). It is a real step, with the graph and the overlap, so the
+parts add up to it; the time per token from the generation rate is printed under the bar for
+comparison, and one of the parts gets a suggestion when it dominates. The events live only in the
+second copy (they cost about 1 us each on the GPU), so the other steps carry none; the copy shares
+the first one's memory pool. `FREETOKEN_DECODE_SAMPLE_S` sets the interval (0 turns the second
+copy off). Where a verify window or a decode step runs without a graph (for example `--spec-mtp`
+on a card whose capture fails), the same events are recorded eagerly on the sampled step, and the
+parts then include the launch gaps.
+
+## GPU cache size estimate
+
+Each GPU's expert cache records which experts every layer used in the last 1,024 decode steps
+(`FREETOKEN_ROUTE_RING_STEPS`). The console replays them in decode order and computes, for every
+cache size at once, the share an LRU cache of that size would have served from the GPU (the LRU
+stack distance of each access). The chart runs from no cache to every expert of the GPU's layers,
+with today's size and the measured rate of the last minute marked; the line under it reads off
+1.5x and 2x today's size in GiB. It assumes every miss is brought into the cache, which plain
+offload does and hybrid does only for part of the misses, so under hybrid the measured rate sits
+below the line. CPU layers never take a slot and are left out, as is the MTP draft head.
 
 ## Where the numbers come from
 
@@ -206,13 +239,18 @@ CUDA event, and read on a later tick. Each rank also reports the VRAM of its own
 state, read from its allocated pools, so under `--pp-size` every GPU's bar is split, not only the
 first one's. The server (`server/kai_api.py`) sums the ranks into `/v1/stats`'s `kai` block and
 `/v1/kai/experts`. The per-expert counts go to a separate file every
-10 seconds and are returned only with `?freq=true`.
+10 seconds and are returned only with `?freq=true`; the routing record goes to
+`rank<N>.routes.npz` on the same beat and is replayed by `/v1/kai/slots` (`webui/slot_estimate.py`).
+The counting runs on the GPU inside the kernels the decode step launches anyway (the hybrid cache
+kernel) or in one small kernel per layer (`record_routes`), so it is part of the captured graph.
 
 ## Limits
 
-- Nothing measures how long a token waits for expert reads, so a suggestion does not come with a
-  predicted tok/s gain.
-- The per-expert view needs eager decode: under CUDA graphs the routing histogram is not counted.
+- The time breakdown says which part is large, not how much a change would gain: the parts
+  overlap differently once one of them shrinks, so a suggestion still does not come with a
+  predicted tok/s.
+- The cache estimate replays one workload's last thousand steps; another kind of conversation
+  routes differently.
 - The cache-size estimate is the best case of filling the cache with the most picked experts; an
   LRU replay is not simulated.
 - Editing a profile does not change a running server until it is restarted.

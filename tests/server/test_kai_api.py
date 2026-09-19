@@ -108,3 +108,47 @@ def test_no_expert_counts_without_the_flag(tmp_path, monkeypatch):
 def test_no_snapshots_means_no_block(tmp_path, monkeypatch):
     monkeypatch.setattr("tempfile.tempdir", str(tmp_path))
     assert kai_api.kai_block(SimpleNamespace(config=SimpleNamespace(server_port=19998))) is None
+
+
+def test_decode_sample_rides_along_per_rank(tmp_path, monkeypatch):
+    r0, r1 = _rank(0, [10], [1], 0, [0, 24]), _rank(1, [10], [1], 0, [24, 48])
+    r1["decode_sample"] = {"samples": 3, "total_ms": 70.0, "ms": {"fetch": 20.0, "cpu": 0.0, "gpu_experts": 9.0, "route": 1.0, "other": 40.0}}
+    k = kai_api.kai_block(_state(tmp_path, monkeypatch, [r0, r1]))
+    assert k["decode_sample"] == [{"rank": 1, **r1["decode_sample"]}]
+    assert kai_api.kai_block(_state(tmp_path / "b", monkeypatch, [_rank(0, [10], [1], 0, [0, 24])]))["decode_sample"] is None
+
+
+def test_publisher_writes_the_routing_ring_and_slots_replays_it(tmp_path, monkeypatch):
+    import numpy as np
+    import torch
+
+    from freetoken.scheduler.webstats import WebStatsPublisher
+
+    monkeypatch.setattr("tempfile.tempdir", str(tmp_path))
+    cfg = SimpleNamespace(tp_info=SimpleNamespace(rank=0, size=1), server_port=19996, pp_layer_range=None)
+    cache = SimpleNamespace(num_layers=3, num_experts=40, cache_size=12, decode_target="hybrid",
+                            is_cpu_layer=lambda i: i == 0)
+    pub = WebStatsPublisher(SimpleNamespace(config=cfg, engine=SimpleNamespace(moe_offload_cache=cache)))
+    rng = np.random.default_rng(0)
+    ring = torch.zeros(3, 64, 2, dtype=torch.int32)
+    for s in range(64):
+        for layer in range(3):
+            bits = np.zeros(64, dtype=np.uint8)
+            bits[rng.choice(10, 3, replace=False)] = 1
+            ring[layer, s] = torch.from_numpy(np.packbits(bits, bitorder="little").view("<i4").copy())
+    pub._write_routes(ring, torch.tensor([64, 64, 64]))
+    with open(os.path.join(stats_dir(19996), "rank0.json"), "w") as fh:
+        json.dump({**_rank(0, [100, 100, 100], [10, 10, 10], 0, None), "moe": {"cache_size": 12}, "pools": {"moe": 12 * 2**20}}, fh)
+    doc = kai_api.slots_doc(SimpleNamespace(config=SimpleNamespace(server_port=19996)))
+    (r,) = doc["ranks"]
+    assert r["rank"] == 0 and r["gpu_layers"] == 2 and r["capacity"] == 80 and r["cache_size"] == 12
+    assert r["decode_target"] == "hybrid" and r["bytes_per_slot"] == 2**20
+    assert abs(r["measured_hit_60s"] - 0.9) < 1e-9
+    # 20 experts in use across the 2 layers: all of them fit, bar a first sighting after the warm-up
+    hits = [p["hit"] for p in r["curve"]]
+    assert hits == sorted(hits) and hits[-1] > 0.95
+
+
+def test_no_routes_means_no_slots(tmp_path, monkeypatch):
+    state = _state(tmp_path, monkeypatch, [_rank(0, [10, 20], [1, 2], 0, [0, 24])])
+    assert kai_api.slots_doc(state) == {"ranks": []}

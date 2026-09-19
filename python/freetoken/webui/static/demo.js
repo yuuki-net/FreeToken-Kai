@@ -30,6 +30,10 @@ if (FT.demo) {
         moe: { collect_stats: true, gpu_hit_rate: 0.938, major_faults_per_min: 12400, ssd_read_bytes_per_s: 1.4 * GiB },
         spec: { k: 2, tokens_per_step: 2.42, accept_rate: 0.71 },
         prefill: { chunk: 4096, auto: true },
+        decode_sample: [0, 1].map((r) => ({
+          rank: r, interval_s: 30, samples: 10, rows: 3,
+          total_ms: r ? 126 : 120, ms: { route: r ? 1.6 : 1.5, fetch: r ? 30.2 : 22.4, gpu_experts: r ? 19.1 : 18.3, cpu: 0, other: r ? 75.1 : 77.8 },
+        })),
         gpus: [
           { rank: 0, index: 0, name: "NVIDIA GeForce RTX 3060", total_bytes: 12 * GiB, used_bytes: 11.2 * GiB, reserved_bytes: 10.6 * GiB, layers: [0, 23],
             pools: { kv: 1.2 * GiB, moe: 4.6 * GiB, mamba: 0.3 * GiB } },
@@ -38,6 +42,14 @@ if (FT.demo) {
         ],
       },
     }),
+    "/v1/kai/slots": () => ({ ranks: [0, 1].map((r) => {
+      const cap = L * E, cur = 700;
+      const hit = (x) => 1 - Math.exp(-x / cap * (r ? 9 : 11));
+      const curve = Array.from({ length: 24 }, (_, i) => Math.round(cap * (i + 1) / 24)).concat([cur]).sort((a, b) => a - b)
+        .map((x) => ({ slots: x, hit: hit(x) }));
+      return { rank: r, steps: 1024, accesses: 220000, gpu_layers: L, num_experts: E, capacity: cap, cache_size: cur,
+        decode_target: "gpu", hit_at_current: hit(cur), measured_hit_60s: hit(cur) - 0.012, bytes_per_slot: 6.9 * 2 ** 20, curve };
+    }) }),
     "/v1/cache/status": () => ({ geometry: {
       num_pages: 8192, page_size: 16, moe_cache_size: 1400, num_mamba_slots: 8, num_experts: E, num_moe_layers: L,
       unit_bytes: { kv_per_token: 20000, moe_per_expert: 1.6 * 2 ** 20, mamba_per_slot: 60 * 2 ** 20 },

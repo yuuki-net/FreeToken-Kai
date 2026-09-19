@@ -6,6 +6,7 @@ the scheduler, and a missing or stale rank shows up as missing rather than as ze
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import re
@@ -19,6 +20,7 @@ from freetoken.webui.stats_path import stats_dir
 
 _RANK_FILE = re.compile(r"rank\d+\.json")
 _FREQ_FILE = re.compile(r"rank\d+\.experts\.json")
+_ROUTES_FILE = re.compile(r"rank(\d+)\.routes\.npz")
 
 
 def read_expert_freq(port: int | None, window: str) -> list[dict] | None:
@@ -130,9 +132,14 @@ def kai_block(state: Any) -> dict | None:
             "pools": r.get("pools"),
             "age_s": round(now - r.get("time", now), 1),
         })
+    samples = [
+        {"rank": r.get("rank"), **r["decode_sample"]} for r in ranks if r.get("decode_sample")
+    ]
     return {
         "window_s": round(secs, 1),
         "moe": moe,
+        # utils/decode_sample.py: where a sampled decode step's time went, per rank
+        "decode_sample": samples or None,
         "spec": spec,
         "prefill": {"chunk": ranks[0].get("prefill_chunk"), "auto": bool(getattr(config, "prefill_chunk_budget", None))},
         "prefix_reuse_rate": cached_tok / (new_tok + cached_tok) if (new_tok + cached_tok) else None,
@@ -192,7 +199,46 @@ def experts_doc(state: Any, window: str = "300", freq: bool = False) -> dict:
     }
 
 
+def slots_doc(state: Any) -> dict:
+    """``/v1/kai/slots``: per rank, the hit rate an LRU expert cache of other sizes would have had
+    on the routing this run saw (webui/slot_estimate.py), next to the measured one."""
+    from freetoken.webui import slot_estimate
+
+    config = getattr(state, "config", None)
+    port = getattr(config, "server_port", None)
+    d = stats_dir(port)
+    measured = {}
+    bytes_per_slot = {}
+    for r in read_ranks(port):
+        w = _window(r) or {}
+        act, mis = sum(w.get("layer_active") or []), sum(w.get("layer_miss") or [])
+        measured[r.get("rank")] = (1 - mis / act) if act else None
+        pools, size = r.get("pools") or {}, (r.get("moe") or {}).get("cache_size")
+        if pools.get("moe") and size:
+            bytes_per_slot[r.get("rank")] = pools["moe"] / size
+    ranks = []
+    if d and os.path.isdir(d):
+        for name in sorted(os.listdir(d)):
+            m = _ROUTES_FILE.fullmatch(name)
+            if not m:
+                continue
+            rank = int(m.group(1))
+            est = slot_estimate.estimate_file(os.path.join(d, name))
+            if est is not None:
+                ranks.append({
+                    "rank": rank, **est,
+                    "measured_hit_60s": measured.get(rank),
+                    "bytes_per_slot": bytes_per_slot.get(rank),
+                })
+    return {"ranks": ranks}
+
+
 def register_kai_routes(app: FastAPI, get_state: Callable[[], Any]) -> None:
     @app.get("/v1/kai/experts")
     async def kai_experts(window: str = "300", freq: bool = False):
         return experts_doc(get_state(), window if window in ("60", "300") else "300", freq)
+
+    @app.get("/v1/kai/slots")
+    async def kai_slots():
+        # a replay takes a second or two of pure Python: keep it off the event loop
+        return await asyncio.to_thread(slots_doc, get_state())

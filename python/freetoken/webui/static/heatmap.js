@@ -1,7 +1,7 @@
-// Where the experts a token needs are not on the GPU: one cell per MoE layer (from
-// --moe-collect-stats), and, when the routing counts exist (--moe-stats-out), one row per layer
+// Where the experts a token needs are not on the GPU: one cell per MoE layer, and one row per layer
 // of how often each expert was picked, with what an ideally filled cache of today's size would
-// have held. Both say what to change, not only what happened.
+// have held (both from --moe-collect-stats, on by default). Both say what to change, not only
+// what happened.
 "use strict";
 
 const FTHeatmap = (() => {

@@ -530,6 +530,10 @@ def build_app(
         async def engine_kai_experts(window: str = "300", freq: bool = False):
             return await _proxied(f"/v1/kai/experts?window={quote(window)}&freq={str(freq).lower()}")
 
+        @app.get("/engine/kai/slots", dependencies=auth)
+        async def engine_kai_slots():
+            return await _proxied("/v1/kai/slots")
+
         @app.get("/host", dependencies=auth)
         async def host():
             from freetoken.webui.hostmem import host_memory

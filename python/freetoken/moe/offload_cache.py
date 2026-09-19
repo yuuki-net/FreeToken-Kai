@@ -26,6 +26,9 @@ _FUSED_COPY = os.getenv("FREETOKEN_FUSED_COPY", "1").strip().lower() not in {"0"
 # entry the batch sees is >= this size.
 _SMALL_BANK_FEAT_BYTES = 256 * 1024
 
+# Rows of OffloadMoeCache.hybrid_stats (the hybrid kernel indexes them by these numbers).
+HYBRID_STAT_MISSING, HYBRID_STAT_ACTIVE, HYBRID_STAT_FETCHED, HYBRID_STAT_STEPS = range(4)
+
 from freetoken.utils import init_logger
 from freetoken.utils.prefill_profile import active as _prefill_profile
 from freetoken.utils.prefill_profile import major_faults as _major_faults
@@ -226,43 +229,47 @@ class OffloadMoeCache:
         # marlin/b12x per-expert global scales ([L*E], GPU resident, see set_alphas).
         self.gate_up_alpha: torch.Tensor | None = None
         self.down_alpha: torch.Tensor | None = None
-        # Opt-in decode miss-rate instrumentation. Accumulated on-device (no per-step host
-        # sync); read via ``decode_miss_stats``. Graph-safe: the ``+=`` is captured into the
-        # decode graph and re-executes with each replay's REAL routing (record_decode_stats
-        # must be enabled before capture — see engine graph setup). The only graph artifact
-        # is a one-off warm-up increment at capture time (<0.1% over a session).
+        # Decode instrumentation (--moe-collect-stats, on by default). Everything accumulates
+        # on the device inside kernels the decode step launches anyway or in one small launch
+        # per layer (record_routes), so it is captured into the decode graph and re-runs with
+        # each replay's real routing; nothing syncs the host. Must be switched on before
+        # capture (engine graph setup). The only graph artifact is the one eager warm-up
+        # step per captured batch size.
         self.collect_stats = False
         # [num_layers, N_STATS] -- ensure_experts passes lru_stats[layer_id] straight to
-        # the kernel, which accumulates in the same launch. The stat_* tensors below stay
-        # for the hybrid path, whose kernel is still ours.
+        # the kernel, which accumulates in the same launch.
         self.lru_stats = torch.zeros(
             (self.num_layers, N_STATS), dtype=torch.int64, device=self.device
         )
-        self.stat_missing = torch.zeros((), dtype=torch.int64, device=self.device)
-        self.stat_active = torch.zeros((), dtype=torch.int64, device=self.device)
-        self.stat_calls = torch.zeros((), dtype=torch.int64, device=self.device)
-        # hybrid only: experts actually fetched over PCIe (<= stat_missing). The CPU
-        # computes stat_missing - stat_fetched of them.
-        self.stat_fetched = torch.zeros((), dtype=torch.int64, device=self.device)
-        # Per-layer counterparts of the scalars above (indexed by MoE-layer id). Same
-        # device-side accumulation (graph-safe: layer_id is a static index per graph node),
-        # so one req's per-layer miss rate is readable via decode_miss_stats_per_layer().
-        self.stat_missing_layer = torch.zeros(self.num_layers, dtype=torch.int64, device=self.device)
-        self.stat_active_layer = torch.zeros(self.num_layers, dtype=torch.int64, device=self.device)
-        self.stat_fetched_layer = torch.zeros(self.num_layers, dtype=torch.int64, device=self.device)
-        self.stat_steps_layer = torch.zeros(self.num_layers, dtype=torch.int64, device=self.device)
-        # Opt-in decode routing histogram (per layer, per expert) for cache-skew
-        # analysis. Accumulated in ``ensure_experts`` from the raw expert ids before the
-        # kernel rewrites them to slots. Only accurate with CUDA graphs disabled (the
-        # captured graph would not re-run this host-side scatter on replay).
+        # Hybrid counterpart, rows = HYBRID_STAT_{MISSING,ACTIVE,FETCHED,STEPS} x MoE layer:
+        # the hybrid kernel adds its own row in the same launch. fetched <= missing; the CPU
+        # computes missing - fetched of them.
+        self.hybrid_stats = torch.zeros((4, self.num_layers), dtype=torch.int64, device=self.device)
+        self.stat_missing_layer = self.hybrid_stats[HYBRID_STAT_MISSING]
+        self.stat_active_layer = self.hybrid_stats[HYBRID_STAT_ACTIVE]
+        self.stat_fetched_layer = self.hybrid_stats[HYBRID_STAT_FETCHED]
+        self.stat_steps_layer = self.hybrid_stats[HYBRID_STAT_STEPS]
         # --moe-bank-ram: per-MoE-layer logical->physical expert id maps, or None when
         # every expert is resident (the identity, and the only state today's behaviour has).
         # The MoE layers read theirs at attach time; see moe/bank_disk.py.
         self.expert_perm: list[torch.Tensor] | None = None
+        # Decode routing, per MoE layer, recorded by ``record_routes`` for every decode layer
+        # (GPU cache, hybrid and CPU layers alike) from the physical expert ids:
+        #   decode_freq  [L, E]     how often each expert was routed (the heatmap, and the
+        #                           hot/cold placement table for --moe-bank-ram)
+        #   route_steps  [L]        decode steps seen per layer
+        #   route_ring   [L, R, W]  the last R steps' sets of active experts, one bit per
+        #                           expert (W = ceil(E / 32) words), at route_steps % R --
+        #                           what the web console replays to estimate other cache sizes
+        # collect_decode_freq stays as the name the stats writers read; it follows collect_stats.
         self.collect_decode_freq = False
         self.decode_freq = torch.zeros(
             (self.num_layers, self.num_experts), dtype=torch.int64, device=self.device
         )
+        self.route_steps = torch.zeros(self.num_layers, dtype=torch.int64, device=self.device)
+        self.route_ring_steps = max(1, int(os.getenv("FREETOKEN_ROUTE_RING_STEPS", "1024")))
+        self.route_words = (self.num_experts + 31) // 32
+        self.route_ring: torch.Tensor | None = None  # allocated by record_routes on first use
         # (per-layer sources, cache) per bank, in schema order. Every piece of cache
         # machinery that moves bank bytes (copy_missing, the prefill double buffers,
         # bank_views) iterates this list, so the slot cache is bank-count agnostic.
@@ -527,16 +534,9 @@ class OffloadMoeCache:
         self.num_indices.zero_()
         self.num_missing_full.zero_()
         self.expert_recency.fill_(-1)
-        self.stat_missing.zero_()
-        self.stat_active.zero_()
-        self.stat_calls.zero_()
-        self.stat_fetched.zero_()
-        self.stat_missing_layer.zero_()
         # a rebuild is a cold start for the cache; carrying pre-rebuild hit/miss counts over would skew every post-rebuild stats report
         self.lru_stats.zero_()
-        self.stat_active_layer.zero_()
-        self.stat_fetched_layer.zero_()
-        self.stat_steps_layer.zero_()
+        self.hybrid_stats.zero_()
         # decode_freq is kept: which experts the router picks does not depend on the slot
         # count, and --moe-stats-out rewrites its file at every idle, so zeroing here would
         # replace a session's histogram with whatever came after the rebuild
@@ -928,21 +928,34 @@ class OffloadMoeCache:
             self._prefill_buffer_has_release_event[buffer_id] = True
         self._prefill_buffer_released[buffer_id] = True
 
+    def enable_stats(self, on: bool = True) -> None:
+        """Switch the decode instrumentation on (before graph capture: what the captured
+        graph records is fixed at capture). Allocates the routing ring here rather than on
+        first use, which would land inside a capture."""
+        self.collect_stats = self.collect_decode_freq = bool(on)
+        if on and self.route_ring is None:
+            self.route_ring = torch.zeros(
+                (self.num_layers, self.route_ring_steps, self.route_words), dtype=torch.int32, device=self.device
+            )
+
+    def record_routes(self, layer_id: int, expert_ids: torch.Tensor) -> None:
+        """Count one decode step's routing for ``layer_id`` (physical expert ids, before any
+        kernel rewrites them to slots): ``decode_freq``, ``route_steps`` and the ring. One
+        launch, device-side, fixed shape -- captured into the decode graph."""
+        from freetoken.moe.offload_kernels import record_routes
+
+        if self.route_ring is None:
+            self.enable_stats(True)
+        record_routes(self, layer_id, expert_ids)
+
     def ensure_experts(self, layer_id: int, expert_ids: torch.Tensor) -> None:
         from freetoken.moe.offload_kernels import ensure_experts
 
-        if self.collect_decode_freq:
-            # ``expert_ids`` still holds raw expert ids here (the kernel rewrites them to
-            # slot ids in place), so snapshot the routing histogram before that happens.
-            ids = expert_ids.reshape(-1).long()
-            self.decode_freq[layer_id].scatter_add_(0, ids, torch.ones_like(ids))
         self._pending_src_layer = layer_id
         self._pending_whole_layer = False
         ensure_experts(self, layer_id, expert_ids)
 
-    def ensure_experts_hybrid(
-        self, layer_id: int, expert_ids: torch.Tensor, freq_ids: torch.Tensor | None = None
-    ) -> None:
+    def ensure_experts_hybrid(self, layer_id: int, expert_ids: torch.Tensor) -> None:
         """Capped-fetch LRU for the hybrid backend.
 
         Like :meth:`ensure_experts` but assigns slots to (and schedules copies for) at
@@ -954,11 +967,6 @@ class OffloadMoeCache:
         miss count (for stats). All device-side / fixed-shape, so it is CUDA-graph safe."""
         from freetoken.moe.offload_kernels import ensure_experts_hybrid
 
-        if self.collect_decode_freq:
-            # freq_ids: the caller may have rewritten non-resident ids before this call (see
-            # OffloadMoELayer._decode_hybrid); the histogram wants what was actually routed.
-            ids = (expert_ids if freq_ids is None else freq_ids).reshape(-1).long()
-            self.decode_freq[layer_id].scatter_add_(0, ids, torch.ones_like(ids))
         self._pending_src_layer = layer_id
         self._pending_whole_layer = False
         ensure_experts_hybrid(
@@ -984,14 +992,7 @@ class OffloadMoeCache:
         self.prefill_hit_rows = 0
         self.prefill_total_rows = 0
         self.lru_stats.zero_()
-        self.stat_missing.zero_()
-        self.stat_active.zero_()
-        self.stat_calls.zero_()
-        self.stat_fetched.zero_()
-        self.stat_missing_layer.zero_()
-        self.stat_active_layer.zero_()
-        self.stat_fetched_layer.zero_()
-        self.stat_steps_layer.zero_()
+        self.hybrid_stats.zero_()
 
     def record_decode_stats(self, layer_id: int) -> None:
         """No-op: ``ensure_experts`` accumulates into ``lru_stats`` inside its own launch.
@@ -1000,29 +1001,9 @@ class OffloadMoeCache:
         was eight torch ops per layer per step, all captured into the decode graph.
         """
 
-    def record_decode_stats_hybrid(self, layer_id: int) -> None:
-        """Hybrid stats: full miss count (pre-cap), the PCIe-fetched count (capped), and
-        the active count. The CPU computes (missing - fetched) experts. Device-side;
-        accumulates both the scalar totals and the per-layer breakdown."""
-        assert 0 <= layer_id < self.num_layers, f"layer_id {layer_id} out of range [0, {self.num_layers})"
-        missing = self.num_missing_full.sum()
-        fetched = self.num_indices.sum()
-        active = self.active_mask.sum()
-        self.stat_missing += missing
-        self.stat_fetched += fetched
-        self.stat_active += active
-        self.stat_calls += 1
-        self.stat_missing_layer[layer_id] += missing
-        self.stat_fetched_layer[layer_id] += fetched
-        self.stat_active_layer[layer_id] += active
-        self.stat_steps_layer[layer_id] += 1
-
     def decode_miss_stats(self) -> dict:
         if self.decode_target == "hybrid":
-            active = int(self.stat_active.item())
-            missing = int(self.stat_missing.item())
-            calls = int(self.stat_calls.item())
-            fetched = int(self.stat_fetched.item())
+            missing, active, fetched, calls = (int(x) for x in self.hybrid_stats.sum(1))
         else:
             active, missing, calls = (int(x) for x in self.lru_stats.sum(0))
             # plain offload fetches every miss over PCIe; stat_fetched is the hybrid split's

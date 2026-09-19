@@ -192,13 +192,13 @@ with its assumptions printed beside it, not a measurement; see [cli.md](cli.md#f
 
 ### 1. Measure the routing
 
-The placement is only as good as the histogram behind it. Run once with the graph disabled
-(under a captured graph the scatter never sees real expert ids) and use the server normally:
+The placement is only as good as the histogram behind it. Run once with `--moe-stats-out` and use
+the server normally:
 
 ```bash
 ft serve --model-path /models/Qwen3.8-Flash-Next-NVFP4 --pp-size 2 --gpu 0,1 \
   --moe-strategy hybrid --ple-backend disk --dense-quant fp8 \
-  --disable-cuda-graph --moe-stats-out ~/moe-stats.json
+  --moe-stats-out ~/moe-stats.json
 ```
 
 `~/moe-stats.rank0.json` and `~/moe-stats.rank1.json` are rewritten each time the server goes idle

@@ -31,12 +31,25 @@ def _parse(argv):
     return args
 
 
-def test_defaults_leave_instrumentation_off():
+def test_defaults_collect_stats_but_write_nothing():
+    # the counters are on by default (the web console reads them); no file unless asked
     args = _parse([])
-    assert args.moe_collect_stats is False
+    assert args.moe_collect_stats is True
     assert args.moe_stats_out is None
     # None (not []) so CudaGraphRunner still auto-sizes the capture list
     assert args.cuda_graph_bs is None
+
+
+def test_no_collect_stats_turns_the_counters_off():
+    assert _parse(["--no-moe-collect-stats"]).moe_collect_stats is False
+    # the older spelling still parses, and a later flag wins as usual
+    assert _parse(["--no-moe-collect-stats", "--moe-collect-stats"]).moe_collect_stats is True
+
+
+def test_stats_out_overrides_no_collect_stats():
+    # asking for the file is asking for the counters; an empty file would help nobody
+    args = _parse(["--no-moe-collect-stats", "--moe-stats-out", "/tmp/moe.json"])
+    assert args.moe_collect_stats is True
 
 
 def test_stats_out_implies_collect_stats():

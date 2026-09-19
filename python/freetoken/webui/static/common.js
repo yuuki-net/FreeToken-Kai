@@ -16,6 +16,7 @@ const FT = (() => {
     "/v1/requests": "/engine/requests",
     "/v1/cache/status": "/engine/cache",
     "/v1/kai/experts": "/engine/kai/experts",
+    "/v1/kai/slots": "/engine/kai/slots",
   };
 
   function token() { try { return localStorage.getItem(TOKEN_KEY) || ""; } catch { return ""; } }

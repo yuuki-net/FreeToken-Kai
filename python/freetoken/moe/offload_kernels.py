@@ -60,6 +60,70 @@ def ensure_experts_hybrid(
     _ensure_experts_hybrid_gpu(cache, layer_id, expert_ids, max_fetch, frac_q16)
 
 
+def record_routes(cache, layer_id: int, expert_ids: torch.Tensor) -> None:
+    """One decode step's routing for ``layer_id`` into ``cache.decode_freq`` / ``route_steps``
+    / ``route_ring`` (see OffloadMoeCache). ``expert_ids`` are physical expert ids, any shape;
+    negative ids are skipped. One launch on the GPU; a torch mirror for CPU tensors (tests)."""
+    ring = cache.route_ring
+    assert ring is not None
+    num_experts, ring_steps, words = cache.num_experts, cache.route_ring_steps, cache.route_words
+    if not expert_ids.is_cuda:
+        ids = expert_ids.reshape(-1).long()
+        ids = ids[ids >= 0]
+        cache.decode_freq[layer_id].scatter_add_(0, ids, torch.ones_like(ids))
+        pos = int(cache.route_steps[layer_id]) % ring_steps
+        bits = torch.zeros(words * 32, dtype=torch.int64)
+        bits[ids.unique()] = 1
+        packed = (bits.view(words, 32) << torch.arange(32)).sum(1)
+        ring[layer_id, pos] = torch.where(packed >= 1 << 31, packed - (1 << 32), packed).to(ring.dtype)
+        cache.route_steps[layer_id] += 1
+        return
+    _record_routes_kernel[(1,)](
+        expert_ids,
+        cache.decode_freq,
+        cache.route_steps,
+        ring,
+        layer_id,
+        expert_ids.numel(),
+        num_experts,
+        ring_steps,
+        words,
+        BLOCK_E=max(32, triton.next_power_of_2(num_experts)),
+    )
+
+
+@triton.jit(do_not_specialize=["layer_id", "num_ids"])
+def _record_routes_kernel(
+    ids_ptr,
+    freq_ptr,       # [L, E] int64
+    steps_ptr,      # [L] int64
+    ring_ptr,       # [L, R, W] int32
+    layer_id,
+    num_ids,
+    num_experts: tl.constexpr,
+    ring_steps: tl.constexpr,
+    words: tl.constexpr,
+    BLOCK_E: tl.constexpr,
+):
+    off_e = tl.arange(0, BLOCK_E)
+    e_mask = off_e < num_experts
+    counts = tl.zeros((BLOCK_E,), dtype=tl.int64)
+    for i in tl.range(num_ids):
+        e = tl.load(ids_ptr + i).to(tl.int32)
+        counts += (off_e == e).to(tl.int64)
+    freq = freq_ptr + layer_id * num_experts + off_e
+    tl.store(freq, tl.load(freq, mask=e_mask, other=0) + counts, mask=e_mask)
+    step = tl.load(steps_ptr + layer_id)
+    tl.store(steps_ptr + layer_id, step + 1)
+    # one bit per expert: word w holds experts 32w..32w+31, bit b = expert 32w+b
+    active = ((counts > 0) & e_mask).to(tl.int64)
+    lane = (off_e % 32).to(tl.int64)
+    packed = tl.sum(tl.reshape(active << lane, (BLOCK_E // 32, 32)), axis=1)
+    off_w = tl.arange(0, BLOCK_E // 32)
+    row = ring_ptr + (layer_id * ring_steps + step % ring_steps) * words
+    tl.store(row + off_w, packed.to(tl.int32), mask=off_w < words)
+
+
 def prefill_hit_compact(cache, layer_id: int, buffer_id: int) -> None:
     """Compact this layer's cache-resident experts into gather indices, device-side.
 
@@ -112,15 +176,18 @@ def _ensure_experts_hybrid_gpu(
         cache.num_indices,
         cache.num_missing_full,
         cache.expert_recency,
+        cache.hybrid_stats,
         layer_id,
         expert_ids.numel(),
         int(max_fetch),
         int(frac_q16),
         cache.num_experts,
         cache.cache_size,
+        cache.num_layers,
         BLOCK_E=block_e,
         BLOCK_C=block_c,
         BY_RECENCY=_HYBRID_FETCH_BY_RECENCY,
+        STATS=bool(cache.collect_stats),
         num_warps=num_warps,
     )
 
@@ -163,6 +230,9 @@ def _ensure_experts_hybrid_cpu(
     num_fetch = min(len(missing), int(max_fetch))
     cache.num_missing_full.fill_(len(missing))
     cache.num_indices.fill_(num_fetch)
+    if getattr(cache, "collect_stats", False):
+        col = cache.hybrid_stats[:, layer_id]
+        col += torch.tensor([len(missing), len(seen), num_fetch, 1], dtype=col.dtype, device=col.device)
 
     usage = cache.usage.tolist()
     for idx in range(num_fetch):
@@ -300,15 +370,18 @@ def _ensure_experts_hybrid_kernel(
     num_indices_ptr,
     num_missing_full_ptr,
     expert_recency_ptr,
+    stats_ptr,
     layer_id,
     num_active,
     max_fetch,
     fetch_frac_q16,
     num_experts: tl.constexpr,
     cache_size: tl.constexpr,
+    num_layers: tl.constexpr,
     BLOCK_E: tl.constexpr,
     BLOCK_C: tl.constexpr,
     BY_RECENCY: tl.constexpr,
+    STATS: tl.constexpr,
 ):
     """Capped-fetch timestamp-LRU (hybrid backend).
 
@@ -325,7 +398,11 @@ def _ensure_experts_hybrid_kernel(
     most-recently active before this step (LRU on the expert, via ``expert_recency``),
     breaking ties toward the lower expert id -- this prioritizes *recurring* misses for
     caching, lowering the steady miss rate. Otherwise the lowest expert ids are fetched
-    (``missing_rank``), the original routing-blind heuristic."""
+    (``missing_rank``), the original routing-blind heuristic.
+
+    ``STATS`` (--moe-collect-stats): add this step's full miss count, active count, capped
+    fetch count and 1 to the layer's column of ``stats_ptr`` ([4, num_layers] int64, rows in
+    ``offload_cache.HYBRID_STAT_*`` order) in the same launch."""
     step = tl.load(step_ptr) + 1
     tl.store(step_ptr, step)
     base = layer_id * num_experts
@@ -355,6 +432,16 @@ def _ensure_experts_hybrid_kernel(
     num_fetch = tl.minimum(num_missing, max_fetch)
     tl.store(num_missing_full_ptr, num_missing.to(tl.int64))
     tl.store(num_indices_ptr, num_fetch.to(tl.int64))
+    if STATS:
+        num_unique = tl.sum(is_active.to(tl.int64))
+        p_missing = stats_ptr + 0 * num_layers + layer_id
+        p_active = stats_ptr + 1 * num_layers + layer_id
+        p_fetched = stats_ptr + 2 * num_layers + layer_id
+        p_steps = stats_ptr + 3 * num_layers + layer_id
+        tl.store(p_missing, tl.load(p_missing) + num_missing.to(tl.int64))
+        tl.store(p_active, tl.load(p_active) + num_unique)
+        tl.store(p_fetched, tl.load(p_fetched) + num_fetch.to(tl.int64))
+        tl.store(p_steps, tl.load(p_steps) + 1)
     is_hit = is_active & (slot >= 0)
     tl.store(usage_ptr + slot, step, mask=is_hit)
 

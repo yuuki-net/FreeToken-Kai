@@ -50,7 +50,7 @@ const FTSuggest = (() => {
 
     if (isMoe && !collect) {
       out.push({ impact: 0, title: t("tun_sug_collect"), detail: t("tun_sug_collect_d"),
-        flag: "--moe-collect-stats", set: [{ flag: "--moe-collect-stats", value: "" }] });
+        flag: "--no-moe-collect-stats", set: [{ flag: "--no-moe-collect-stats", value: null }] });
     }
     if (faultsPerTok != null && faultsPerTok >= 2) {
       const avail = mem.mem_available || 0;

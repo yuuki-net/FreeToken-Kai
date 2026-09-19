@@ -123,10 +123,13 @@ cache, expert cache and GDN state, and host RAM.
 ![Dashboard](assets/kai-console-dashboard.png)
 
 **How experts are served** shows, per layer, how often a routed expert was not on the GPU, and what
-to change about it. With a measurement run it also shows how often each expert was picked, and
-what a bigger cache would hold.
+to change about it, how often each expert was picked, where a token's time goes (copying experts,
+CPU compute, GPU compute, the rest), and how a bigger GPU cache would have done on the routing it
+just saw.
 
 ![Expert heatmap](assets/kai-console-heatmap.png)
+
+![Where a token's time goes and the GPU cache size estimate](assets/kai-console-breakdown.png)
 
 Other PCs on the LAN can watch everything; starting, stopping and editing from them needs the token
 the console shows on this PC. `ft serve` serves the same dashboard read-only on its own port.

@@ -817,12 +817,21 @@ def parse_args(
 
     parser.add_argument(
         "--moe-collect-stats",
+        dest="moe_collect_stats",
         action="store_true",
         default=ServerArgs.moe_collect_stats,
         help=(
-            "Accumulate decode miss-rate counters in the offload MoE cache (device-side, "
-            "captured into the decode graph). Read back by --moe-stats-out."
+            "Count decode routing in the offload MoE cache: miss/fetch counters, how often "
+            "each expert is routed, and the last steps' routing for the web console's "
+            "cache-size estimate. Device-side and captured into the decode graph. On by "
+            "default; kept so older command lines still parse."
         ),
+    )
+    parser.add_argument(
+        "--no-moe-collect-stats",
+        dest="moe_collect_stats",
+        action="store_false",
+        help="Turn the decode routing counters off (the web console then has no miss rates or heatmap).",
     )
     parser.add_argument(
         "--moe-stats-out",
@@ -831,17 +840,14 @@ def parse_args(
             "Write the decode routing histogram (per layer, per expert) and the realized "
             "miss rates to this JSON path, rewritten each time the server goes idle and on "
             "shutdown; implies --moe-collect-stats. One "
-            "file per pipeline rank (.rank<N>.json) when --pp-size > 1. The histogram is "
-            "only accumulated outside a captured graph, so pair it with "
-            "--disable-cuda-graph for a collection run."
+            "file per pipeline rank (.rank<N>.json) when --pp-size > 1."
         ),
     )
     parser.add_argument(
         "--disable-cuda-graph",
         action="store_true",
         help=(
-            "Run decode eagerly (no CUDA graph capture). Much slower; for instrumentation "
-            "runs whose counters must see the real per-step routing."
+            "Run decode eagerly (no CUDA graph capture). Much slower; for debugging."
         ),
     )
 

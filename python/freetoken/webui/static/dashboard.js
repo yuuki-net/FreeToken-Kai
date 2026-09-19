@@ -9,6 +9,7 @@
   const hist = FT.demoHistory ? FT.demoHistory() : []; // [t, decode, prefill], last 10 minutes
   let geometry = null, reqCursor = 0, requests = [], engineConfig = null, lastStatsHost = false;
   let engineRunning = null;  // the manager's own engine: drives which buttons a profile row shows
+  let lastKai = null;
 
   // ---------------------------------------------------------------- engine + tiles
   async function tick() {
@@ -81,6 +82,9 @@
     drawChart();
     renderGpus(stats);
     renderKai(stats);
+    lastKai = stats.kai || null;
+    $("#moe-cards").hidden = !lastKai?.moe;
+    if (lastKai?.moe) FTBreakdown.renderTokens($("#tok"), lastKai, tp.decode_tps || 0);
   }
 
   // ---------------------------------------------------------------- speed chart
@@ -241,6 +245,15 @@
     } catch {} finally { heatBusy = false; }
   }
 
+  // ---------------------------------------------------------------- cache size estimate
+  let slotsBusy = false;
+  async function pollSlots() {
+    if (slotsBusy || !lastKai?.moe || $("#eng-uptime").textContent === t("none")) return;
+    slotsBusy = true;
+    try { FTBreakdown.renderSlots($("#slots"), await FT.serveGet("/v1/kai/slots"), lastKai); }
+    catch {} finally { slotsBusy = false; }
+  }
+
   async function pollGeometry() { try { geometry = (await FT.serveGet("/v1/cache/status")).geometry; } catch {} }
 
   // ---------------------------------------------------------------- ft mgr: lifecycle, profiles, logs
@@ -369,6 +382,8 @@
   setInterval(pollGeometry, 15000);
   setTimeout(pollHeat, 1500);
   setInterval(pollHeat, 10000);
+  setTimeout(pollSlots, 2500);
+  setInterval(pollSlots, 30000);
   pollHost();
   setInterval(pollHost, 3000);
   addEventListener("resize", drawChart);

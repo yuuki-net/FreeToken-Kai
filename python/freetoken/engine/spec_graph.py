@@ -41,6 +41,7 @@ import torch
 from freetoken.attention.linear import FLAMetadata
 from freetoken.core import Batch, Req
 from freetoken.utils import init_logger, mem_GB
+from freetoken.utils import decode_sample
 
 if TYPE_CHECKING:
     from .engine import Engine
@@ -84,6 +85,10 @@ class SpecVerifyGraph:
         self.hidden: torch.Tensor | None = None   # head-owning rank: the final hidden state (draft head input)
         self.stash: list = []                     # the GDN layers' SpecGdnStash objects (graph-pool tensors)
         self.graph: torch.cuda.CUDAGraph | None = None
+        # --moe-collect-stats: the same window with the decode timeline's event records
+        # (utils/decode_sample.py), and the GDN stashes that copy fills
+        self.graph_timed: torch.cuda.CUDAGraph | None = None
+        self.stash_timed: list = []
         self._capture_batch: Batch | None = None
         # draft head (head-owning rank): window graph + one-step chain graph, see capture_mtp
         self.g_window: torch.cuda.CUDAGraph | None = None
@@ -160,6 +165,19 @@ class SpecVerifyGraph:
                 ctx.spec_stash = []
                 pp = eng.pp_comm
                 self.hidden = model.last_hidden if pp is None or pp.is_last else None
+                if decode_sample.TIMELINE is not None:
+                    # Shares the plain graph's pool: the two are never replayed together, and the
+                    # plain graph's live outputs (out, hidden, the stashes) are not reused. The
+                    # draft head reads self.hidden, so the timed copy leaves its hidden state there.
+                    eng.attn_backend.reset_forward_plan(batch)
+                    timed = torch.cuda.CUDAGraph()
+                    with torch.cuda.graph(timed, pool=graph.pool(), stream=eng.stream):
+                        self.out.copy_(decode_sample.run_forward(model.forward))
+                        if self.hidden is not None:
+                            self.hidden.copy_(model.last_hidden)
+                    self.stash_timed = list(ctx.spec_stash)
+                    ctx.spec_stash = []
+                    self.graph_timed = timed
         finally:
             ctx.pp_hidden_in = None
             if eng.moe_offload_cache is not None:
@@ -325,9 +343,9 @@ class SpecVerifyGraph:
         slot = req.linear_slot_idx if req.linear_slot_idx is not None else req.table_idx
         self._bind(batch, table_idx=req.table_idx, slot=slot, kv_len=req.device_len)
 
-    def replay(self) -> torch.Tensor:
+    def replay(self, timed: bool = False) -> torch.Tensor:
         assert self.graph is not None and self.out is not None
-        self.graph.replay()
+        (self.graph_timed if timed else self.graph).replay()
         return self.out
 
 
