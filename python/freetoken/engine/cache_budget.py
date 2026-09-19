@@ -125,11 +125,11 @@ def shortfall_fixes(
       reserve the greedy fill can only take experts out of what is left, so the plan fits.
     - ``memory_ratio``: the smallest ratio (to 0.01) whose budget covers the smallest plan,
       unless that is above ``_MAX_SUGGESTED_RATIO``.
-    - ``disable_overlap``: whether dropping the prefill-overlap floor (2 x num_experts slots
-      down to num_experts) alone makes it fit.
+
+    No ``--disable-moe-prefill-overlap``: the plan already drops overlap on its own whenever
+    that alone makes it fit, so a plan that still fails has the ``num_experts`` floor.
     """
     expert_floor = exc.moe_slots * exc.per_expert_bytes
-    kv_now = pool_pages(exc.kv_pages) * exc.cache_per_page
 
     kv_tokens = None
     left_for_kv = exc.budget_bytes - expert_floor
@@ -150,12 +150,7 @@ def shortfall_fixes(
         if r <= _MAX_SUGGESTED_RATIO:
             ratio = r
 
-    disable_overlap = False
-    if exc.overlap_floor:
-        lower = exc.num_experts * exc.per_expert_bytes + kv_now
-        disable_overlap = lower <= exc.budget_bytes
-
-    return {"kv_reserve_tokens": kv_tokens, "memory_ratio": ratio, "disable_overlap": disable_overlap}
+    return {"kv_reserve_tokens": kv_tokens, "memory_ratio": ratio}
 
 
 def _mib(b: int) -> str:
@@ -208,11 +203,6 @@ def explain_shortfall(
         )
     if fixes["memory_ratio"] is not None:
         options.append(f"    --memory-ratio {fixes['memory_ratio']:.2f}")
-    if fixes["disable_overlap"]:
-        options.append(
-            f"    --disable-moe-prefill-overlap   (expert floor {2 * exc.num_experts} -> "
-            f"{exc.num_experts} slots, frees {_mib(exc.num_experts * exc.per_expert_bytes)})"
-        )
     if options:
         lines.append("  any one of these fits:")
         lines.extend(options)
@@ -274,6 +264,12 @@ def plan_cache_budget(
     to ``[floor, min(total_experts, max_slots)]`` (floor is ``2*num_experts`` when prefill
     overlap is feasible else ``num_experts``); KV pages take whatever remains.
 
+    Overlap is feasible only when its floor fits the budget next to the KV reserve. Where it
+    does not but the ``num_experts`` floor does, the plan turns overlap off instead of
+    failing: overlap only hides the prefill bank transfer, and one 12 GB card with a 512-expert
+    model (Qwen3.8-Flash-Next) cannot hold the 1024-slot floor. The KV reserve is never cut
+    for it -- that is a context length someone asked for.
+
     ``num_pages`` is the usable count. The pool allocates one dummy page on top of it
     (``create_kv_pool``: ``num_pages + 1``), so that page is charged to the budget here too.
     """
@@ -284,10 +280,12 @@ def plan_cache_budget(
     # Prefill overlap borrows two full expert-layer buffers, so it needs >= 2*num_experts
     # slots; disable it (and lower the floor) if the cap cannot fit that.
     overlap = prefill_overlap and hi >= 2 * num_experts
+    kv_reserve_bytes = pool_pages(kv_reserve_pages) * cache_per_page
+    if overlap and 2 * num_experts * per_expert_bytes + kv_reserve_bytes > budget_bytes:
+        overlap = False  # the overlap floor does not fit next to the KV reserve
     lo = 2 * num_experts if overlap else num_experts
     assert hi >= lo, f"slot cap {hi} below the minimum {lo} slots"
 
-    kv_reserve_bytes = pool_pages(kv_reserve_pages) * cache_per_page
     # MoE-priority: reserve KV first, then experts greedily take the remaining budget.
     raw = (budget_bytes - kv_reserve_bytes) // per_expert_bytes
     moe_cache_size = max(lo, min(raw, hi))

@@ -1486,6 +1486,13 @@ class Engine:
         self._mtp_bank_layers = self._append_mtp_bank(banks)
         if config.moe_cache_auto:
             size, pages, overlap = self._resolve_auto_moe_cache_size(config, banks, method)
+            if config.moe_prefill_overlap and not overlap:
+                n = config.model_config.num_experts
+                logger.warning_rank0(
+                    f"--moe-cache-auto: MoE prefill overlap off, its {2 * n}-slot floor does not "
+                    f"fit next to the KV reserve; the cache keeps {size} slots (floor {n}) and "
+                    "prefill copies each layer's experts in turn"
+                )
             object.__setattr__(config, "moe_cache_size", size)
             object.__setattr__(config, "moe_prefill_overlap", overlap)
             if config.num_page_override is None:

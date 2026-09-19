@@ -80,6 +80,55 @@ def test_budget_too_small_for_min_moe_plus_reserve_raises():
         )  # min moe = 4 slots (400 B) + reserve (10 pages = 100 B) = 500 B > 300 B budget
 
 
+def test_overlap_floor_that_does_not_fit_turns_overlap_off():
+    # 2*E floor (800 B) + reserve (11 pages = 110 B) > 700 B, but the E floor (400 B) fits:
+    # start without overlap rather than refuse.
+    size, pages, overlap = plan_cache_budget(
+        budget_bytes=700, per_expert_bytes=100, cache_per_page=10,
+        num_experts=4, total_experts=40, prefill_overlap=True,
+        kv_reserve_pages=10, max_slots=40,
+    )
+    assert overlap is False
+    assert size == (700 - 110) // 100  # 5: greedy from the E floor, not pinned at it
+    assert pages >= 10
+
+
+def test_overlap_is_kept_when_its_floor_fits_exactly():
+    size, pages, overlap = plan_cache_budget(
+        budget_bytes=910, per_expert_bytes=100, cache_per_page=10,
+        num_experts=4, total_experts=40, prefill_overlap=True,
+        kv_reserve_pages=10, max_slots=40,
+    )
+    assert overlap is True and size == 8 and pages == 10
+
+
+def test_dropping_overlap_never_cuts_the_kv_reserve():
+    # E floor + reserve does not fit either: still the budget error, not a shorter context.
+    with pytest.raises(AssertionError, match="budget too small"):
+        plan_cache_budget(
+            budget_bytes=450, per_expert_bytes=100, cache_per_page=10,
+            num_experts=4, total_experts=40, prefill_overlap=True,
+            kv_reserve_pages=10, max_slots=40,
+        )
+
+
+def test_flash_next_on_one_12gb_card_starts_without_overlap():
+    # Qwen3.8-Flash-Next on one RTX 3060 (2026-09-19): 512 experts x 2.64 MiB, the budget the
+    # explicit --moe-cache-size 512 run implied at memory_ratio 0.9 (~2.7 GiB after weights and
+    # the GDN pool). The 1024-slot overlap floor (2.64 GiB) plus the default 8192-token reserve
+    # does not fit; before this the auto plan refused and pointed at the flag.
+    GiB, MiB = 1 << 30, 1 << 20
+    per_expert = int(2.64 * MiB)
+    per_token = int(2.89 * GiB / 131072)  # bf16 KV, 12 full-attention layers
+    size, pages, overlap = plan_cache_budget(
+        budget_bytes=int(2.7 * GiB), per_expert_bytes=per_expert, cache_per_page=per_token,
+        num_experts=512, total_experts=512 * 48, prefill_overlap=True,
+        kv_reserve_pages=8192, max_slots=512 * 48,
+    )
+    assert overlap is False
+    assert 512 <= size < 1024 and pages >= 8192
+
+
 def test_prefill_overlap_false_is_honored():
     # Even when the cache could fit 2*num_experts, an explicit False stays False.
     size, pages, overlap = plan_cache_budget(

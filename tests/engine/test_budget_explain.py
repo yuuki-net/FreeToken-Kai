@@ -91,19 +91,16 @@ def test_the_suggested_memory_ratio_fits_and_is_the_smallest_to_a_hundredth():
         resolve_moe_cache_auto(**{**kw, "memory_ratio": round(r - 0.01, 2)})
 
 
-def test_disabling_overlap_is_offered_only_when_that_alone_fits():
-    # With overlap on, the floor is 2 x 256 slots; dropping it frees 256 x 1.7 MiB.
-    kw, exc = _fail(prefill_overlap=True, kv_reserve_tokens=40_000)
-    fixes = shortfall_fixes(
-        exc, baseline_free=kw["baseline_free"], memory_ratio=kw["memory_ratio"],
-        weights_bytes=kw["weights_bytes"], fixed_cache_size=kw["fixed_cache_size"],
-        page_size=kw["page_size"],
-    )
-    if fixes["disable_overlap"]:
-        assert "--disable-moe-prefill-overlap" in str(exc)
-        _fits(**{**kw, "prefill_overlap": False})
-    else:
-        assert "--disable-moe-prefill-overlap" not in str(exc)
+def test_overlap_that_alone_blocks_the_plan_is_dropped_not_suggested():
+    # With overlap on, the floor is 2 x 256 slots; the num_experts floor fits, so the plan
+    # starts with overlap off instead of stopping with --disable-moe-prefill-overlap.
+    kw = {**BASE, "prefill_overlap": True, "kv_reserve_tokens": 40_000}
+    size, pages, overlap = resolve_moe_cache_auto(**kw)
+    assert overlap is False and 256 <= size < 512 and pages >= 40_000
+    # and when even the lower floor does not fit, the message has no overlap option
+    _, exc = _fail(prefill_overlap=True)
+    assert "--disable-moe-prefill-overlap" not in str(exc)
+    assert exc.moe_slots == 256
 
 
 def test_a_gap_no_single_flag_closes_says_so():
