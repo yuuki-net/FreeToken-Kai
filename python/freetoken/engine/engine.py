@@ -2780,12 +2780,11 @@ class Engine:
     def write_moe_stats_idle(self) -> None:
         """Rewrite ``--moe-stats-out`` with everything counted so far (the scheduler went idle).
 
-        The stop path alone is not enough: it runs only when the scheduler worker itself takes
-        a KeyboardInterrupt, i.e. Ctrl+C in the terminal the server runs in the foreground of.
-        ``kill`` / ``systemctl stop`` make the API process terminate the workers first, and a
-        launcher that starts the server with SIGINT ignored passes that on to them, so the
-        file was never written -- silently. Idle is when nothing is on the device, the
-        histogram is a few tens of KB, and it is rewritten only after the server did something.
+        The stop path alone is not enough: it runs when the scheduler worker takes a
+        KeyboardInterrupt -- Ctrl+C, or SIGTERM (server/launch.py ``_stop_on_sigterm``) -- but a
+        SIGKILL, a crash or a stop that outlives its grace period never gets there. Idle is when
+        nothing is on the device, the histogram is a few tens of KB, and it is rewritten only
+        after the server did something.
         """
         if not getattr(self, "_moe_stats_out", None):
             return

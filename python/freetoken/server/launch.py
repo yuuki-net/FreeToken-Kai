@@ -46,6 +46,36 @@ def _detach_process_group() -> None:
         pass
 
 
+# How long a scheduler worker that took SIGTERM may spend on its orderly stop before it exits
+# anyway: the stop syncs the ranks, and a rank that never gets there must not hold the process
+# (a systemd unit would otherwise wait out its own stop timeout, 90 s by default).
+SIGTERM_GRACE_S = 30.0
+
+
+def _stop_on_sigterm(grace_s: float = SIGTERM_GRACE_S) -> None:
+    """Make SIGTERM stop this worker the way Ctrl+C does: as a KeyboardInterrupt, which
+    ``_run_scheduler`` catches to run ``scheduler.shutdown()`` -- the path that writes
+    ``--moe-stats-out`` a last time and flushes the engine's other shutdown work.
+
+    Without this, SIGTERM (``kill``, ``systemctl stop``, and the API process terminating its
+    workers when it is itself stopped) ended the worker on the spot and the shutdown never ran;
+    only a Ctrl+C in the terminal the server ran in the foreground of reached it.
+
+    A second SIGTERM gets the default action again (it kills), and a timer ends the process
+    ``grace_s`` after the first in case the orderly stop hangs."""
+    import signal
+    import threading
+
+    def handler(signum, frame):
+        signal.signal(signal.SIGTERM, signal.SIG_DFL)
+        timer = threading.Timer(grace_s, os._exit, args=(128 + signum,))
+        timer.daemon = True
+        timer.start()
+        raise KeyboardInterrupt
+
+    signal.signal(signal.SIGTERM, handler)
+
+
 def _run_tokenize_worker(detach: bool, **kwargs) -> None:
     """Module-level so it survives the spawn pickle; exists only to detach the group first."""
     if detach:
@@ -117,6 +147,8 @@ def _run_scheduler(args: ServerArgs, ack_queue: mp.Queue[str]) -> None:
         if args.silent_output:
             logging.disable(logging.INFO)
 
+        # only now: a SIGTERM during startup still ends the worker at once
+        _stop_on_sigterm()
         try:
             scheduler.run_forever()
         except KeyboardInterrupt:
