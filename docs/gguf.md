@@ -66,3 +66,8 @@ multiply them fast enough; on this host that rate, not capacity, is what caps de
 Read the headers before you download 90 GB. `tools/gguf_probe.py` in the fork's working notes takes
 the first 12 MiB of each shard and prints the per-tensor ggml types and the totals, which is how the
 table above was made. A build whose expert tensors are all one type is the only kind worth pursuing.
+
+The borrowed ggml kernels (`kernel/gguf.py`) are compiled on first use, with `clang++` as nvcc's
+host compiler: install clang (`apt install clang`). gcc 13 to 15 stop on torch 2.11's
+`ATen/core/List_inl.h` (a missing `typename`), so without clang the first GGUF op fails to build.
+`FREETOKEN_GGUF_HOST_CXX` picks another compiler.
