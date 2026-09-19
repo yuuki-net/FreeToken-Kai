@@ -512,8 +512,8 @@ def test_flags_off_by_default_and_reach_the_config():
     assert args.prefix_disk_cache == "/tmp/pfx" and args.prefix_disk_cache_size == "8G"
 
 
-def test_flags_refuse_pipeline_ranks_and_a_bad_size():
-    with pytest.raises(SystemExit):
-        _parse(["--prefix-disk-cache", "/tmp/pfx", "--pp-size", "2"])
+def test_flags_take_pipeline_ranks_and_refuse_a_bad_size():
+    args = _parse(["--prefix-disk-cache", "/tmp/pfx", "--pp-size", "2"])
+    assert args.prefix_disk_cache == "/tmp/pfx" and args.parallel == "pp"
     with pytest.raises(SystemExit):
         _parse(["--prefix-disk-cache", "/tmp/pfx", "--prefix-disk-cache-size", "lots"])

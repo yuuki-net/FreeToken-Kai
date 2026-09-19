@@ -18,6 +18,7 @@ from freetoken.message import (
     DetokenizeMsg,
     ErrorReplyMsg,
     ExitMsg,
+    PrefixDiskBackendMsg,
     PromptAdmittedMsg,
     UserMsg,
 )
@@ -208,6 +209,13 @@ class Scheduler(SchedulerIOMixin):
         if getattr(self, "bank_rewarm", None) is not None:
             self.bank_rewarm.idle()
         self.engine.write_moe_stats_idle()
+
+    def _rank0_notes(self) -> List[BaseBackendMsg]:
+        """--prefix-disk-cache under --pp-size: rank 0's decisions, relayed with the next step."""
+        disk = getattr(self, "prefix_disk", None)
+        if disk is None or disk.world == 1:
+            return []
+        return [PrefixDiskBackendMsg(uid=u, kind=k, length=n) for u, k, n in disk.take_notes()]
 
     def _wait_for_prefix_disk(self) -> None:
         """Nothing was scheduled: if that is because the head of the prefill queue is waiting for
@@ -674,6 +682,14 @@ class Scheduler(SchedulerIOMixin):
             # _flush_abort_acks runs after _process_last_data, making this a true terminal
             # accounting barrier for FrontendManager/prepare-stop.
             self._pending_abort_acks.add(msg.uid)
+        elif isinstance(msg, PrefixDiskBackendMsg):
+            # rank 0's decision about a queued request (--prefix-disk-cache, --pp-size): applied
+            # here, at the same step on every rank. Its request may have been aborted since.
+            disk = getattr(self, "prefix_disk", None)
+            if disk is not None:
+                req = next((r for r in self.prefill_manager.pending_list if r.uid == msg.uid), None)
+                if req is not None:
+                    disk.apply_note(req, msg.kind, msg.length)
         elif isinstance(msg, CacheRebuildBackendMsg):
             # v1 scope: only if_idle, single-rank, non-owned-KV. drain mode and TP rebuild
             # need the drain-gate / all-rank failure-agreement machinery (deferred), so we

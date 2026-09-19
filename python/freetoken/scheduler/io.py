@@ -4,6 +4,7 @@ import time
 from collections import deque
 from typing import TYPE_CHECKING, Deque, Final, List, Tuple
 
+import msgpack
 import torch
 from freetoken.distributed.watchdog import rank_wait_watchdog
 from freetoken.message import BaseBackendMsg, BaseTokenizerMsg, BatchTokenizerMsg
@@ -162,6 +163,11 @@ class SchedulerIOMixin:
     def run_when_idle(self):
         raise NotImplementedError("should be implemented")
 
+    def _rank0_notes(self) -> List[BaseBackendMsg]:
+        """Rank 0: messages of its own to relay this step after the tokenizer's (decisions the
+        other ranks must apply at the same step). The scheduler overrides this."""
+        return []
+
     def offline_receive_msg(self, blocking: bool = False) -> List[BaseBackendMsg]:
         raise NotImplementedError("should be implemented")
 
@@ -191,6 +197,11 @@ class SchedulerIOMixin:
         pending_raw_msgs: List[bytes] = []
         while not self._recv_from_tokenizer.empty():
             pending_raw_msgs.append(self._recv_from_tokenizer.get_raw())
+        # rank 0's own notes ride behind the tokenizer's messages, counted with them, and rank 0
+        # handles them in the same place of the same step as every other rank does
+        notes = self._rank0_notes()
+        for note in notes:
+            pending_raw_msgs.append(msgpack.packb(note.encoder(), use_bin_type=True))
 
         # tell every other rank how many raw messages follow
         self._publish_msg_count(len(pending_raw_msgs))

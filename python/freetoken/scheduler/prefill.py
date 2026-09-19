@@ -469,7 +469,7 @@ class PrefillManager:
             ):
                 # its prompt is on disk deeper than the tree has it and is being read back;
                 # hold it (and the queue behind it, as any refusal does) until it is restored
-                adder.refusal = ("disk", pending_req.disk_entry.length)
+                adder.refusal = ("disk", getattr(pending_req, "disk_wait_len", 0))
                 break
             if req := adder.try_add_one(pending_req):
                 predecessor = pending_req.chunked_req

@@ -1,9 +1,9 @@
 """Prefix cache on disk (``--prefix-disk-cache``): keep what the radix tree lets go, and what a
 restart throws away, so a long prompt seen before is read back instead of prefilled again.
 
-Stage 1 covers hybrid GDN models (Qwen3.5-MoE, Qwen3.8-Flash-Next) on one rank. See
-``kvcache/prefix_disk_store.py`` for the file format and what makes an entry trustworthy; this
-module is the part that touches the pools and the tree.
+Covers hybrid GDN models (Qwen3.5-MoE, Qwen3.8-Flash-Next) on one GPU and under ``--pp-size``.
+See ``kvcache/prefix_disk_store.py`` for the file format and what makes an entry trustworthy;
+this module is the part that touches the pools and the tree.
 
 **What an entry is.** A tree node that owns a live GDN snapshot marks a boundary ``L`` a request
 can resume from. An entry is that node's whole path: the ids ``[0, L)``, the KV pages under them
@@ -23,6 +23,19 @@ deeper than the tree's own match, the request waits (the queue behind it too) wh
 thread loads the file; then ``CacheManager.insert_restored_prefix`` takes pages and a GDN slot
 the ordinary way, uploads the entry into them and inserts the node into the tree, and admission
 proceeds exactly as for an in-memory hit.
+
+**Under ``--pp-size``.** Every rank runs its own scheduler over the same relayed messages and
+keeps its own tree, identical to the others because every decision is made the same way at the
+same step. The disk breaks that three ways: whether a read has finished, the read deadline, and
+which files a rank has are different on every rank. So rank 0 alone decides -- which entry to read
+("plan"), that it has read it ("ready"), or that it gives up ("abandon") -- and sends each decision
+as a message of its own behind the next step's relayed requests (``PrefixDiskBackendMsg``);
+every rank, rank 0 included, applies it when it handles that step's messages. Each rank stores
+and reads only its own layers (its own directory under the root, with an equal share of the
+cap). Rank 0 cannot see whether the others hold the entry, so the restore itself agrees twice
+over the rank group: whether every rank read its file, and whether every rank uploaded its part;
+if one did not, no rank restores and the request prefills as usual. Writing stays per rank and
+unsynchronised: it changes no state the scheduling reads.
 """
 
 from __future__ import annotations
@@ -60,6 +73,9 @@ MIN_GAIN_TOKENS = 512
 # that prefills in 3 s.
 READ_DEADLINE_BASE_S = 1.0
 READ_DEADLINE_TOKENS_PER_S = 2000
+# --pp-size: how long a rank waits for its own read once rank 0 has read the same entry (the
+# rank group's collectives time out after 60 s, so this stays well below that).
+PP_LOAD_WAIT_S = 30.0
 # Host memory one idle pass may queue for the writer before it stops and leaves the rest for
 # the next idle.
 IDLE_PASS_BYTES = 512 << 20
@@ -245,6 +261,9 @@ class PrefixDiskCache:
         read_deadline_base_s: float = READ_DEADLINE_BASE_S,
         read_deadline_tokens_per_s: float = READ_DEADLINE_TOKENS_PER_S,
         log: Callable[[str], None] | None = None,
+        rank: int = 0,
+        world: int = 1,
+        agree: Callable[[bool], bool] | None = None,
     ) -> None:
         if not cache_manager.is_hybrid:
             raise PrefixDiskUnsupported("the prefix disk cache needs the hybrid radix cache")
@@ -264,6 +283,12 @@ class PrefixDiskCache:
         self._loads: set = set()
         self.stats = {"written": 0, "write_bytes": 0, "write_failed": 0, "restored": 0,
                       "restored_tokens": 0, "restore_skipped": 0, "load_missed": 0, "load_abandoned": 0}
+        # --pp-size: this rank's place, and ``agree(ok) -> every rank's ok`` over the rank group
+        self.rank, self.world = int(rank), int(world)
+        self.primary = self.rank == 0
+        self.agree = agree or (lambda ok: ok)
+        self.pp_load_wait_s = PP_LOAD_WAIT_S
+        self._outbox: List[Tuple[int, str, int]] = []  # rank 0: notes for the next relayed step
 
     # ------------------------------------------------------------------ write side
     def persist_idle(self) -> int:
@@ -364,6 +389,8 @@ class PrefixDiskCache:
         ``can_restore`` -- the request is the first of this admission pass, when nothing admitted
         before it holds an unallocated reservation -- and it leaves ``reserve_tokens`` (what the
         running requests' decode still needs) of KV untouched."""
+        if self.world > 1:
+            return self._admit_gate_pp(req, can_restore=can_restore, reserve_tokens=reserve_tokens)
         state = getattr(req, "disk_state", None)
         if state is None:
             req.disk_state = "checked"
@@ -379,6 +406,7 @@ class PrefixDiskCache:
             if gain < max(self.min_gain, entry.length // 8):
                 return True
             req.disk_entry = entry
+            req.disk_wait_len = entry.length
             req.disk_started = time.monotonic()
             req.disk_deadline = (req.disk_started + self.read_deadline_base_s
                                  + gain / self.read_deadline_tokens_per_s)
@@ -416,6 +444,132 @@ class PrefixDiskCache:
             req.disk_entry = None
         return True
 
+    # ------------------------------------------------------------------ --pp-size
+    def _admit_gate_pp(self, req: "PendingReq", *, can_restore: bool, reserve_tokens: int) -> bool:
+        """``admit_gate`` when every rank schedules for itself: whatever depends on this rank's
+        disk or clock is rank 0's to decide, and it only takes effect when the note that carries
+        it is applied (``apply_note``), at the same step on every rank. Until then the request
+        waits on every rank alike."""
+        state = getattr(req, "disk_state", None)
+        if state is None:
+            limit = req.input_len - 1      # admission always prefills at least the last token
+            if limit < self.min_tokens:
+                req.disk_state = "done"
+                return True
+            req.disk_state = "planning"
+            req.disk_wait_len = 0
+            if self.primary:
+                length, gain = self._plan(req.input_ids[:limit], limit)
+                req.disk_gain = gain
+                self._note(req.uid, "plan", length)
+            return False
+        if state in ("planning", "loading"):
+            if state == "loading" and self.primary and not req.disk_reported:
+                self._check_load(req)
+            return False
+        if state == "ready":
+            if not can_restore:
+                return False
+            req.disk_state = "done"
+            self._restore_pp(req, reserve_tokens)
+            req.disk_entry = None
+            return True
+        return True
+
+    def _plan(self, ids: torch.Tensor, limit: int) -> Tuple[int, int]:
+        """Rank 0: the entry worth reading for this prompt, as ``(length, gain)``; (0, 0) = none."""
+        entry = self.store.lookup(ids, limit)
+        if entry is None:
+            return 0, 0
+        tree = self.cm.prefix_cache.match_prefix(ids[: entry.length]).cached_len
+        gain = entry.length - tree
+        if gain < max(self.min_gain, entry.length // 8):
+            return 0, 0
+        return entry.length, gain
+
+    def _check_load(self, req) -> None:
+        """Rank 0, while the request waits: report the read once it is over (or too slow)."""
+        fut = req.disk_future
+        if fut is not None and not fut.done():
+            if time.monotonic() < req.disk_deadline:
+                return
+            self.stats["load_abandoned"] += 1
+            logger.warning(
+                f"prefix disk cache: request {req.uid} stopped waiting for its {req.disk_wait_len}-token "
+                f"entry after {time.monotonic() - req.disk_started:.1f} s (the read is slower than "
+                f"prefilling it would be); it prefills instead"
+            )
+            self._note(req.uid, "abandon", req.disk_wait_len)
+        elif fut is not None and fut.result() is not None:
+            self._note(req.uid, "ready", req.disk_wait_len)
+        else:
+            self.stats["load_missed"] += 1
+            self._note(req.uid, "abandon", req.disk_wait_len)
+        req.disk_reported = True
+
+    def _note(self, uid: int, kind: str, length: int) -> None:
+        with self._lock:
+            self._outbox.append((int(uid), kind, int(length)))
+
+    def take_notes(self) -> List[Tuple[int, str, int]]:
+        """Rank 0: the decisions to relay with the next step's messages."""
+        with self._lock:
+            notes, self._outbox = self._outbox, []
+        return notes
+
+    def apply_note(self, req, kind: str, length: int) -> None:
+        """Every rank, at the same step: apply one of rank 0's decisions to the waiting ``req``."""
+        state = getattr(req, "disk_state", None)
+        if kind == "plan" and state == "planning":
+            if length <= 0:
+                req.disk_state = "done"
+                return
+            ids = req.input_ids[:length].clone()
+            entry = self.store.lookup(ids, length)
+            fut = None
+            if entry is not None and entry.length == length:
+                fut = self._reader.submit(self._load, entry, ids)
+                with self._lock:
+                    self._loads.add(fut)
+                fut.add_done_callback(self._load_finished)
+            req.disk_entry = entry if fut is not None else None
+            req.disk_future = fut
+            req.disk_wait_len = length
+            req.disk_reported = False
+            req.disk_started = time.monotonic()
+            gain = getattr(req, "disk_gain", length) or length
+            req.disk_deadline = (req.disk_started + self.read_deadline_base_s
+                                 + gain / self.read_deadline_tokens_per_s)
+            req.disk_state = "loading"
+        elif kind == "ready" and state == "loading":
+            req.disk_state = "ready"
+        elif kind == "abandon" and state == "loading":
+            req.disk_state = "done"
+            req.disk_entry = None
+
+    def _restore_pp(self, req, reserve_tokens: int) -> None:
+        """Every rank, together: read this rank's own file to the end (rank 0 already has), agree
+        that every rank has it, then restore (``_restore`` agrees once more on the upload)."""
+        fut = getattr(req, "disk_future", None)
+        loaded = None
+        if fut is not None:
+            try:
+                loaded = fut.result(timeout=self.pp_load_wait_s)
+            except cf.TimeoutError:
+                logger.warning(
+                    f"prefix disk cache: rank {self.rank} had not read request {req.uid}'s "
+                    f"{req.disk_wait_len}-token entry after {self.pp_load_wait_s:.0f} s more"
+                )
+        if not self.agree(loaded is not None):
+            self.stats["load_missed"] += 1
+            logger.info(
+                f"prefix disk cache: request {req.uid}'s {req.disk_wait_len}-token entry is not on every "
+                f"rank's disk ({'this rank has it' if loaded is not None else 'this rank does not'}); "
+                f"it prefills instead"
+            )
+            return
+        self._restore(req, req.disk_entry, *loaded, reserve_tokens=reserve_tokens)
+
     def _load_finished(self, fut) -> None:
         with self._lock:
             self._loads.discard(fut)
@@ -438,8 +592,22 @@ class PrefixDiskCache:
         t0 = time.monotonic()
 
         def write(pages: torch.Tensor, first_page: int, slot: int) -> None:
-            self.layout.write_pages(pages, tensors, first_page)
-            self.layout.write_state(slot, tensors)
+            if self.world == 1:
+                self.layout.write_pages(pages, tensors, first_page)
+                self.layout.write_state(slot, tensors)
+                return
+            # every rank reaches this point together or none does (the checks before it read
+            # only state the ranks share), so the upload can agree: a rank that failed makes
+            # every rank raise, and insert_restored_prefix hands the pages and slot back
+            err = None
+            try:
+                self.layout.write_pages(pages, tensors, first_page)
+                self.layout.write_state(slot, tensors)
+            except Exception as exc:  # noqa: BLE001
+                err = exc
+            if not self.agree(err is None):
+                raise RuntimeError(f"a rank could not upload its part ({err!r} here)" if err is not None
+                                   else "another rank could not upload its part")
 
         try:
             restored, uploaded = self.cm.insert_restored_prefix(ids, write, reserve_tokens=reserve_tokens)
@@ -561,10 +729,11 @@ def build_prefix_disk_cache(config, engine, cache_manager: "CacheManager") -> Pr
     from freetoken.moe.bank_disk import parse_size
 
     flag = "--prefix-disk-cache"
-    if config.tp_info.size > 1:
+    world, rank = config.tp_info.size, config.tp_info.rank
+    if world > 1 and getattr(config, "parallel", None) != "pp":
         raise PrefixDiskUnsupported(
-            f"{flag} runs on one rank only for now; it is refused with --pp-size / --tp-size > 1 "
-            f"(each rank would have to make the same restore decision at the same step)"
+            f"{flag} is refused with --tp-size > 1 (every rank would hold a slice of every layer); "
+            f"--pp-size is supported"
         )
     if getattr(config, "offline_mode", False):
         raise PrefixDiskUnsupported(f"{flag} is a server feature (it writes while the scheduler is idle)")
@@ -575,15 +744,29 @@ def build_prefix_disk_cache(config, engine, cache_manager: "CacheManager") -> Pr
         )
     layout = PoolLayout(engine.kv_cache, engine.linear_state_pool, config.page_size)
     capacity = parse_size(config.prefix_disk_cache_size)
-    store = PrefixDiskStore(
-        config.prefix_disk_cache, capacity, build_fingerprint(config, layout), log=logger.warning
-    )
+    root = config.prefix_disk_cache
+    if world > 1:
+        # a directory and an equal share of the cap per rank: each rank's capacity account would
+        # otherwise count the other ranks' files as foreign and delete them to make room
+        root = os.path.join(root, f"pp{rank}of{world}")
+        capacity //= world
+    store = PrefixDiskStore(root, capacity, build_fingerprint(config, layout), log=logger.warning)
+    where = f" (rank {rank} of {world})" if world > 1 else ""
     logger.info(
-        f"{flag}: {store.dir} holds {len(store)} entries for this configuration; "
+        f"{flag}{where}: {store.dir} holds {len(store)} entries for this configuration; "
         f"{store.total_bytes / (1 << 30):.2f} of {capacity / (1 << 30):.2f} GiB used across "
         f"the directory. Prefixes of {MIN_TOKENS}+ tokens are written while idle."
     )
-    return PrefixDiskCache(store, cache_manager, layout)
+    agree = None
+    if world > 1:
+        group = getattr(engine, "tp_cpu_group", None)
+
+        def agree(ok: bool) -> bool:
+            flag_t = torch.tensor([1 if ok else 0], dtype=torch.int64)
+            torch.distributed.all_reduce(flag_t, op=torch.distributed.ReduceOp.MIN, group=group)
+            return bool(flag_t.item())
+
+    return PrefixDiskCache(store, cache_manager, layout, rank=rank, world=world, agree=agree)
 
 
 __all__ = [

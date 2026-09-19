@@ -123,8 +123,13 @@ The decode log prints the pool as `#mamba-slot: used/total`, and each prefill pr
 
 ## Keeping prefixes on disk (`--prefix-disk-cache`)
 
-> **Experimental**: measured on one GPU and one model so far (an RTX 2060 with Ornith), and the
-> flag may still change.
+> **Experimental**: measured on an RTX 2060 with Ornith and on two RTX 3060s with Qwen3.8-Flash-Next
+> (`--pp-size 2`), and the flag may still change.
+>
+> Two RTX 3060s, Flash-Next with `--spec-mtp 5`, an 8.8k-token prompt, time to first token: 21.05 s
+> prefilled, 1.89 s from the in-memory cache, **2.23 s from disk after a restart** (both ranks
+> restored 8,768 tokens in the same step, each reading its own 161-179 MiB in 0.17-0.18 s). With one
+> rank's file deleted, both ranks prefilled it (20.93 s) and nothing stalled.
 >
 > An 8,097-token prompt, time to first token: 13.0-14.1 s prefilled, 0.99 s from the in-memory
 > cache, **1.24-1.28 s from disk** after the cache had let it go (about 0.2 s reading, 0.1 s copying
@@ -167,6 +172,15 @@ ft serve ... --prefix-disk-cache ~/.cache/freetoken-prefix --prefix-disk-cache-s
   directory, least recently used out first.
 - **Page cache.** Entry files are dropped from the page cache after they are written or read, so
   they do not push out a `--moe-bank-ram` bank's cold half.
+- **Pipelines (`--pp-size`).** Each rank writes and reads only its own layers, in its own
+  sub-directory (`pp<rank>of<ranks>`) with an equal share of `--prefix-disk-cache-size`. Every rank
+  runs its own copy of the scheduler, and a disk read finishes at a different moment on each, so
+  rank 0 alone decides which entry to read, when it has arrived and when to give up, and sends
+  each decision to the other ranks with the next step's requests. Before restoring, the ranks
+  check together that every one of them has read its file and uploaded its part; if one has not
+  (its file was evicted, say), none restores and the prompt is prefilled as usual. Rank 0 decides
+  one step before the others act on it, so a request that is looked up waits one scheduler step
+  longer than on one GPU.
 
-Not supported yet, and refused at startup: `--pp-size` / `--tp-size` > 1, models other than the
+Not supported yet, and refused at startup: `--tp-size` > 1, models other than the
 hybrid GDN ones, and `--cache-type naive`. Image prompts are never cached, on disk or not.

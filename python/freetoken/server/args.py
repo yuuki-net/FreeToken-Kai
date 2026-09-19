@@ -789,13 +789,14 @@ def parse_args(
         default=ServerArgs.prefix_disk_cache,
         metavar="DIR",
         help=(
-            "Hybrid GDN models (Qwen3.5-MoE, Qwen3.8-Flash-Next), one GPU: keep prefix-cache "
+            "Hybrid GDN models (Qwen3.5-MoE, Qwen3.8-Flash-Next): keep prefix-cache "
             "entries -- a prompt's KV pages and the GDN state snapshot at its end -- in this "
             "directory, written while the server is idle, and read them back instead of "
             "prefilling again when a prompt starts with one the in-memory cache no longer "
             "holds, including after a restart. Only prefixes of 1024+ tokens are written. "
             "Entries are keyed by the exact tokens and by the model, weights and cache layout; "
-            "anything else is never read. Refused with --pp-size / --tp-size > 1. "
+            "anything else is never read. Under --pp-size each rank keeps its own layers in its "
+            "own subdirectory with an equal share of the cap; refused with --tp-size > 1. "
             "See docs/prefix-reuse.md."
         ),
     )
@@ -1146,11 +1147,10 @@ def parse_args(
             parser.error("--pp-prefill-group needs --max-running-req 1")
 
     if kwargs["prefix_disk_cache"]:
-        if kwargs["tensor_parallel_size"] > 1:
+        if kwargs["tensor_parallel_size"] > 1 and pp_size <= 1:
             parser.error(
-                "--prefix-disk-cache runs on one GPU only for now: it is refused with "
-                f"{'--pp-size' if pp_size > 1 else '--tp-size'} > 1 (every rank would have to "
-                "restore the same prefix at the same step)"
+                "--prefix-disk-cache is refused with --tp-size > 1 (every rank would hold a slice "
+                "of every layer); --pp-size is supported"
             )
         from freetoken.moe.bank_disk import parse_size
 

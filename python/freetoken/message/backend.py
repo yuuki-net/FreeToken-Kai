@@ -87,6 +87,17 @@ class AbortBackendMsg(BaseBackendMsg):
 
 
 @dataclass
+class PrefixDiskBackendMsg(BaseBackendMsg):
+    """--prefix-disk-cache under --pp-size: a decision rank 0 made about a queued request, relayed
+    so every rank applies it at the same step (scheduler/prefix_disk.py). Never from the tokenizer.
+    ``kind``: "plan" (read the ``length``-token entry; 0 = nothing worth reading), "ready" (rank 0
+    has read it) or "abandon" (prefill instead)."""
+    uid: int
+    kind: str
+    length: int = 0
+
+
+@dataclass
 class CacheRebuildBackendMsg(BaseBackendMsg):
     # tokenizer worker -> scheduler: request a runtime KV/MoE/GDN cache resize.
     request_id: str
