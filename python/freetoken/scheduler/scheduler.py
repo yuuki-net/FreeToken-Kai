@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import time
 
 from typing import TYPE_CHECKING, List, NamedTuple, NoReturn, Set, Tuple, TypeAlias
 
@@ -217,12 +218,21 @@ class Scheduler(SchedulerIOMixin):
             return []
         return [PrefixDiskBackendMsg(uid=u, kind=k, length=n) for u, k, n in disk.take_notes()]
 
-    def _wait_for_prefix_disk(self) -> None:
-        """Nothing was scheduled: if that is because the head of the prefill queue is waiting for
-        a prefix to load from disk, wait on the load briefly instead of spinning the loop."""
+    def _wait_nothing_scheduled(self) -> None:
+        """Nothing was scheduled and nothing is in flight. If the head of the prefill queue is
+        waiting for a prefix to load from disk, wait on the load briefly. If it was refused and
+        nothing is running that could free it, only a new message (an abort, a rebuild) or VRAM
+        another process gives back changes that: sleep, doubling from 1 ms to 50 ms, instead of
+        spinning the loop -- the spin held a core at 100% and queried free VRAM every turn.
+        Any scheduled batch resets the backoff (``_schedule_next_batch``)."""
         disk = getattr(self, "prefix_disk", None)
         if disk is not None and disk.loading:
             disk.wait_for_load(0.01)
+            return
+        if self.prefill_manager.runnable and not self.decode_manager.runnable:
+            wait = min(max(2 * getattr(self, "_refused_backoff", 0.0), 0.001), _REFUSED_BACKOFF_MAX_S)
+            self._refused_backoff = wait
+            time.sleep(wait)
 
     @torch.inference_mode()
     def rebuild_cache(
@@ -319,7 +329,7 @@ class Scheduler(SchedulerIOMixin):
                 self._restore_linear_states(forward_input.batch)
                 ongoing_data = (forward_input, self._forward(forward_input))
         elif last_data is None:
-            self._wait_for_prefix_disk()
+            self._wait_nothing_scheduled()
 
         # The drain issues GPU-visible writes to state the batch just launched still reads: the
         # page-table re-point and, for the paged-SWA pools, the full->swa (DSV4: full->window)
@@ -356,7 +366,7 @@ class Scheduler(SchedulerIOMixin):
             self._restore_linear_states(forward_input.batch)
             ongoing_data = (forward_input, self._forward(forward_input))
         else:
-            self._wait_for_prefix_disk()
+            self._wait_nothing_scheduled()
 
         self._process_last_data(ongoing_data)
         self._flush_abort_acks()
@@ -1012,6 +1022,7 @@ class Scheduler(SchedulerIOMixin):
             batch = self.decode_manager.schedule_next_batch()
         if batch is None:
             return None
+        self._refused_backoff = 0.0
         forward_input = self._prepare_batch(batch)
         self._report_prompt_admissions(batch)
         return forward_input
@@ -1173,6 +1184,9 @@ def _no_tokens_needed(batch: Batch) -> bool:
         and all(isinstance(r, ChunkedReq) for r in batch.reqs)
     )
 
+
+# the longest the loop sleeps while a refused prefill waits with nothing running (_wait_nothing_scheduled)
+_REFUSED_BACKOFF_MAX_S = 0.05
 
 # --spec-mtp diagnostics (env): FT_SPEC_PLAIN=1 never verifies (plain decode steps, the draft
 # head still runs); FT_SPEC_MAX_DRAFTS=n caps the drafts per verify window (0 = one-row windows)
