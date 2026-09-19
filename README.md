@@ -2,8 +2,9 @@
 
 **Large models on the PC you already have, with the settings worked out for you.**
 
-gpt-oss-120b on one RTX 3060 12 GB. A 125B MoE on two of them. A 35B MoE on an RTX 2060 6 GB, and
-at 250k of context on one 3060. Getting there used to mean learning a dozen `ft serve` flags and
+gpt-oss-120b on one RTX 3060 12 GB. A 125B MoE on two of them -- or on one, generating as fast as
+on two (19 tok/s) with 128k of context. A 35B MoE on an RTX 2060 6 GB, and at 250k of context on
+one 3060. Getting there used to mean learning a dozen `ft serve` flags and
 how they trade against each other on your card. Now a benchmark in the browser measures your PC
 with the model, tries the settings one at a time, and hands you the fastest as a launch profile.
 
@@ -59,6 +60,12 @@ which is the point.
 **You want a big model on your own PC and do not want to learn the flags.** Follow
 [Getting started](#getting-started): the benchmark picks them. See
 [docs/web-console.md](docs/web-console.md).
+
+**You have one 12 GB card and want Qwen3.8-Flash-Next (125B MoE).** It fits, with 128 GB of RAM:
+generation at 19 tok/s, the same as on two cards, prompts at 190 tok/s, 128k of context. It needs
+settings the automatic plan would not pick; the console's **Recommended** proposes them for such a
+card. See [docs/kai.md](docs/kai.md#running-qwen38-flash-next-on-one-rtx-3060-12-gb) for the
+command, what each flag is for, and why 262k is not offered.
 
 **You have two GPUs and upstream will only use one.** See [docs/pipeline.md](docs/pipeline.md).
 `--pp-size 2` needs neither NCCL nor peer access, so it works on consumer boards where P2P is

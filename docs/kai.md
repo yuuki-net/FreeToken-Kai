@@ -152,7 +152,7 @@ to read the thread count as a tuned value.
 |---|---|---|
 | RTX 2060 6 GB, 32 GB RAM, Windows 11 + WSL2 (`memory=24GB`) | `ornith-ai/Ornith-1.5-35B-A3B-NVFP4` (35B MoE, 3B active, vision) | Text and image input work. Decode 25-39 tok/s (`--moe-strategy hybrid`, `--dtype float16`), 64k of context with `--host-embedding`. Prefill: a 2062-token prompt in ~7.8 s (68 s before the Turing GEMM changes); ~5 s of that is the per-chunk expert streaming, the rest ~1.3 ms/token; a follow-up turn behind a cached prefix answers in 2-3 s |
 | same | `openai/gpt-oss-20b` (MXFP4) | 20k of context with the defaults (`--moe-strategy hybrid --disable-moe-prefill-overlap`, bf16, `--kv-reserve-tokens 20480`: 20,868 tokens allocated, K + V = 0.58 GiB, 34 expert slots). Decode 14-16 tok/s measured against the depth held: 16.1 tok/s median at 1,845 tokens, 15.3 at 8,035, 14.4 at 15,953 (2026-09-13). One run fell to 9.1 at 19,315 with the pool 93% full; a `--memory-ratio 0.95` run (30,817 tokens) did not drop at the same depth, so the cause is not the length, and it is not pinned down. That `--memory-ratio 0.95` run leaves 0.12 GiB free and decodes slower (9.8 tok/s at 7.4k), so 20k is the usable figure. `--kv-cache-dtype` is refused (`HybridSWAKVCache`). Prefill is the cost: a 19k prompt took about 6.5 minutes, and consecutive prompts sharing a prefix showed `#cached-token: 0`. The earlier 13-14 tok/s was the Turing patch alone on upstream |
-| The two-GPU machine above (`--pp-size 2`, GPU 1 on the chipset x4 slot) | `RadixArk/Qwen3.8-Flash-Next-NVFP4` (125B MoE, vision), `--pp-size 2 --dense-quant fp8` | Does not fit one 12 GB card; runs with 128k of context. 18-20 tok/s plain, 13-27 tok/s with `--spec-mtp 5` (2.1-4.5 tokens accepted per step; the verify window and the draft head run as CUDA graphs on both ranks). Image input validated end to end on upstream's image path with the vision tower on the CPU (`--mm-encoder-weights cpu`) and on the GPU (`host`, computing in float32): colour probe 6/6, a four-quadrant image described to the end, and 2.6-5.8 tokens accepted per step with `--spec-mtp 5` after the image (2026-09-15). A follow-up turn behind a cached prefix answers in 2.4-4.5 s (9 s before the CPU short-prefill path) |
+| The two-GPU machine above (`--pp-size 2`, GPU 1 on the chipset x4 slot) | `RadixArk/Qwen3.8-Flash-Next-NVFP4` (125B MoE, vision), `--pp-size 2 --dense-quant fp8` Runs with 128k of context on the two cards; one card also runs it (see [below](#running-qwen38-flash-next-on-one-rtx-3060-12-gb)). 18-20 tok/s plain, 13-27 tok/s with `--spec-mtp 5` (2.1-4.5 tokens accepted per step; the verify window and the draft head run as CUDA graphs on both ranks). Image input validated end to end on upstream's image path with the vision tower on the CPU (`--mm-encoder-weights cpu`) and on the GPU (`host`, computing in float32): colour probe 6/6, a four-quadrant image described to the end, and 2.6-5.8 tokens accepted per step with `--spec-mtp 5` after the image (2026-09-15). A follow-up turn behind a cached prefix answers in 2.4-4.5 s (9 s before the CPU short-prefill path) |
 | same | `ornith-ai/Ornith-1.5-35B-A3B-NVFP4` | One card (`--gpu 0`), `--moe-strategy hybrid`: 41-46 tok/s, 2,947 expert slots (2026-09-06; the context length of that run was not recorded). The same one-card configuration takes 256k of context (`--max-seq-len-override 262144 --kv-reserve-tokens 262144`, 262154 tokens allocated, K + V = 5.00 GiB, 1.33 GiB free after initialisation) with the expert cache cut to 680 slots. Measured against the depth actually held, 22 sampled steps each: 39.2 tok/s median at 8,185 tokens, 34.8 at 63,655 (-11%), 25.2 at 249,948 (-36%, KV at 95% of capacity). Prefill of the 250k context took 435 s in 8,192-token chunks, the per-chunk rate falling from 896 tok/s over the first chunk to 371 at a depth of 221k. On this host the expert transfer is not the bottleneck, so the cache can be spent on context almost for free; the cost lands on prefill. The first steps after any prefill run at 31-37 until the cache warms. Two cards, `--pp-layers 25 --moe-strategy offload`: 40-44 tok/s, 3,833 slots per card; the even split with hybrid is slower (25-30 tok/s). `--spec-mtp 5` on one card: 19-35 tok/s (a 6-row verify step costs 68-92 ms against 23 ms for one row: the window multiplies the expert traffic, as on the 2060) |
 | same | `openai/gpt-oss-120b` (MXFP4, 57 GB of expert banks) | One card: 9-12 tok/s (202 expert slots; the banks exceed the pin budget, so 9 layers decode on the CPU). Two cards, `--pp-layers 26 --moe-strategy hybrid`: 12-17 tok/s (394 slots per card, every bank pinned). All gpt-oss-120b runs used 32k of context (`--max-seq-len-override 32768 --kv-reserve-tokens 32768`), not the 128k of the Flash-Next row above: 18 of its 36 layers are full attention at 2048 B per token per layer, so 128k of KV would want 4.7-5.5 GiB against 1.62 GiB free. Untested at 128k |
 
@@ -240,6 +240,44 @@ figure is the one to watch: it is the dequant-and-multiply rate, not a memcpy ra
 caps decode on a machine like this one -- reading a step's experts from host memory at ~44 GB/s
 costs about 13 ms, more than the GPU spends on everything else. A host that reports far less there
 will be slower whatever the GPU is.
+
+## Running Qwen3.8-Flash-Next on one RTX 3060 (12 GB)
+
+```bash
+ft serve   --model models/Qwen3.8-Flash-Next-NVFP4 --gpu 0 --host 0.0.0.0 --port 1919   --moe-strategy hybrid --moe-cpu-layers auto --moe-cpu-threads 7 --ple-backend disk --dense-quant fp8   --moe-cache-size 512 --disable-moe-prefill-overlap   --kv-cache-dtype q4_0 --num-tokens 135168 --max-seq-len-override 131072   --host-embedding --max-running-req 1 --memory-ratio 0.95   --prefill-mixer-pieces 2 --max-prefill-length 8192 --prefill-chunk-budget 0.75
+```
+
+Measured on one RTX 3060 12 GB (the x16 card of the two-GPU machine above, 128 GB RAM, WSL2),
+`RadixArk/Qwen3.8-Flash-Next-NVFP4`, with the command above (2026-09-19):
+
+| | One card | Two cards (`--pp-size 2`), for reference |
+|---|---|---|
+| Generation | **19.19 tok/s** | 19.24 tok/s |
+| Prompt processing, 16k-token prompt | **189 tok/s** | 575 tok/s after the benchmark |
+| KV | 135,168 tokens, 0.97 GiB | 131,072 tokens |
+
+A 100k-token prompt with an eight-digit code planted at its start was read in 534 s (187 tok/s)
+and the code answered correctly; generation at that depth ran at 17.4 tok/s. Ten minutes of
+alternating requests (a 300-token generation, then an 8k-token prompt with a code to answer)
+completed 16 requests with no error, generation at 19.05 tok/s over the first third and 18.76 over
+the last.
+
+| Flag | Why |
+|---|---|
+| `--moe-cache-size 512 --disable-moe-prefill-overlap` | Exactly one layer of experts on the GPU. Sized automatically (`--moe-cache-auto`), the start refuses on this card (`cache budget too small`): the minimum plan counts a KV reserve and the prefill overlap's second layer. An explicit size skips that plan -- the slots are taken, and what is left goes to KV and prompt processing |
+| `--num-tokens 135168` | Caps the KV at 128k plus room for the output. Uncapped, KV takes every byte left and prompt processing has 0.17 GiB to work in: 768-token chunks, 133 tok/s. Capped, the chunk is 8192 tokens (2.34 GiB) |
+| `--kv-cache-dtype q4_0` | 128k of KV in 0.97 GiB |
+| `--host-embedding` | The embedding table (0.6 GiB as fp8) goes to pinned RAM; that is +79k tokens of KV at the same settings. It takes 1.2 GiB of the pin budget, so one more bank layer decodes on the CPU (17 instead of 16); generation did not change |
+| `--memory-ratio 0.95` | Nearly all of the card. The card used here had 10.97 GiB free before loading; a card with less free (a display, other programs) may not start |
+| `--moe-strategy hybrid --moe-cpu-layers auto` | As on two cards: 63 GiB of banks against a 41 GiB pin budget under WSL, so 17 head and tail layers decode on the CPU |
+
+**Why not 262k.** It fits (`--num-tokens 270336`: 1.94 GiB of KV), but prompt processing falls to
+72 tok/s, and a 250k-token prompt ended the server with `CUDA driver error: device not ready`:
+at 0.95 the card has no room left for the rest. 128k is the setting to use on one 12 GB card.
+
+The console's **Recommended** proposes these flags when the model is Qwen3.8-Flash-Next and there
+is one card whose VRAM the non-expert weights nearly fill; with `--num-tokens` set, the benchmark
+leaves the context length where it is.
 
 ## Speculative decoding with the checkpoint's MTP head (`--spec-mtp K`)
 
