@@ -158,3 +158,46 @@ def test_host_embedding_is_recommended_for_flash_next_on_a_small_card(tmp_path, 
                  moe_intermediate_size=640, vision_config=None)
     f = _flags(rec.recommend(_model(tmp_path, "Flash-Next", weight_gib=135, **flash)))
     assert "--host-embedding" in f
+
+
+FLASH_NEXT = dict(GDN_MOE, model_type="qwen4_exp", num_hidden_layers=48, num_experts=512, hidden_size=2560,
+                  moe_intermediate_size=640, vision_config=None,
+                  layer_types=["linear_attention", "linear_attention", "linear_attention", "full_attention"] * 12)
+
+
+def test_flash_next_on_one_12gb_card(tmp_path, monkeypatch):
+    # the automatic expert-cache plan refuses to start here; the explicit one-layer cache with a
+    # capped q4_0 KV runs as fast as two cards (guides/23, 2026-09-19)
+    _host(monkeypatch, [("NVIDIA GeForce RTX 3060", 12, 8.6)], ram_gib=128, cores=8)
+    f = _flags(rec.recommend(_model(tmp_path, "Flash-Next", weight_gib=135, **FLASH_NEXT)))
+    assert "--pp-size" not in f and "--moe-cache-auto" not in f
+    assert f["--moe-cache-size"] == "512" and "--disable-moe-prefill-overlap" in f
+    assert f["--moe-strategy"] == "hybrid" and f["--moe-cpu-layers"] == "auto"
+    assert f["--kv-cache-dtype"] == "q4_0"
+    ctx = rec.ONE_CARD_CONTEXT
+    assert f["--max-seq-len-override"] == str(ctx) and f["--num-tokens"] == str(ctx + 8192)
+    assert "--kv-reserve-tokens" not in f
+    assert "--host-embedding" in f and f["--memory-ratio"] == "0.95"
+    assert f["--dense-quant"] == "fp8" and f["--prefill-mixer-pieces"] == "2"
+
+
+def test_two_cards_keep_the_pipeline_and_the_automatic_plan(tmp_path, monkeypatch):
+    _host(monkeypatch, [("NVIDIA GeForce RTX 3060", 12, 8.6)] * 2, ram_gib=128, cores=8)
+    f = _flags(rec.recommend(_model(tmp_path, "Flash-Next", weight_gib=135, **FLASH_NEXT)))
+    assert f["--pp-size"] == "2" and "--moe-cache-auto" in f
+    assert "--num-tokens" not in f and "--moe-cache-size" not in f and f["--memory-ratio"] == "0.85"
+
+
+def test_the_one_card_flags_parse(tmp_path, monkeypatch):
+    # every flag the recommendation writes must be one ft serve takes, with no conflicting pair
+    import pytest
+    pytest.importorskip("freetoken.server.args")
+    from freetoken.server.args import parse_args
+
+    _host(monkeypatch, [("NVIDIA GeForce RTX 3060", 12, 8.6)], ram_gib=128, cores=8)
+    path = _model(tmp_path, "Flash-Next", weight_gib=135, **dict(FLASH_NEXT, architectures=["Qwen4ExpForConditionalGeneration"],
+                                                                 torch_dtype="bfloat16"))
+    r = rec.recommend(path)
+    assert "--num-tokens" in r["flags"]
+    args, _ = parse_args(["--model", path, "--tool-call-parser", "llama3", "--reasoning-parser", "off", *r["flags"]], False)
+    assert args.moe_cache_size == 512 and args.moe_cache_auto is False and args.num_token_override == rec.ONE_CARD_CONTEXT + 8192

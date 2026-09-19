@@ -921,3 +921,15 @@ def test_picking_up_keeps_the_earlier_runs_on_record(tmp_path):
     r = job.status()["result"]
     assert [e["finished"] for e in r["earlier"]][0] == first["finished"] and len(r["earlier"]) == 2
     assert r["earlier"][0]["trials"] == json.loads(json.dumps(first["trials"]))  # as saved
+
+
+def test_an_explicit_kv_size_skips_the_context_tiers(tmp_path):
+    # one card (Flash-Next on 12 GB): the KV is sized by --num-tokens, which --kv-reserve-tokens
+    # cannot move, so the tiers would only change the advertised length
+    rec = json.loads(json.dumps(DENSE_REC))
+    rec["flags"] += ["--num-tokens", "270336"]
+    m = FakeManager()
+    serve = FakeServe(m, effects={"--kv-reserve-tokens=32768": (1.0, 1.0, 1.0)})
+    r = _run(_job(tmp_path, m, serve, rec=rec))["result"]
+    assert not any((t.get("key") or "").startswith("context_") for t in r["trials"])
+    assert dict(tuner.parse_flags(r["args"]))["--num-tokens"] == "270336"

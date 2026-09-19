@@ -16,6 +16,10 @@ import subprocess
 from .models import resolve_model
 
 GiB = 1 << 30
+# Qwen3.8-Flash-Next on one card whose VRAM the non-expert weights nearly fill (a 3060 12 GB):
+# the context the KV is capped at. 262k fits but leaves prefill too little (72 tok/s) and a 250k
+# prompt ended in "CUDA driver error: device not ready"; 128k runs prefill at 190 (guides/23)
+ONE_CARD_CONTEXT = 131072
 
 
 # ------------------------------------------------------------------ the host
@@ -173,6 +177,12 @@ def recommend(model: str, *, extra_dirs: list[str] | None = None) -> dict:
 
     flags: list[str] = []
     notes: list[dict] = []
+    # One card that the non-expert weights nearly fill, with Flash-Next: the automatic expert-cache
+    # plan refuses to start there (its minimum counts a KV reserve and the prefill overlap's second
+    # layer), while an explicit one-layer cache with a capped q4_0 KV runs as fast as two cards
+    # (guides/23, 2026-09-19). Measured on Flash-Next only, so only Flash-Next gets it.
+    one_card = (is_moe and facts.get("model_type") == "qwen4_exp" and len(cards) <= 1
+                and bool(resident) and resident > vram * 0.75)
 
     def add(flag: str, value: str | None, why: str, why_en: str) -> None:
         flags.append(flag)
@@ -204,7 +214,7 @@ def recommend(model: str, *, extra_dirs: list[str] | None = None) -> dict:
 
     # --- experts: where they run, and how much RAM they may take
     if is_moe:
-        if vram <= 8 * GiB:
+        if vram <= 8 * GiB or one_card:
             add("--moe-strategy", "hybrid",
                 f"VRAM が {vram / GiB:.0f} GiB と小さいので、GPU に載らないエキスパートは CPU で計算します。",
                 f"With {vram / GiB:.0f} GiB of VRAM, experts that are not on the GPU are computed on the CPU.")
@@ -214,15 +224,28 @@ def recommend(model: str, *, extra_dirs: list[str] | None = None) -> dict:
             add("--moe-cpu-threads", str(max(2, min(cores - 2, 8))),
                 f"物理コア {cores} 個から、ほかの処理のぶんを残した数です。",
                 f"{cores} physical cores, leaving some for everything else.")
-        add("--moe-cache-auto", None,
-            "空いている VRAM から、GPU に載せるエキスパートの枠を自動で決めます。",
-            "The number of experts kept on the GPU is sized from the free VRAM.")
+        if one_card:
+            n = int(facts.get("num_experts") or 0)
+            add("--moe-cache-size", str(n),
+                f"GPU に載せるエキスパートの枠を 1 層分（{n}）に固定します。自動で決めると、この VRAM では最小の計画に KV の予約と"
+                "重ね合わせの 2 層目が入って起動を断ります。固定すればその計算を通らず、残りが KV とプロンプト処理に回ります"
+                "（3060 12GB 1 枚で生成 19.3 tok/s、2 枚と同じ）。",
+                f"Keep exactly one layer of experts on the GPU ({n} slots). Sized automatically, the minimum plan on this much VRAM "
+                "counts a KV reserve and the prefill overlap's second layer and refuses to start; a fixed size skips that plan, and "
+                "the rest goes to KV and prompt processing (19.3 tok/s generation on one 3060 12 GB, the same as on two).")
+            add("--disable-moe-prefill-overlap", None,
+                "重ね合わせは枠が 2 層分要るので切ります。",
+                "The prefill overlap needs two layers of slots, so it is off.")
+        else:
+            add("--moe-cache-auto", None,
+                "空いている VRAM から、GPU に載せるエキスパートの枠を自動で決めます。",
+                "The number of experts kept on the GPU is sized from the free VRAM.")
         if weights and mem.get("total") and weights > mem["total"]:
             cap = max(8, int((mem["total"] * 0.7) / GiB))
             add("--moe-bank-ram", f"{cap}G",
                 f"重み {weights / GiB:.0f} GiB が RAM {mem['total'] / GiB:.0f} GiB に収まらないので、入る分だけ RAM に置き、残りは SSD から読みます。",
                 f"{weights / GiB:.0f} GiB of weights do not fit {mem['total'] / GiB:.0f} GiB of RAM: keep what fits in RAM and read the rest from the SSD.")
-        if vram - resident < 2 * GiB and vram <= 8 * GiB:
+        if vram - resident < 2 * GiB and vram <= 8 * GiB and not one_card:
             add("--disable-moe-prefill-overlap", None,
                 "プロンプト処理の 2 バッファ分の VRAM が残らないので、重ね合わせを切ります。",
                 "There is no VRAM left for prompt processing's second buffer, so the overlap is turned off.")
@@ -232,7 +255,20 @@ def recommend(model: str, *, extra_dirs: list[str] | None = None) -> dict:
     # cannot see, so take the card's size as the tier and say where to look to raise it.
     max_ctx = facts.get("max_context") or 0
     per_token = kv_bytes_per_token(facts, quantized=is_moe)
-    if max_ctx:
+    if max_ctx and one_card:
+        ctx = min(max_ctx, ONE_CARD_CONTEXT)
+        cap = ctx + 8192
+        add("--kv-cache-dtype", "q4_0",
+            f"KV を 4 ビットにします。{ctx:,} トークン分の KV が 1 GiB 前後に収まります。",
+            f"A 4-bit KV cache: {ctx:,} tokens of KV fit in about 1 GiB.")
+        add("--num-tokens", str(cap),
+            f"KV を {cap:,} トークン（文脈 {ctx:,} ＋ 出力の余裕）で止めます。止めないと KV が残りの VRAM を全部取り、"
+            "プロンプト処理の作業域が 0.17 GiB まで縮んで、1 回に 768 トークンしか読めなくなります（2060 で 106〜123 → 658 tok/s の差）。",
+            f"Cap the KV at {cap:,} tokens (a {ctx:,} context plus room for the output). Uncapped, KV takes every byte left and "
+            "prompt processing has 0.17 GiB to work in, 768 tokens at a time (106-123 vs 658 tok/s on a 2060).")
+        add("--max-seq-len-override", str(ctx), "宣伝する長さと実際に入る長さをそろえます。",
+            "The advertised context matches what actually fits.")
+    elif max_ctx:
         tier = 16384 if vram <= 8 * GiB else 65536 if vram <= 16 * GiB else 131072
         ctx = min(max_ctx, tier)
         if is_moe:
@@ -256,13 +292,21 @@ def recommend(model: str, *, extra_dirs: list[str] | None = None) -> dict:
         add("--dense-quant", "fp8",
             "エキスパート以外の bf16 の重みを読み込み時に fp8 にします。常駐分が 1 枚あたり 4.9 → 2.9 GB になり、空いた VRAM がエキスパートの枠に回ります。",
             "Quantizes the bf16 non-expert weights to fp8 at load: resident weights go from 4.9 to 2.9 GB per card, and the freed VRAM goes to the expert cache.")
-    if facts.get("model_type") in ("qwen3_5_moe", "qwen4_exp") and vram <= 8 * GiB:
+    if one_card:
+        add("--prefill-chunk-budget", "0.75",
+            "プロンプト処理の 1 チャンクが空き VRAM の 75% まで使えるようにします（2 枚構成で 510 → 700 tok/s の実測と同じ設定）。",
+            "Let one prefill chunk use 75% of the free VRAM (the setting measured at 510 -> 700 tok/s on two cards).")
+    if facts.get("model_type") in ("qwen3_5_moe", "qwen4_exp") and (vram <= 8 * GiB or one_card):
         add("--host-embedding", None, "埋め込み表を RAM に置いて、その分の VRAM を KV に回します。",
             "Keep the embedding table in RAM and give its VRAM to the KV cache.")
 
     # --- the rest
-    add("--memory-ratio", "0.85", "画面表示やほかのアプリが使う VRAM の余地を残します。",
-        "Leave VRAM for the display and other applications.")
+    if one_card:
+        add("--memory-ratio", "0.95", "1 枚に収めるため、VRAM をほぼ使い切ります（画面を出しているカードでは起動しないことがあります）。",
+            "Use nearly all the VRAM to fit one card (a card that also drives a display may not start).")
+    else:
+        add("--memory-ratio", "0.85", "画面表示やほかのアプリが使う VRAM の余地を残します。",
+            "Leave VRAM for the display and other applications.")
     add("--max-running-req", "1", "1 リクエストずつ処理します（小さいカードでは同時実行より安定します）。",
         "One request at a time (steadier than concurrency on small cards).")
     if facts.get("vision"):

@@ -851,6 +851,11 @@ class TuneJob:
         # with nothing newly kept, the last result's tiers still stand and are not run again
         model_max = facts.get("max_context")
         tiers = context_candidates(best.get("geometry") or {}, model_max) if (prior is None or kept_now) else []
+        if has_flag(best_args, "--num-tokens"):
+            # the KV is sized explicitly (one card: Flash-Next on a 12 GB card, recommend.py): the tiers
+            # size it through --kv-reserve-tokens, which an explicit size ignores, so they would only
+            # move the advertised length away from what fits
+            tiers = []
         for tier in tiers:
             self._check()
             c = search.Candidate(f"context_{tier}", {"--kv-reserve-tokens": str(tier), "--max-seq-len-override": str(tier)},
