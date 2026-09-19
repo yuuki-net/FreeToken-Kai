@@ -535,6 +535,15 @@ class CacheManager:
         if prefix_len > base:
             req.chunk_dups.append((base, prefix_len))
         req.chunk_upto = L
+        # The in-flight successor copied chunk_upto when it was built, before this commit, so
+        # it holds the value from before it (None under overlap: every chunk is built before
+        # its predecessor commits). Its own commit then falls back to its handle, which the
+        # loop below advances -- correct only while that match lands exactly on L. Hand it the
+        # watermark too, so its base does not depend on that.
+        successor = req.successor
+        while successor is not None:
+            successor.chunk_upto = L
+            successor = successor.successor
         # The node at L owns a snapshot either way (insert attached one, or reported the one
         # already there), so the match truncates to exactly L. Lock BEFORE the replacement
         # alloc below: that can evict_mamba, which would otherwise reclaim this still-unlocked

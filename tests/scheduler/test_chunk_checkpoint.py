@@ -104,11 +104,21 @@ def test_the_watermark_carries_across_chunks():
 
 def test_the_in_flight_successor_gets_the_new_handle():
     cm, req = _manager(), _req()
-    tail = SimpleNamespace(cache_handle=None, successor=None)
-    req.successor = SimpleNamespace(cache_handle=None, successor=tail)
+    tail = SimpleNamespace(cache_handle=None, successor=None, chunk_upto=None)
+    req.successor = SimpleNamespace(cache_handle=None, successor=tail, chunk_upto=None)
     cm.commit_chunk_checkpoint(req)
     assert req.successor.cache_handle is req.cache_handle
     assert tail.cache_handle is req.cache_handle, "the whole chain, not just the next one"
+
+
+def test_the_in_flight_successor_gets_the_new_watermark():
+    """The successor was built before this commit and copied the watermark from before it.
+    Without the hand-over its own commit would fall back to its handle -- right today, but only
+    because the match after the insert always lands on L."""
+    cm, req = _manager(), _req(chunk_upto=None)
+    req.successor = SimpleNamespace(cache_handle=None, successor=None, chunk_upto=None)
+    cm.commit_chunk_checkpoint(req)
+    assert req.chunk_upto == 2048 and req.successor.chunk_upto == 2048
 
 
 def test_a_boundary_that_is_not_page_aligned_is_skipped():
