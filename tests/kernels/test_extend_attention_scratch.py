@@ -168,13 +168,43 @@ def test_features_the_scratch_path_does_not_have_fall_back(name, extra, monkeypa
 
 
 @cuda_only
-def test_a_short_extend_stays_on_the_fused_kernel(monkeypatch):
-    """A verify window or a chat turn behind a cached prefix is a handful of rows: the GEMMs
-    are thin and the gather would be paid for all of them."""
-    case = _case(attn._ATTN_SCRATCH_MIN_ROWS - 1, 512)
+@pytest.mark.parametrize("rows", [1, 4, 64])
+def test_a_short_extend_takes_the_scratch_path_and_agrees(rows, monkeypatch):
+    """A verify window or a chat turn behind a cached prefix is a handful of rows. Measured on
+    the RTX 2060 the scratch path is still the faster one there (1 row behind 16k: 1.4 ms
+    against 26.7 ms), so it takes them -- and must answer what the fused kernel answers."""
+    case = _case(rows, 512)
     calls = _watched(monkeypatch)
-    _run(case, monkeypatch, "1")
-    assert calls
+    scratch = _run(case, monkeypatch, "1")
+    assert not calls
+    fused = _run(case, monkeypatch, "0")
+    torch.testing.assert_close(scratch, fused, rtol=2e-3, atol=2e-3)
+
+
+@cuda_only
+def test_a_captured_graph_keeps_the_fused_kernel(monkeypatch):
+    """The scratch gather is sized by the context and reading that size syncs the host, which
+    invalidates a CUDA graph capture (the --spec-mtp verify window on the RTX 2060 fell back to
+    eager for exactly this). Under capture the fused kernel is used, and the replay answers
+    what the eager scratch path does."""
+    case = _case(4, 512)
+    monkeypatch.setenv(attn._ATTN_SCRATCH_ENV, "1")
+    eager = attn.extend_paged_attention(**case)
+    out = torch.empty_like(case["q"])
+    s = torch.cuda.Stream()
+    s.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(s):
+        monkeypatch.setenv(attn._ATTN_SCRATCH_ENV, "0")
+        attn.extend_paged_attention(**case, out=out)   # warm-up: compile the fused kernel
+        monkeypatch.setenv(attn._ATTN_SCRATCH_ENV, "1")
+        torch.cuda.synchronize()
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g, stream=s):
+            attn.extend_paged_attention(**case, out=out)
+    out.zero_()
+    g.replay()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(out, eager, rtol=2e-3, atol=2e-3)
 
 
 @cuda_only

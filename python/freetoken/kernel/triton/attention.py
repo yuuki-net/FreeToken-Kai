@@ -791,9 +791,12 @@ _ATTN_SCRATCH_ENV = "FREETOKEN_ATTN_SCRATCH"
 _ATTN_SCRATCH_MB_ENV = "FREETOKEN_ATTN_SCRATCH_MB"
 # The score tile is the knob. Everything else this path allocates is fixed by the request.
 _ATTN_SCRATCH_MB = 48
-# Below this many rows the fused kernel is the better shape (a verify window, a chat turn
-# behind a cached prefix): the GEMMs are thin and the gather is paid for a handful of rows.
-_ATTN_SCRATCH_MIN_ROWS = 128
+# Fewest rows this path takes. It was 128 on the reading that thin GEMMs lose to the fused
+# kernel for a verify window or a chat turn behind a cached prefix; measured on the RTX 2060
+# (Ornith's shape, fp16) this path is faster at every row count from 1 up, and more so the
+# longer the prefix: 1 row behind 16k 1.4 ms against 26.7 ms, 64 rows 3.9 against 53.9 ms
+# (guides/26 §10). FREETOKEN_ATTN_SCRATCH_MIN_ROWS overrides it.
+_ATTN_SCRATCH_MIN_ROWS = 1
 # The gathered contiguous K/V is the one allocation not bounded by the score budget -- it is
 # the whole context. Past this multiple of the budget, leave it to the fused kernel, whose
 # footprint is its tile.
@@ -850,7 +853,7 @@ def _scratch_attention_applies(
         return False        # a quantized slab without its scales cannot be decoded
     if sliding_window or sinks is not None:
         return False
-    if num_rows < _ATTN_SCRATCH_MIN_ROWS:
+    if num_rows < int(os.getenv("FREETOKEN_ATTN_SCRATCH_MIN_ROWS") or _ATTN_SCRATCH_MIN_ROWS):
         return False
     gather = 2 * num_kv_heads * kv_len * head_dim * q.element_size()
     return gather <= _ATTN_SCRATCH_GATHER_LIMIT * _attn_scratch_bytes()
@@ -1201,7 +1204,10 @@ def extend_paged_attention(
         assert block_ends.is_cuda and block_ends.dtype == torch.int32 and block_ends.numel() == num_q_tokens
     o = out if out is not None else torch.empty_like(q)
     sinks_arg = sinks if sinks is not None else q
-    if block_ends is None and _scratch_attention_applies(
+    # Not while a CUDA graph is being captured: the gather is sized by the context (so a
+    # replay could not reuse it), and reading that size is a device-to-host sync, which
+    # invalidates the capture. The graph keeps the fused kernel.
+    if block_ends is None and not torch.cuda.is_current_stream_capturing() and _scratch_attention_applies(
         q,
         k_extend,
         v_extend,
