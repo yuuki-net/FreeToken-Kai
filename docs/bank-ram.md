@@ -462,6 +462,12 @@ Windows drive's free space. And a bank file is never *created* on a 9p/drvfs pat
 network filesystem or tmpfs: the start stops before anything is written there and says where to
 point `--moe-bank-dir` instead. A file already placed there is served, with a warning.
 
+If a write into the bank file still fails partway -- the host drive filled after the start checked
+it, or an I/O error -- the start stops with `BankFileError: --moe-bank-ram: writing <file> failed:
+<reason>`, naming the bank file. That is not the checkpoint: upstream reports a checkpoint it cannot
+read as `WeightLoadError`, and this error never carries that name. Free the space, or point
+`--moe-bank-dir` elsewhere, rather than fetch the model again.
+
 `pack` and `verify` have run on Ornith on an RTX 2060 host: the packed checkpoint served the same
 text at temperature 0 as the original. `unpack` has run on the synthetic checkpoints of the test
 suite only -- the run on Ornith was cut short by the full host drive above. Nothing has run on

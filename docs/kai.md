@@ -1,7 +1,7 @@
 # FreeToken Kai (改)
 
 An unofficial fork of [FlashML-org/FreeToken](https://github.com/FlashML-org/FreeToken),
-merged with upstream `main` at commit `cac247a` (2026-09-16). It is not affiliated with, endorsed
+merged with upstream `main` at commit `a8eb986` (2026-09-19). It is not affiliated with, endorsed
 by, or supported by FlashML. The license is unchanged (Apache-2.0).
 
 The fork adds nine things upstream does not have:
@@ -193,6 +193,10 @@ uv pip install pillow
 ```
 
 CUDA kernels are JIT-compiled on first use (CUDA 13 toolkit with `nvcc`, as upstream).
+The build targets the GPU the process is bound to, so on a machine that mixes GPU generations it
+builds for the one `--gpu` picks. The first start after an update that changes the build flags
+compiles the kernels again (Ornith on the RTX 2060 took about 10 s longer: two kernels, a few
+seconds each); later starts load them from the cache.
 
 ## Running Ornith-1.5-35B-A3B on an RTX 2060 (6 GB) under WSL2
 
@@ -455,13 +459,17 @@ model that does). Not yet measured on a card.
 
 ## Keeping up with upstream
 
-The fork is a few dozen commits merged with upstream `main`, touching a small set of files (see
-`git log upstream/main..`). It has been merged once, for upstream's quantization refactor (#418),
-which moved kernel selection into a `QuantConfig` / `QuantMethod` layer. The fork follows it:
+The fork is merged with upstream `main` regularly (see `git log upstream/main..` for what it adds).
+Two merges changed the fork's own code: upstream's quantization refactor (#418), which the fork
+follows as described below, and upstream's multimodal stack, which replaced the fork's image input;
+the fork keeps only a CPU vision tower on top of it (`--mm-encoder-weights cpu`) and the pipeline
+split's handling of the tower.
+
+Upstream's quantization refactor moved kernel selection into a `QuantConfig` / `QuantMethod` layer.
+The fork follows it:
 `--dense-quant fp8` (a pipeline flag, see `pipeline.md`) reports an fp8 scheme for the projections a
 checkpoint left bf16 instead of overriding the model config, and the fork's own fp8 and NVFP4 head
 classes were dropped in favour of that layer.
 
-Merging is expected to stay straightforward until upstream ships its own multimodal serving or
-Turing support, at which point the corresponding part of this fork should be dropped in favour of
-the official code.
+Merging is expected to stay straightforward until upstream ships its own Turing support, at which
+point the fork's Turing part should be dropped in favour of the official code.
