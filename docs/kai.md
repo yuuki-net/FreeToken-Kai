@@ -264,7 +264,7 @@ the last.
 
 | Flag | Why |
 |---|---|
-| `--moe-cache-size 512 --disable-moe-prefill-overlap` | Exactly one layer of experts on the GPU. Sized automatically (`--moe-cache-auto`), the start refuses on this card (`cache budget too small`): the minimum plan counts a KV reserve and the prefill overlap's second layer. An explicit size skips that plan -- the slots are taken, and what is left goes to KV and prompt processing |
+| `--moe-cache-size 512 --disable-moe-prefill-overlap` | Exactly one layer of experts on the GPU, and what is left goes to KV and prompt processing. Sized automatically (`--moe-cache-auto`, with `--memory-ratio 0.9` and no `--num-tokens`), the card starts too: 887 slots, generation 20.0 tok/s, but the first 16k-token prompt ran at 60 tok/s |
 | `--num-tokens 135168` | Caps the KV at 128k plus room for the output. Uncapped, KV takes every byte left and prompt processing has 0.17 GiB to work in: 768-token chunks, 133 tok/s. Capped, the chunk is 8192 tokens (2.34 GiB) |
 | `--kv-cache-dtype q4_0` | 128k of KV in 0.97 GiB |
 | `--host-embedding` | The embedding table (0.6 GiB as fp8) goes to pinned RAM; that is +79k tokens of KV at the same settings. It takes 1.2 GiB of the pin budget, so one more bank layer decodes on the CPU (17 instead of 16); generation did not change |

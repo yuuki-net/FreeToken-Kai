@@ -62,9 +62,9 @@ which is the point.
 [docs/web-console.md](docs/web-console.md).
 
 **You have one 12 GB card and want Qwen3.8-Flash-Next (125B MoE).** It fits, with 128 GB of RAM:
-generation at 19 tok/s, the same as on two cards, prompts at 190 tok/s, 128k of context. It needs
-settings the automatic plan would not pick; the console's **Recommended** proposes them for such a
-card. See [docs/kai.md](docs/kai.md#running-qwen38-flash-next-on-one-rtx-3060-12-gb) for the
+generation at 19 tok/s, the same as on two cards, prompts at 190 tok/s, 128k of context. The automatic plan
+starts on such a card too, but its first long prompt ran at 60 tok/s; the console's
+**Recommended** proposes the faster settings for such a card. See [docs/kai.md](docs/kai.md#running-qwen38-flash-next-on-one-rtx-3060-12-gb) for the
 command, what each flag is for, and why 262k is not offered.
 
 **You have two GPUs and upstream will only use one.** See [docs/pipeline.md](docs/pipeline.md).
