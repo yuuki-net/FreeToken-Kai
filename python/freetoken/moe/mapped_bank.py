@@ -744,7 +744,16 @@ class MappedTier:
         return True
 
     def sink(self, layer_id: int, banks) -> None:
-        """``layer_sink`` for the expert loader; ``layer_id`` counts from this rank's first layer."""
+        """``layer_sink`` for the expert loader; ``layer_id`` counts from this rank's first layer.
+
+        A failed write surfaces as BankFileError naming the bank file: the loader around this
+        reports anything else as an unreadable checkpoint (WeightLoadError)."""
+        try:
+            self._sink(layer_id, banks)
+        except OSError as exc:
+            raise BankFileError(f"--moe-bank-ram: writing {self.path} failed: {exc}") from exc
+
+    def _sink(self, layer_id: int, banks) -> None:
         with self._lock:
             if self._file is None:
                 if self.layout is None:

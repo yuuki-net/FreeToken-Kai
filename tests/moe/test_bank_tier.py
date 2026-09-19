@@ -205,6 +205,22 @@ def test_not_enough_disk_is_said_before_writing(tmp_path, monkeypatch):
         _tier(tmp_path / "bank.ftmb", range(L)).prepare()
 
 
+def test_a_write_that_fails_while_loading_names_the_bank_file(tmp_path, monkeypatch):
+    """The engine reports anything but BankFileError from the loader as an unreadable checkpoint."""
+    import errno
+
+    tier = _tier(tmp_path / "bank.ftmb", range(L))
+    assert tier.prepare() is False
+
+    def full(*_a, **_kw):
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+    monkeypatch.setattr(BankFile, "write_layer", full)
+    with pytest.raises(BankFileError, match=r"writing .*bank\.ftmb failed: .*No space left") as exc:
+        tier.sink(0, _banks(0))
+    assert isinstance(exc.value.__cause__, OSError)
+
+
 # ----- build_tier: flags to tier ----------------------------------------------------------------
 class _Method:
     """The parts of a bound expert method build_tier reads."""

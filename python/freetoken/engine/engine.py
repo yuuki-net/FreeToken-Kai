@@ -27,6 +27,7 @@ from freetoken.mm.config import ENCODER_SECTIONS
 from freetoken.models import create_model, load_weight
 from freetoken.models.weight import ftw_lacks_vision
 from freetoken.moe import is_offload_moe_strategy
+from freetoken.moe.bank_file import BankFileError
 from freetoken.moe.expert_banks import load_expert_banks
 from freetoken.moe.host_banks import HostResidency as _HostResidency, PinFailed
 from freetoken.moe.offload_cache import OffloadMoeCache, attach_offload_moe_cache
@@ -506,7 +507,9 @@ def _weight_load_context():
     try:
         yield
     except Exception as exc:
-        if _is_resource_failure(exc):
+        # BankFileError: the --moe-bank-ram file is Kai's own, written while the checkpoint is
+        # read; a full disk there is not an unreadable checkpoint
+        if _is_resource_failure(exc) or isinstance(exc, BankFileError):
             raise
         raise WeightLoadError(f"{type(exc).__name__}: {exc}") from exc
 
