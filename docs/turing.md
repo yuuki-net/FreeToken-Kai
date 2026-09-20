@@ -131,9 +131,18 @@ cuBLAS, softmax in fp32, and matmul again. The whole key range is scored at once
 the plain one -- no running maximum, nothing to rescale. The query tile is sized from
 `FREETOKEN_ATTN_SCRATCH_MB` (48); `FREETOKEN_ATTN_SCRATCH=0/1` overrides the arch choice.
 
+Short extends take it too. The path used to start at 128 rows, on the reasoning that a gather sized
+by the context is not worth paying for a handful of rows. Measured against the fused kernel at
+head_dim 256, that was wrong at every width: one row behind a 1k prefix is 2.51 ms fused against
+0.52 ms here, behind 16k it is 26.7 against 1.4, and 512 rows behind 48k is 722 against 107. Both
+paths read the whole prefix, so both grow with the context and only the constant differs.
+`FREETOKEN_ATTN_SCRATCH_MIN_ROWS` (1) sets the floor.
+
 Anything the path cannot express falls back to the fused kernel: a sliding window, attention sinks,
-the non-split call, an extend shorter than 128 rows (the gather would be paid for a handful of rows),
-and a context whose gathered K/V would exceed four times the score budget.
+the non-split call, a context whose gathered K/V would exceed four times the score budget, and any
+call made while a CUDA graph is being captured -- the gather's shape comes from the context, so it
+cannot be replayed, and asking whether it applies would read the prefix lengths on the host and
+break the capture. That read is why a speculative verify window could not be captured on Turing.
 
 A quantized cache (`--kv-cache-dtype`) is served here rather than handed back. The gather already
 builds a contiguous prefix matrix, so the packed rows are decoded into it once, with the same

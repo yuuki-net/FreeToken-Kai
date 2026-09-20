@@ -346,6 +346,14 @@ off when a multi-row forward costs about as much as a single-row one -- experts 
 the GPU -- which a 6 GB card cannot offer for a 35B MoE. Treat `--spec-mtp` on Turing/offload
 setups as a correctness-verified feature, not a speed-up.
 
+Part of that was the fork's own doing, and is fixed: the prefill attention path read the prefix
+lengths on the host before deciding (see `docs/turing.md` §7), so on Turing -- the one arch that
+reaches that decision -- a verify window never captured into a graph and every step ran eager
+through the fused kernel. With the read gone, K=3 behind an 8k prompt runs 13.6-14.2 tok/s where
+the same build before the fix ran 5.5-5.7, and 12.2-12.9 eager. The numbers in the paragraph above
+were taken before it, so the comparison against plain decode is due a re-measurement; the shape of
+the argument (every verify row pays its own expert traffic) has not changed.
+
 The same holds on an RTX 3060 12 GB (Ornith, `--moe-strategy hybrid`, `--attention-backend
 triton`, K=5, graphs captured): a 6-row verify step takes 68-92 ms against 23 ms for a plain
 step, 1.4-3.8 tokens are accepted, and the result is 19-35 tok/s against 41-46 tok/s plain.
@@ -384,6 +392,7 @@ model that does). Not yet measured on a card.
 | `FREETOKEN_FP8_SCRATCH_GEMM` | arch (on below Ampere) | fp8 W8A16 prefill GEMM as dequant + cuBLAS instead of the inline-dequant Triton kernel |
 | `FREETOKEN_NVFP4_MOE_SCRATCH` | arch (on below Ampere) | NVFP4 prefill MoE as chunked dequant + per-expert cuBLAS instead of the inline-dequant kernel |
 | `FREETOKEN_NVFP4_MOE_ARITH` | arch (on up to Ampere) | Arithmetic (gather-free) e2m1 dequant in the prefill MoE kernel; bit-identical, speed knob only |
+| `FREETOKEN_ATTN_SCRATCH` / `FREETOKEN_ATTN_SCRATCH_MB` / `FREETOKEN_ATTN_SCRATCH_MIN_ROWS` | arch (on below Ampere) / `48` / `1` | Prefill attention as gather + cuBLAS instead of the fused extend kernel; the query tile's scratch budget; the shortest extend that takes it (`docs/turing.md` §7) |
 | `FREETOKEN_CPU_PREFILL_MAX_TOKENS` | `256` | Prefill extends up to this many rows compute their routed experts on the CPU executor (offload/hybrid) instead of streaming every layer's bank; `0` disables |
 | `FREETOKEN_STAGED_COPY` / `FREETOKEN_STAGED_COPY_MB` | on / `32` | Whole-layer prefill copies of non-pinned bank layers go through two pinned staging buffers of this size |
 | `FREETOKEN_BANK_PREAD` | `buffered` | With `--moe-bank-ram`: how a prefill chunk reads the non-resident rows. `buffered` reads them from the file on several threads through the page cache; `direct` with `O_DIRECT` (about 5% more prefill where the page cache is far short of the rows; where it nearly holds them, decode loses the rows a prefill would have cached, -15% measured); `0` faults them in through the mapping as before |
