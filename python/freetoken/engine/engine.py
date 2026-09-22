@@ -1196,7 +1196,12 @@ class Engine:
                 "family served images. Reconvert it with `ft checkpoint`, add the encoder in place with "
                 "scripts/ftw_hotfix.py (docs/ftw-hotfix.md), or start with --text-model-only"
             )
-        with _weight_load_context():
+        # safetensors 0.8.0 keeps page-locked host memory it took to read straight onto the GPU,
+        # which is fatal where the pin budget is about 1 GiB (safetensors_compat has the numbers)
+        from freetoken.models.safetensors_compat import host_staged_reads, reason, wanted
+
+        stage = wanted(config.model_path)
+        with _weight_load_context(), host_staged_reads(stage, why=reason(config.model_path) if stage else ""):
             self.model.load_state_dict(self._load_weight_state_dict(config))
         finalize_quant(self.model)
 
@@ -1502,7 +1507,15 @@ class Engine:
                         layer_sink=bank_tier.sink if bank_tier else None,
                     )
         except PinFailed as exc:
-            raise RuntimeError(f"{exc}; {_pin_hint(self._host_tables_bytes)}") from exc
+            # this refusal measured the host's cap; record it so the next start's --moe-cpu-layers
+            # auto plans against the truth instead of dying in the same place
+            if exc.registered_bytes:
+                from freetoken.moe.pin_probe import remember
+
+                remember(exc.registered_bytes, how="refused mid-load")
+            raise RuntimeError(
+                f"{exc}; {_pin_hint(self._host_tables_bytes, cpu_layers_set=bool(config.moe_cpu_layers))}"
+            ) from exc
         if bank_tier is not None:
             bank_tier.finish()
             banks.sources.update(bank_tier.sources)
@@ -3055,14 +3068,20 @@ def _linear_state_host_bytes(config) -> int:
 def _pin_budget_bytes(reserved: int = 0) -> int | None:
     """Bytes this process can still safely cudaHostRegister, or None when the platform does not cap pinning (plain Linux).
 
-    WSL's WDDM-backed CUDA caps pinning near half of RAM, shared across processes -- budget 40%. FREETOKEN_PIN_BUDGET_GB overrides anywhere. ``reserved`` subtracts host bytes already pinned outside the expert banks (qwen4_exp's PLE table)."""
-    if env := os.environ.get("FREETOKEN_PIN_BUDGET_GB"):
-        cap = int(float(env) * 2**30)
-    elif not hasattr(os, "uname") or "microsoft" not in os.uname().release.lower():  # WSL kernel tag
-        return None
-    else:
-        cap = int(os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE") * 0.4)
-    return max(0, cap - reserved)
+    Answered by :mod:`freetoken.moe.pin_probe`: a figure measured on this host when one exists,
+    FREETOKEN_PIN_BUDGET_GB anywhere, and only otherwise a fraction of MemTotal -- which measurement
+    shows is wrong in both directions (that module's docstring has the numbers). ``reserved``
+    subtracts host bytes already pinned outside the expert banks (qwen4_exp's PLE table)."""
+    from freetoken.moe.pin_probe import budget
+
+    return budget(reserved)
+
+
+def _pin_source() -> str:
+    """Where the pin budget's figure came from, so a log line or a refusal says whether it was measured."""
+    from freetoken.moe.pin_probe import source
+
+    return source()
 
 
 def _bank_bytes(config: EngineConfig, method=None) -> int | None:
@@ -3071,9 +3090,18 @@ def _bank_bytes(config: EngineConfig, method=None) -> int | None:
     return ftw_bank_bytes(config.model_path) or bank_bytes_estimate(config.model_config, method)
 
 
-def _pin_hint(reserved: int) -> str:
+def _pin_hint(reserved: int, *, cpu_layers_set: bool = False) -> str:
     if _pin_budget_bytes(reserved) is None:
         return "the expert banks need more page-locked host RAM than this host has; free host RAM or serve a smaller model"
+    if cpu_layers_set:
+        # the flag the other branch asks for is already on the command line and the split it planned
+        # still did not fit, so the budget was wrong, not the flag; #2 read as "pass
+        # --moe-cpu-layers auto" to a reporter who had passed exactly that
+        return (
+            "--moe-cpu-layers is already set, so this host's pin cap is below the budget the split was "
+            "planned against; the cap measured by this failure has been recorded and the next start "
+            "plans for it, or set FREETOKEN_PIN_BUDGET_GB / --moe-cpu-layers 1.0 to force it now"
+        )
     return (
         "pass --moe-cpu-layers auto to lock the layers over the pin budget for CPU decode, "
         "or --moe-cpu-layers <count|fraction|ids> to choose them yourself"
@@ -3089,7 +3117,8 @@ def _check_pin_budget(config: EngineConfig, *, reserved: int, method=None) -> No
     if bank_bytes and bank_bytes > budget:
         raise ValueError(
             f"expert banks need {bank_bytes / 2**30:.1f} GiB of pinned host RAM but the pin budget is "
-            f"{budget / 2**30:.1f} GiB (WSL caps CUDA pinning; FREETOKEN_PIN_BUDGET_GB overrides); {_pin_hint(reserved)}"
+            f"{budget / 2**30:.1f} GiB, {_pin_source()} (WSL caps CUDA pinning; run \'ft doctor pin\' to "
+            f"measure this host, or set FREETOKEN_PIN_BUDGET_GB); {_pin_hint(reserved)}"
         )
 
 
@@ -3122,7 +3151,7 @@ def _auto_cpu_layers(config: EngineConfig, num_moe_layers: int, *, reserved: int
     ids = frozenset(range(head)) | frozenset(range(num_moe_layers - (n - head), num_moe_layers))
     logger.info_rank0(
         f"--moe-cpu-layers auto: banks {bank_bytes / 2**30:.2f} GiB > pin budget "
-        f"{budget / 2**30:.2f} GiB; locking {n} head+tail MoE layers for CPU decode "
+        f"{budget / 2**30:.2f} GiB ({_pin_source()}); locking {n} head+tail MoE layers for CPU decode "
         f"({sorted(ids)})"
     )
     return ids
