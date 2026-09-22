@@ -174,6 +174,16 @@ def recommend(model: str, *, extra_dirs: list[str] | None = None) -> dict:
     experts_w = expert_bytes(facts) if is_moe else 0
     # what has to sit on the GPU: everything except the routed experts, which stream in per token
     resident = max(int(weights * 0.1), weights - experts_w) if weights else 0
+    # What this host page-locks, when it has ever been measured. The expert banks have to be
+    # page-locked before the GPU may read them and WSL caps that, so the flags below stand on
+    # this figure -- pin_probe is stdlib-only, so importing it keeps this module torch-free.
+    pin_cap = None
+    if is_moe:
+        from freetoken.moe import pin_probe
+
+        if pin_probe.is_pin_capped():
+            known = pin_probe.remembered()
+            pin_cap = known.cap_bytes if known else None  # set only where the driver refused
 
     flags: list[str] = []
     notes: list[dict] = []
@@ -218,9 +228,29 @@ def recommend(model: str, *, extra_dirs: list[str] | None = None) -> dict:
             add("--moe-strategy", "hybrid",
                 f"VRAM が {vram / GiB:.0f} GiB と小さいので、GPU に載らないエキスパートは CPU で計算します。",
                 f"With {vram / GiB:.0f} GiB of VRAM, experts that are not on the GPU are computed on the CPU.")
-            add("--moe-cpu-layers", "auto",
-                "CPU に回す層を実測から決めます（WSL では GPU に固定できる RAM に上限があります）。",
-                "Which layers run on the CPU is decided from measurements (under WSL the RAM that can be pinned for the GPU is capped).")
+            # The split is planned against this host's pin cap, and that cap is not derivable
+            # (see freetoken.moe.pin_probe): the fallback of 40% of guest RAM is off by 10x on
+            # Windows 10 hosts, where the whole budget is about 1 GiB. So the note says which
+            # figure the flag is standing on, and how to replace a guess with a measurement.
+            if pin_cap is not None and pin_cap < 2 * GiB and experts_w > pin_cap:
+                add("--moe-cpu-layers", "1.0",
+                    f"この機械がページロックできる RAM は実測 {pin_cap / GiB:.2f} GiB で、エキスパートの "
+                    f"{experts_w / GiB:.0f} GiB には足りません。全層を CPU で計算します"
+                    "（auto でも同じ結論になりますが、こちらは起動時に測り直しません）。",
+                    f"This machine page-locks {pin_cap / GiB:.2f} GiB (measured), short of the "
+                    f"{experts_w / GiB:.0f} GiB of experts, so every layer decodes on the CPU. auto reaches the "
+                    "same answer; this states it outright.")
+            elif pin_cap is not None:
+                add("--moe-cpu-layers", "auto",
+                    f"CPU に回す層を、ページロックできる RAM の量（この機械の実測値 {pin_cap / GiB:.2f} GiB）から決めます。",
+                    f"Which layers run on the CPU is decided from how much RAM can be page-locked "
+                    f"(measured here: {pin_cap / GiB:.2f} GiB).")
+            else:
+                add("--moe-cpu-layers", "auto",
+                    "CPU に回す層を、ページロックできる RAM の量から決めます。WSL にはその上限があり、"
+                    "この機械ではまだ未実測です（`ft doctor pin` で測ると、起動時の層分けがこの機械の実測値に基づきます）。",
+                    "Which layers run on the CPU is decided from how much RAM can be page-locked. WSL caps that and this "
+                    "machine has not measured it yet ('ft doctor pin' makes the split stand on a measurement instead of a guess).")
             add("--moe-cpu-threads", str(max(2, min(cores - 2, 8))),
                 f"物理コア {cores} 個から、ほかの処理のぶんを残した数です。",
                 f"{cores} physical cores, leaving some for everything else.")

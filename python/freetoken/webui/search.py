@@ -104,11 +104,32 @@ def kernel_unusable(name: str, hw: dict, modules: set[str]) -> tuple[str, str] |
     return None
 
 
+def offload_unpinnable(hw: dict) -> tuple[str, str] | None:
+    """Why a plain ``offload`` start cannot happen on this host, when it cannot.
+
+    ``offload`` page-locks every expert bank, so a host whose measured cap is short of them
+    refuses the start; the candidate is then not worth a trial (FreeToken-Kai#2). The figures
+    come from the hardware measurement, which measures the cap before anything else pins."""
+    pin = ((hw or {}).get("measurements") or {}).get("pin") or {}
+    cap, banks = pin.get("cap_bytes"), pin.get("banks_bytes")
+    if not cap or not banks or banks <= cap:
+        return None
+    gib = 1 << 30
+    return (f"このマシンがページロックできる RAM は実測 {cap / gib:.2f} GiB で、エキスパート {banks / gib:.1f} GiB を"
+            "全部固定する offload は起動しないので試さない。",
+            f"This machine page-locks {cap / gib:.2f} GiB (measured), so a plain offload start, which pins all "
+            f"{banks / gib:.1f} GiB of experts, does not start and is not tried.")
+
+
 def unavailable(facts: dict, hw: dict, modules: set[str] | None = None) -> list[dict]:
-    """The kernels left out of the plan, for the page's list of what was not measured."""
+    """What was left out of the plan, for the page's list of what was not measured."""
     modules = installed_modules() if modules is None else modules
     fmt = expert_format(facts.get("quant")) if facts.get("num_experts") else None
     out = []
+    if facts.get("num_experts"):
+        why = offload_unpinnable(hw)
+        if why:
+            out.append({"flag": "--moe-strategy offload", "why": why[0], "why_en": why[1]})
     for kind, table in (("moe", MOE_KERNELS), ("linear", LINEAR_KERNELS)):
         for name in table.get(fmt or "", ()):
             why = kernel_unusable(name, hw, modules)
@@ -133,7 +154,7 @@ def plan(args: list[str], facts: dict, hw: dict, mode: str = "standard", modules
 
     if is_moe:
         # --- how the experts run: the kernel bench cannot see the whole step, so both are started
-        if strategy == "hybrid":
+        if strategy == "hybrid" and not offload_unpinnable(hw):
             add(Candidate("strategy_offload", {"--moe-strategy": "offload"}, drop=("--moe-cpu-layers", "--moe-cpu-threads"), group="strategy",
                           what_ja="足りないエキスパートを CPU で計算せず、すべて GPU に送る（offload）",
                           what_en="send every missing expert to the GPU instead of computing some on the CPU (offload)"))
@@ -273,8 +294,8 @@ SKIPPED = [
     ("--max-running-req", "複数の要求を同時に処理する速さ（スループット）で、1 人で使う速さではないので 1 のまま。",
      "It trades single-request speed for concurrent throughput; one person's speed is measured, so it stays 1."),
     ("--cuda-graph-max-bs", "同時処理が 1 のときは使われない。", "Unused with one running request."),
-    ("--moe-cpu-layers", "WSL で GPU に固定できる RAM の上限から auto が層を決める。上限を超える指定は起動できないので探さない。",
-     "Under WSL auto picks the layers from the pinnable-RAM limit; a list beyond it does not start, so it is not searched."),
+    ("--moe-cpu-layers", "WSL で GPU に固定できる RAM の上限（このベンチマークが実測して記録する）から auto が層を決める。上限を超える指定は起動できないので探さない。",
+     "Under WSL auto picks the layers from the pinnable-RAM limit, which this benchmark measures and records; a list beyond it does not start, so it is not searched."),
     ("--attention-backend", "GPU とモデルに合うものを auto が選ぶ。合わないものは起動しないか結果が崩れるので探さない。",
      "auto picks the backend that fits the GPU and model; others fail to start or change the output."),
     ("--moe-bank-ram", "RAM に重みが入らないときに必要かどうかで決まる（速さの比較ではない）。",

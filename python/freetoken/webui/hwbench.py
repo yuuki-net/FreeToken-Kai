@@ -284,6 +284,63 @@ def step_overlap(fmt: str, wl, device_index: int, threads: int) -> dict:
 
 
 # ------------------------------------------------------------------ what it means
+def step_pin(model_path: str, timeout: float = 300.0) -> dict | None:
+    """This host's page-lock cap, and this model's expert bytes to compare it against.
+
+    Measured in a child process, and before every other step, for the same reason: the cap is a
+    quota shared by every process, torch's pinned allocator never returns a rung to the driver,
+    and the pcie and gather steps below hold pinned buffers. Measuring here or later would
+    answer for whatever this process was already holding.
+
+    The child records the figure where every later start reads it (freetoken.moe.pin_probe), so
+    this step is also what spares a person from running ``ft doctor pin`` by hand."""
+    from freetoken.moe import pin_probe
+
+    if not pin_probe.is_pin_capped():
+        return None  # nothing caps page-locking here; there is no budget to measure
+    argv = [sys.executable, "-m", "freetoken.cli", "doctor", "pin", "--quiet"]
+    try:
+        subprocess.run(argv, capture_output=True, text=True, timeout=timeout, check=False)
+    except (OSError, subprocess.SubprocessError) as exc:
+        emit("skip", id="pin", reason="failed", message=str(exc)[:400])
+        return None
+    known = pin_probe.remembered()
+    return {
+        "cap_bytes": known.cap_bytes if known else None,  # set only where the driver refused
+        "how": known.how if known else None,
+        "budget_bytes": pin_probe.budget(),
+        "source": pin_probe.source(),
+        "banks_bytes": _expert_bytes(model_path),
+    }
+
+
+def _expert_bytes(model_path: str) -> int:
+    """This model's routed-expert bytes, the same figure the recommendation uses."""
+    try:
+        from .recommend import expert_bytes, model_facts
+
+        return expert_bytes(model_facts(model_path)) or 0
+    except Exception:  # noqa: BLE001 -- a shape this cannot read must not end the run
+        return 0
+
+
+def offload_possible(m: dict) -> tuple[bool, str, str]:
+    """Whether a plain ``offload`` start could page-lock this model's banks on this host.
+
+    ``offload`` pins every bank, so where the cap is short of them the server does not start --
+    proposing it, or spending a trial on it, is wasted either way (FreeToken-Kai#2). Only a cap a
+    refusal measured answers this; an estimate is not evidence that a start would fail."""
+    pin = m.get("pin") or {}
+    cap, banks = pin.get("cap_bytes"), pin.get("banks_bytes")
+    if not cap or not banks or banks <= cap:
+        return True, "", ""
+    return (False,
+            f"このマシンがページロックできる RAM は実測 {cap / GiB:.2f} GiB で、エキスパート "
+            f"{banks / GiB:.1f} GiB を全部固定する offload はこの機械では起動できません。",
+            f"This machine page-locks {cap / GiB:.2f} GiB (measured), so a plain offload start -- which pins all "
+            f"{banks / GiB:.1f} GiB of experts -- cannot start here.")
+
+
 def derive(m: dict, threshold: float = 2.0) -> list[dict]:
     """Flags the measurements decide, each with the numbers behind it (both languages)."""
     notes: list[dict] = []
@@ -300,13 +357,26 @@ def derive(m: dict, threshold: float = 2.0) -> list[dict]:
                           "why": f"{cpu['threads']} スレッドで最大（{best:.1f} GB/s）の 95% 以上が出ます。それ以上増やしてもほとんど速くならず、ほかの処理のコアを奪うだけです。",
                           "why_en": f"{cpu['threads']} threads reach 95% of the best ({best:.1f} GB/s). More barely helps and only takes cores from everything else."})
         else:
-            notes.append({"flag": "--moe-strategy", "value": "offload",
-                          "why": f"GPU への転送（{pcie:.1f} GB/s）が CPU でのエキスパート計算（{cpu['best_gbs']:.1f} GB/s）の 1/{threshold:.0f} より速いので、エキスパートは GPU に送って計算します。",
-                          "why_en": f"The transfer to the GPU ({pcie:.1f} GB/s) beats computing experts on the CPU ({cpu['best_gbs']:.1f} GB/s) by more than 1/{threshold:.0f}, so experts are sent to the GPU."})
+            ok, ja, en = offload_possible(m)
+            if ok:
+                notes.append({"flag": "--moe-strategy", "value": "offload",
+                              "why": f"GPU への転送（{pcie:.1f} GB/s）が CPU でのエキスパート計算（{cpu['best_gbs']:.1f} GB/s）の 1/{threshold:.0f} より速いので、エキスパートは GPU に送って計算します。",
+                              "why_en": f"The transfer to the GPU ({pcie:.1f} GB/s) beats computing experts on the CPU ({cpu['best_gbs']:.1f} GB/s) by more than 1/{threshold:.0f}, so experts are sent to the GPU."})
+            else:
+                # the transfer is the faster side, but offload cannot start here at all
+                notes.append({"flag": "--moe-strategy", "value": "hybrid",
+                              "why": f"GPU への転送（{pcie:.1f} GB/s）のほうが速いのですが、{ja}足りないエキスパートの一部だけ GPU に送り、残りは CPU で計算します。",
+                              "why_en": f"The transfer to the GPU ({pcie:.1f} GB/s) is the faster side, but {en} Some of the missing experts are sent to the GPU and the rest computed on the CPU."})
+                notes.append({"flag": "--moe-cpu-threads", "value": str(cpu["threads"]),
+                              "why": f"{cpu['threads']} スレッドで最大（{cpu['best_gbs']:.1f} GB/s）の 95% 以上が出ます。",
+                              "why_en": f"{cpu['threads']} threads reach 95% of the best ({cpu['best_gbs']:.1f} GB/s)."})
     elif gathers:
+        ok, ja, en = offload_possible(m)
         notes.append({"flag": "--moe-strategy", "value": "offload",
-                      "why": "この形式のエキスパートは CPU で計算できないので、GPU に送って計算します。",
-                      "why_en": "Experts in this format cannot be computed on the CPU, so they are sent to the GPU."})
+                      "why": "この形式のエキスパートは CPU で計算できないので、GPU に送って計算します。"
+                             + ("" if ok else f"ただし{ja}--moe-bank-ram でバンクをマップするか、小さいモデルを使ってください。"),
+                      "why_en": "Experts in this format cannot be computed on the CPU, so they are sent to the GPU."
+                                + ("" if ok else f" However, {en} Map the banks with --moe-bank-ram, or serve a smaller model.")})
     ov = m.get("overlap")
     if ov and ov.get("fetch_fraction") is not None:
         notes.append({"flag": "--moe-hybrid-max-fetch", "value": "-1",
@@ -325,6 +395,10 @@ def run(model_path: str) -> dict:
 
         cpu_capable = fmt in _CPU_MOE_FORMATS
     steps = [{"id": "gpu", "unit": ""}]
+    from freetoken.moe import pin_probe
+
+    if pin_probe.is_pin_capped():
+        steps.append({"id": "pin", "unit": "GiB"})
     steps += [{"id": f"pcie{g['index']}", "unit": "GB/s", "gpu": g["index"], "max": g["link_gbs"]} for g in gpus]
     steps += [{"id": "ram", "unit": "GB/s"}, {"id": "ssd", "unit": "GB/s"}]
     if wl is not None:
@@ -347,6 +421,13 @@ def run(model_path: str) -> dict:
             emit("skip", id=sid, reason="failed", message=str(exc)[:400])
             return None
 
+    # first, and before anything pins: the cap is a quota every process shares
+    if pin_probe.is_pin_capped():
+        emit("step", id="pin")
+        m["pin"] = guarded("pin", step_pin, model_path)
+        if m.get("pin"):
+            cap = m["pin"].get("cap_bytes") or m["pin"].get("budget_bytes") or 0
+            emit("done", id="pin", value=round(cap / GiB, 2), **m["pin"])
     for g in gpus:
         m["pcie"][str(g["index"])] = guarded(f"pcie{g['index']}", step_pcie, g["index"])
     m["ram"] = guarded("ram", step_ram)
