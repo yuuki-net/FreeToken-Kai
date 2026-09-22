@@ -1587,13 +1587,14 @@ class Engine:
         )
         # before set_bank_sources: the residency validation and the copy plan's skip of non-pinned layers key on the CPU-layer set
         cache.cpu_layer_ids = cpu_layer_ids
-        mapped_pinned = _mapped_bank_is_addressable(bank_tier)
-        if bank_tier is not None and not mapped_pinned:
+        mapped_cpu = _mapped_cpu_layers(bank_tier, len(next(iter(banks.sources.values()))))
+        mapped_pinned = bank_tier is None or not mapped_cpu
+        if bank_tier is not None and mapped_cpu:
             # Nothing the GPU can address: a mapped bank then has no device address it can
             # trust, so every layer has to decode on the CPU executor -- which is the state the
             # residency label below declares, and set_bank_sources checks the two agree.
             # This costs the VRAM expert cache, so it is the fallback, not the plan.
-            cache.cpu_layer_ids = frozenset(range(len(next(iter(banks.sources.values())))))
+            cache.cpu_layer_ids = frozenset(cpu_layer_ids | mapped_cpu)
         cache.set_bank_sources(
             banks.sources,
             # a mapped bank is mlocked, not registered, which is exactly what LOCKED
@@ -1603,10 +1604,10 @@ class Engine:
                 # length must match the bank sources, which --spec-mtp extends by one
                 [
                     (
-                        _HostResidency.PINNED if mapped_pinned else _HostResidency.LOCKED
+                        _HostResidency.LOCKED if i in mapped_cpu else _HostResidency.PINNED
                     ).value
+                    for i in range(len(next(iter(banks.sources.values()))))
                 ]
-                * len(next(iter(banks.sources.values())))
                 if bank_tier is not None
                 else banks.layer_residency
             ),
@@ -2784,8 +2785,13 @@ class Engine:
 
         if config.use_dummy_weight:
             return None
+        # Registration is capped by the host's page-lock budget; residency is not (the
+        # resident rows save the CPU executor a disk read whether or not the GPU can
+        # address them). FreeToken-Kai#2: asking for the whole residency stopped partway
+        # and left the run with no usable layer at all.
         return build_tier(
-            config, method, pp=try_get_pp_info(), log=logger.info, warn=logger.warning
+            config, method, pp=try_get_pp_info(), log=logger.info, warn=logger.warning,
+            register_budget=_pin_budget_bytes(self._host_tables_bytes),
         )
 
     def write_moe_stats_idle(self) -> None:
@@ -3063,19 +3069,26 @@ def _linear_state_host_bytes(config) -> int:
     return n * per
 
 
-def _mapped_bank_is_addressable(bank_tier) -> bool:
-    """Whether the GPU may take an address inside a ``--moe-bank-ram`` mapping.
+def _mapped_cpu_layers(bank_tier, num_layers: int) -> frozenset[int]:
+    """Layers of a ``--moe-bank-ram`` mapping the GPU cannot address, so they decode on CPU.
 
-    ``fully_registered``, never "some bytes registered": a mapping registered in PART is the
-    same as an unregistered one to the cache. ``mapped_bank.fully_registered`` says so and the
-    start-up warning promises every miss then goes to the CPU executor -- but this decision used
-    to read ``registered_bytes``, so a host that stops registering partway left every layer
-    labelled PINNED and the copy plan asked ``device_ptr()`` for a block that was never
-    registered: ``cudaHostGetDevicePointer``, "invalid argument", before the first token
-    (FreeToken-Kai#2, an explicit ``--moe-bank-ram`` size over the host's cap).
+    Per layer, never all-or-nothing on bytes: registration walks the file layer by layer and
+    stops when the page-lock budget is spent, so what comes back is a set of complete layers
+    (mapped_bank). The layers outside it have no device address at all -- reading
+    ``registered_bytes`` here instead ("some bytes registered") labelled every layer PINNED
+    and the copy plan then asked ``device_ptr()`` for a block that was never registered:
+    ``cudaHostGetDevicePointer``, "invalid argument", before the first token (FreeToken-Kai#2
+    with an explicit ``--moe-bank-ram`` size over the host's cap).
     """
-    banks = getattr(bank_tier, "banks", None) if bank_tier is not None else None
-    return bool(banks is not None and banks.fully_registered)
+    if bank_tier is None:
+        return frozenset()
+    banks = getattr(bank_tier, "banks", None)
+    if banks is None:
+        return frozenset(range(num_layers))
+    covered = getattr(banks, "registered_layers", None)
+    if covered is None:  # older bank object: fall back to the all-or-nothing answer
+        covered = set(range(num_layers)) if banks.fully_registered else set()
+    return frozenset(i for i in range(num_layers) if i not in covered)
 
 
 def _pin_budget_bytes(reserved: int = 0) -> int | None:

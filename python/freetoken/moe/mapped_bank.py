@@ -119,7 +119,8 @@ class MappedBanks:
     ``hot_per_layer``: rows ``[0, hot)`` of each block are the resident prefix (default: all).
     """
 
-    def __init__(self, path: str, register: bool = True, layers=None, hot_per_layer: int | None = None):
+    def __init__(self, path: str, register: bool = True, layers=None, hot_per_layer: int | None = None,
+                 register_budget: int | None = None):
         import torch
 
         # FREETOKEN_BANK_REGISTER: prefix (default) registers only the locked rows; "all"
@@ -183,6 +184,14 @@ class MappedBanks:
             access=mmap.ACCESS_COPY if self.private else mmap.ACCESS_READ,
         )
         self._registered: list[int] = []
+        # Bytes registration may spend (the CUDA pin budget), or None for as much as it takes.
+        # Residency is a RAM decision and is NOT capped by this: the resident rows earn their
+        # keep on the CPU executor too, which reads the mapping directly (FreeToken-Kai#2).
+        self.register_budget = None if register_budget is None else max(0, int(register_budget))
+        # positions (into self.layers) whose EVERY block registered: the layers the GPU may
+        # address. A layer registered in part is no use to it, so it is not in here.
+        self.registered_layers: set[int] = set()
+        self._register_stopped = False
         self.hot_blocks = 0
         self.registered_blocks = 0
         self.locked_bytes = 0
@@ -248,32 +257,55 @@ class MappedBanks:
         # which on the shared form is the property being avoided here
         self._base = buf.data_ptr()
         self._buf = buf
-        for name, row_shape, dtype_name, row_bytes in self.layout.banks:
-            dtype = _dtype_of(dtype_name)
-            per_layer = []
-            for pos, layer in enumerate(self.layers):
+        # Layer by layer, not bank kind by bank kind. Registration can stop partway -- the CUDA
+        # pin budget -- and a layer is only usable by the GPU when EVERY one of its blocks is
+        # registered. Kind-first left each layer holding one or two of its six blocks, so not a
+        # single layer could be fetched from (FreeToken-Kai#2). The file is laid out layer-first
+        # too (bank_file.py), so this also reads it in file order.
+        views: dict[str, list] = {name: [] for name, *_ in self.layout.banks}
+        layer_register_bytes = sum(
+            self._lock_rows(self.layout.num_experts * rb) * rb
+            for _name, _shape, _dtype, rb in self.layout.banks
+        )
+        for pos, layer in enumerate(self.layers):
+            registering = register and not self._register_stopped
+            if registering and self.register_budget is not None and layer_register_bytes:
+                if self.registered_bytes + layer_register_bytes > self.register_budget:
+                    # spent: every later layer would be the same, and asking anyway is what
+                    # leaves registered blocks inside a layer nothing can use
+                    registering = False
+                    self._register_stopped = True
+            before, blocks = self.registered_blocks, 0
+            for name, row_shape, dtype_name, row_bytes in self.layout.banks:
+                dtype = _dtype_of(dtype_name)
                 off = self.layout.offset_of(name, layer)
                 rel = off - self._map_offset  # the mapping starts at this rank's first block
                 span = self.layout.num_experts * row_bytes
-                per_layer.append(
+                views[name].append(
                     buf[rel:rel + span].view(dtype).reshape(self.layout.num_experts, *row_shape)
                 )
-                lock_rows = (
-                    self.layout.num_experts
-                    if self.register_mode == "all" or span <= _WHOLE_BLOCK_BYTES
-                    else self.hot_per_layer
-                )
+                lock_rows = self._lock_rows(span)
                 self.whole_blocks += span <= _WHOLE_BLOCK_BYTES
                 if span > lock_rows * row_bytes:
                     self.cold_spans.append(
                         (off + lock_rows * row_bytes, span - lock_rows * row_bytes)
                     )
                     self.cold_blocks.append((name, pos, self._base + rel, row_bytes, lock_rows))
-                self._settle(rel, lock_rows * row_bytes, span, register)
+                asked = self.registered_blocks
+                self._settle(rel, lock_rows * row_bytes, span, registering)
+                if registering and self.registered_blocks == asked:
+                    # refused: this layer can no longer be completed, so registering the rest of
+                    # it buys nothing, and neither will any later layer -- stop asking here.
+                    # Every refused attempt also has to clear the CUDA error slot.
+                    registering = False
+                    self._register_stopped = True
                 self._advise(hint, rel, span, len(self._map))
                 if preload:
                     self._touch(buf, rel, span)
-            self.sources[name] = per_layer
+                blocks += 1
+            if registering and blocks and self.registered_blocks - before == blocks:
+                self.registered_layers.add(pos)
+        self.sources = views
         self.cold_spans.sort()
         self.settle_seconds = time.perf_counter() - started
         self.preloaded = preload
@@ -401,6 +433,13 @@ class MappedBanks:
         view = buf[offset:offset + span:page]
         if view.numel():
             int(view.to(torch.int64).sum())
+
+    def _lock_rows(self, span: int) -> int:
+        """Rows of one block that become resident: the whole block for the small ones (and
+        for FREETOKEN_BANK_REGISTER=all), the hot prefix otherwise."""
+        if self.register_mode == "all" or span <= _WHOLE_BLOCK_BYTES:
+            return self.layout.num_experts
+        return self.hot_per_layer
 
     def _settle(self, offset: int, nbytes: int, block_bytes: int, register: bool) -> None:
         """Fault in and lock the resident prefix of one block.
@@ -567,8 +606,12 @@ class MappedTier:
     def __init__(self, path: str, layers, *, num_experts: int, hot_per_layer: int,
                  all_layers=None, wanted: dict | None = None, layout: MappedBankLayout | None = None,
                  meta: dict | None = None, can_write: bool = True, log=None, warn=None,
-                 readahead: str = "off", report_readahead: bool = True, first_rank: bool = True):
+                 readahead: str = "off", report_readahead: bool = True, first_rank: bool = True,
+                 register_budget: int | None = None):
         self.path = path
+        # Bytes registration may spend (the host's CUDA pin budget). Residency is not capped
+        # by it: the resident rows also save the CPU executor a disk read.
+        self.register_budget = register_budget
         # --moe-bank-readahead: "off" (report only), "auto" (the recommended window) or kB. Every
         # rank maps the same file, so one device: each rank sets it before opening its own
         # mapping, and only the first says anything about it.
@@ -791,7 +834,8 @@ class MappedTier:
         # next start. It also means the settle already reads with the window decode will use.
         self._apply_readahead()
         self.log("--moe-bank-ram: faulting in and locking the resident rows")
-        self.banks = MappedBanks(self.path, layers=self.layers, hot_per_layer=self.hot_per_layer)
+        self.banks = MappedBanks(self.path, layers=self.layers, hot_per_layer=self.hot_per_layer,
+                                 register_budget=self.register_budget)
         b = self.banks
         if b.probe_refused:
             self.log(
@@ -812,11 +856,11 @@ class MappedTier:
         )
         if b.registered_bytes and not b.fully_registered:
             self.warn(
-                f"--moe-bank-ram: only {b.registered_blocks} of {b.hot_blocks} resident "
-                f"blocks could be registered, and a bank registered in part cannot be told "
-                f"apart from an unregistered one by the cache -- every decode miss goes to "
-                f"the CPU executor. Lower --moe-bank-ram, or FREETOKEN_BANK_REGISTER=none "
-                f"to stop asking"
+                f"--moe-bank-ram: the CUDA pin budget covered {len(b.registered_layers)} of "
+                f"{len(b.layers)} layers ({b.registered_blocks} of {b.hot_blocks} resident "
+                f"blocks); those layers fetch over PCIe as usual and the rest decode on the "
+                f"CPU executor -- their resident rows still save the disk read. "
+                f"`ft doctor pin` measures this host; FREETOKEN_BANK_REGISTER=none stops asking"
             )
         if b.lock_errno and not b.fully_registered:
             import resource
@@ -930,7 +974,7 @@ class MappedTier:
                          f"({cache.bank_reader.describe()})")
             except Exception as exc:  # noqa: BLE001 -- the mapping copy still works
                 self.log(f"--moe-bank-ram: parallel prefill reads unavailable ({exc}); page faults as before")
-        if self.banks.fully_registered:
+        if self.banks.registered_layers:
             # Only rows [0, hot) are cudaHostRegistered; the rest is host memory the device
             # has no address for, and a GPU fetch of one is an illegal access inside the
             # decode graph (which is how this was found). Telling the cache where the
@@ -940,8 +984,9 @@ class MappedTier:
             cache.prefix_pinned_rows = self.banks.hot_per_layer
             self.log(
                 f"--moe-bank-ram: PCIe fetches restricted to the resident "
-                f"{self.banks.hot_per_layer}/{self.banks.layout.num_experts} experts "
-                f"per layer; the rest decode on the CPU"
+                f"{self.banks.hot_per_layer}/{self.banks.layout.num_experts} experts per "
+                f"layer, on the {len(self.banks.registered_layers)}/{len(self.banks.layers)} "
+                f"layers the pin budget covered; the rest decode on the CPU"
             )
             return
         # Nothing registered -- or not every block, which the cache has no way to express:

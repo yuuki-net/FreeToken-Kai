@@ -498,20 +498,18 @@ class AutoBankRam:
         text = (
             f"--moe-bank-ram auto: {self.total_bytes / GiB:.1f} GiB for the banks across "
             f"{self.ranks} rank{'s' if self.ranks != 1 else ''}"
+            f" = MemAvailable {self.available / GiB:.1f} GiB - {self.nonbank / GiB:.1f} GiB for the "
+            f"rest of the server ({NONBANK_PER_RANK_BYTES / GiB:.1f} per rank) - "
+            f"{self.headroom / GiB:.1f} GiB left as page cache for the non-resident rows"
         )
-        by_ram = self.available - self.nonbank - self.headroom
-        if self.pin_cap is not None and self.pin_cap < by_ram:
+        if self.pin_cap is not None and self.pin_cap < self.total_bytes:
+            # Residency is a RAM decision, so the pin budget no longer shrinks it; it decides how
+            # much of it the GPU can address, layer by layer (mapped_bank), and the layers it does
+            # not reach decode on the CPU executor -- with their rows still resident.
             text += (
-                f" = the CUDA pin budget {(self.pin_cap + PIN_RESERVE_BYTES) / GiB:.1f} GiB "
-                f"({_pin_source()}; 'ft doctor pin' measures this host, FREETOKEN_PIN_BUDGET_GB overrides) - "
-                f"{PIN_RESERVE_BYTES / GiB:.1f} GiB for other pinned buffers, since the resident rows are "
-                f"registered with CUDA; RAM alone would allow {by_ram / GiB:.1f} GiB"
-            )
-        else:
-            text += (
-                f" = MemAvailable {self.available / GiB:.1f} GiB - {self.nonbank / GiB:.1f} GiB for the "
-                f"rest of the server ({NONBANK_PER_RANK_BYTES / GiB:.1f} per rank) - "
-                f"{self.headroom / GiB:.1f} GiB left as page cache for the non-resident rows"
+                f". The CUDA pin budget {(self.pin_cap + PIN_RESERVE_BYTES) / GiB:.1f} GiB "
+                f"({_pin_source()}; `ft doctor pin` measures this host, FREETOKEN_PIN_BUDGET_GB "
+                f"overrides) registers the first layers only; the rest decode on the CPU"
             )
         return text + "; pass a size to override"
 
@@ -535,19 +533,13 @@ def auto_bank_ram(mem: dict[str, int], ranks: int, proc: str = "/proc") -> AutoB
     # max(0, ...): a *measured* cap can be smaller than the reserve itself (1 GiB on Windows 10,
     # FreeToken-Kai#2), and a negative cap used to reach the message below as a negative size
     pin_cap = None if pin is None else max(0, pin - PIN_RESERVE_BYTES)
-    budget = by_ram if pin_cap is None else min(by_ram, pin_cap)
+    # RAM alone sizes the resident rows. The page-lock budget caps REGISTRATION, which is a
+    # separate decision made per layer while the mapping is built (mapped_bank): a host that
+    # can register little still wants its rows resident, because the CPU executor reads the
+    # mapping directly and residency is what saves it the disk read. Taking min() here meant
+    # a 1 GiB pin cap refused the flag outright on a host with 22 GiB free (FreeToken-Kai#2).
+    budget = by_ram
     if budget < GiB:
-        if pin_cap is not None and pin_cap < by_ram:
-            # the pin cap is what binds, and freeing memory cannot raise it -- the old message
-            # said "free some memory" to hosts with 22 GiB of it available
-            raise ValueError(
-                f"--moe-bank-ram auto: the CUDA pin budget is {pin / GiB:.2f} GiB, leaving "
-                f"{pin_cap / GiB:.2f} GiB once {PIN_RESERVE_BYTES / GiB:.1f} GiB is kept for the server's "
-                f"other pinned buffers -- too little to size the resident rows from, though RAM alone "
-                f"would allow {by_ram / GiB:.1f} GiB. Freeing memory does not raise this cap "
-                f"({_pin_source(proc)}); pass an explicit size, which maps the banks and page-locks what "
-                f"it can, or serve every expert on the CPU with --moe-cpu-layers 1.0"
-            )
         raise ValueError(
             f"--moe-bank-ram auto: MemAvailable is {avail / GiB:.1f} GiB"
             + (f" and the CUDA pin budget {pin / GiB:.1f} GiB" if pin is not None else "")

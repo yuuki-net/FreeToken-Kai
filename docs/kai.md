@@ -478,9 +478,13 @@ model that does). Not yet measured on a card.
   it. Pinned pages are never reclaimed, so what one process holds for a moment with nothing else
   running is not what a server can commit and still work.
 
-  Where the cap is around 1 GiB nothing can pin expert banks at all: serve with `--moe-cpu-layers 1.0` (every expert on the CPU), or with
-  `--moe-bank-ram`, which maps the banks and locks only a resident prefix so the cap stops
-  deciding.
+  Where the cap is around 1 GiB nothing can pin a whole set of expert banks: serve with
+  `--moe-cpu-layers 1.0` (every expert on the CPU), or with a count that keeps the banks of the
+  GPU layers inside the cap. **`--moe-bank-ram` is not the answer to a small cap** -- it is the
+  answer to banks that do not fit in RAM, and on a host where they do fit it only adds the reads
+  of whatever spills out of the resident rows. Where the banks do not fit AND the cap is small,
+  residency and registration part company: RAM sizes the resident rows and the cap decides how
+  many of the layers the GPU can address, layer by layer, with the rest decoding on the CPU.
 - Under WSL2 on a full 6 GB card, PyTorch's expandable-segment allocator intermittently died
   with `CUDA driver error: device not ready` when it had to release cached segments while
   other streams were busy. The Turing prefill scratches (MoE dequant chunks, fp8 dequant) are

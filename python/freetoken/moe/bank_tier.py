@@ -43,7 +43,7 @@ def _say_order_without_stats(path, layers, log, warn) -> None:
     )
 
 
-def build_tier(config, method, *, pp=None, log=print, warn=None):
+def build_tier(config, method, *, pp=None, log=print, warn=None, register_budget=None):
     """``config``: the engine config (``model_path``, ``model_config``, ``full_model_config``,
     ``moe_bank_ram`` / ``_stats`` / ``_dir``, ``tp_info``). ``method``: the bound offload expert
     method, or None for a loader without one (GGUF). ``pp``: the pipeline placement, or None.
@@ -180,5 +180,5 @@ def build_tier(config, method, *, pp=None, log=print, warn=None):
         path, layers, all_layers=range(total_layers), num_experts=num_experts, hot_per_layer=hot,
         wanted=wanted, layout=layout, meta=meta, can_write=packed is None, log=log, warn=warn,
         readahead=getattr(config, "moe_bank_readahead", "off") or "off", report_readahead=first_rank,
-        first_rank=first_rank,
+        first_rank=first_rank, register_budget=register_budget,
     )

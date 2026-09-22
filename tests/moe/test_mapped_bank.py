@@ -286,7 +286,7 @@ class _FakeCache:
         self.hybrid_fetch_fraction = 0.194
 
 
-def _tier(tmp_path, registered, hot=4, blocks=6, registered_blocks=None):
+def _tier(tmp_path, registered, hot=4, blocks=6, registered_blocks=None, layers=(0, 1, 2)):
     from freetoken.moe.mapped_bank import MappedTier
 
     _, p, _, path = _built(tmp_path, hot=hot)
@@ -299,11 +299,13 @@ def _tier(tmp_path, registered, hot=4, blocks=6, registered_blocks=None):
     tier.banks.registered_blocks = (
         blocks if registered_blocks is None and registered else registered_blocks or 0
     )
+    # the layers whose every block registered: what the GPU may address (attach keys on this)
+    tier.banks.registered_layers = set(layers) if registered else set()
     return tier
 
 
 def test_a_registered_prefix_keeps_the_pcie_fetch_and_bounds_it(tmp_path):
-    tier = _tier(tmp_path, registered=1 << 20)
+    tier = _tier(tmp_path, registered=1 << 20)  # every layer covered
     cache = _FakeCache()
     try:
         tier.attach(cache, device="cpu")
@@ -315,6 +317,32 @@ def test_a_registered_prefix_keeps_the_pcie_fetch_and_bounds_it(tmp_path):
     assert cache.hybrid_fetch_fraction == pytest.approx(0.194)
     # ... but only rows the device can address are eligible
     assert cache.prefix_pinned_rows == 4
+
+
+def test_the_layers_the_budget_covered_keep_the_fetch_and_the_rest_do_not(tmp_path):
+    """A pin budget that reaches two of three layers: those two fetch, the third is the engine's
+    to route to the CPU (engine._mapped_cpu_layers reads the same set)."""
+    tier = _tier(tmp_path, registered=1 << 20, registered_blocks=4, layers=(0, 1))
+    cache = _FakeCache()
+    said = []
+    tier.log = said.append
+    try:
+        tier.attach(cache, device="cpu")
+    finally:
+        tier.banks.close()
+    assert cache.prefix_pinned_rows == 4  # the resident prefix is still the bound
+    assert cache.hybrid_max_fetch == 512  # and the fetch path stays on for the covered layers
+    assert any("2/3" in m for m in said), said
+
+
+def test_no_layer_covered_sends_every_miss_to_the_cpu(tmp_path):
+    tier = _tier(tmp_path, registered=0)
+    cache = _FakeCache()
+    try:
+        tier.attach(cache, device="cpu")
+    finally:
+        tier.banks.close()
+    assert cache.prefix_pinned_rows is None and cache.hybrid_max_fetch == 0
 
 
 def test_the_draft_head_layer_gets_the_identity_permutation(tmp_path):
@@ -342,23 +370,84 @@ def test_the_draft_head_layer_gets_the_identity_permutation(tmp_path):
     assert cache.expert_perm[3] is None
 
 
-def test_a_bank_registered_in_part_is_treated_as_not_registered(tmp_path):
-    """prefix_pinned_rows は層にもブロックにも 1 つしかない。
+class _FakeCudart:
+    """cudaHostRegister that takes the first ``ok`` calls and refuses the rest, like a host whose
+    page-lock budget runs out partway through the blocks."""
 
-    それは「行 [0, hot) はどこでもデバイスから触れる」という主張で、1 ブロックでも登録に
-    失敗していれば嘘になる。嘘になった先は decode graph の中の illegal access で、
-    そこまで行かせない。いまのところ登録は全部通るか全部断られるかのどちらかだが、
-    24 GiB ぶんのブロックの途中で上限に当たればそうではなくなる。
+    def __init__(self, ok):
+        self.ok = ok
+        self.calls = 0
+        self.refusals = 0
+
+    def cudaHostRegister(self, addr, nbytes, flags):
+        self.calls += 1
+        if self.calls <= self.ok:
+            return 0
+        self.refusals += 1
+        return 2  # any non-zero is a refusal
+
+    def cudaHostUnregister(self, addr):  # close() gives the registrations back
+        return 0
+
+
+def _registered_bank(monkeypatch, tmp_path, *, ok=10**9, budget=None, hot=4):
+    import torch
+
+    from freetoken.moe import mapped_bank as mb
+
+    fake = _FakeCudart(ok)
+    monkeypatch.setattr(torch.cuda, "cudart", lambda: fake)
+    monkeypatch.setattr(mb, "clear_cuda_error", lambda: None)
+    _, _placement, _, path = _built(tmp_path, hot=hot)
+    return mb.MappedBanks(path, hot_per_layer=hot, register_budget=budget), fake
+
+
+def test_registration_counts_whole_layers_and_stops_at_the_first_refusal(monkeypatch, tmp_path):
+    """`prefix_pinned_rows` は「行 [0, hot) はデバイスから触れる」という主張で、その層の
+    ブロックが 1 つでも登録に失敗していれば嘘になる。嘘の先は decode graph の中の illegal
+    access なので、**層単位で**全ブロック揃ったものだけを数える。
+
+    登録は層ごとに進む（種類ごとではない）。種類ごとだと途中で止まった時点でどの層も
+    ブロックが揃わず、使える層がゼロになる（FreeToken-Kai#2）。
     """
-    tier = _tier(tmp_path, registered=1 << 20, blocks=6, registered_blocks=5)
-    cache = _FakeCache()
+    banks, _ = _registered_bank(monkeypatch, tmp_path)
     try:
-        tier.attach(cache, device="cpu")
+        per_layer = len(banks.layout.banks)  # このジオメトリの 1 層あたりのブロック数
+        assert banks.registered_layers == {0, 1, 2} and banks.fully_registered
     finally:
-        tier.banks.close()
-    assert cache.prefix_pinned_rows is None
-    assert cache.hybrid_max_fetch == 0
-    assert cache.hybrid_fetch_fraction == 0.0
+        banks.close()
+
+    # 層 0 は揃い、その次の層で断られ、以降は試されない。
+    # 「試されない」は拒否の回数で見る: 打ち切らなければ残りのブロックぶん拒否が並ぶ。
+    banks, fake = _registered_bank(monkeypatch, tmp_path, ok=per_layer + 1)
+    try:
+        assert banks.registered_layers == {0}  # 揃ったのは層 0 だけ
+        assert banks.registered_blocks >= per_layer  # 層 0 のぶんは登録できている
+        assert fake.refusals <= 2  # 断られたブロック 1 つ（フラグ 2 通りまで）で止まる
+        assert not banks.fully_registered
+    finally:
+        banks.close()
+
+
+def test_a_budget_stops_at_a_layer_boundary_without_asking(monkeypatch, tmp_path):
+    """予算が 2 層ぶんなら 2 層で止める。断られてから気づくのではなく**先に数える**
+    （断られた試行はどれも CUDA のエラースロットを掃除しないといけないし、
+    使えない層の中に登録済みブロックを残すだけになる）。"""
+    banks, _ = _registered_bank(monkeypatch, tmp_path)
+    try:
+        per_layer_blocks = len(banks.layout.banks)
+        per_layer_bytes = banks.registered_bytes // 3
+    finally:
+        banks.close()
+
+    banks, fake = _registered_bank(monkeypatch, tmp_path, budget=2 * per_layer_bytes)
+    try:
+        assert banks.registered_layers == {0, 1}
+        assert banks.registered_bytes == 2 * per_layer_bytes
+        assert banks.registered_blocks == 2 * per_layer_blocks
+        assert fake.refusals == 0  # 断られてから気づくのではなく、先に数えて止める
+    finally:
+        banks.close()
 
 
 def test_nothing_registered_falls_back_to_the_cpu_for_every_miss(tmp_path):

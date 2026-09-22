@@ -376,20 +376,24 @@ def test_a_new_bank_is_refused_on_drvfs_and_tmpfs_but_not_on_ext4(tree, tmp_path
     assert "RAM" in dp.refuses_new_bank(str(tmp_path / "bankmap"), proc, sys)
 
 
-def test_under_wsl_auto_stays_inside_the_cuda_pin_budget(monkeypatch):
-    """Measured on the 2060 host: MemAvailable alone chose 15.6 GiB of 23.5, 141 of 240 resident
-    blocks registered, and the boot died in a CUDA allocation."""
+def test_under_wsl_the_pin_budget_limits_registration_not_residency(monkeypatch):
+    """Measured on the 2060 host: RAM allows 15.6 GiB of 23.5 and the pin budget 9.4 GiB.
+
+    The budget used to size the resident rows, which cost a host with plenty of RAM the rows the
+    CPU executor wanted (and refused the flag outright at 1 GiB, FreeToken-Kai#2). Residency is
+    RAM's decision; the budget says how many layers the GPU will be able to address, and the
+    message has to make that split visible."""
     monkeypatch.setattr(dp, "is_wsl", lambda proc="/proc": True)
     monkeypatch.delenv("FREETOKEN_PIN_BUDGET_GB", raising=False)
     mem = {"MemTotal": int(23.5 * GiB), "MemAvailable": int(22.1 * GiB)}
     auto = dp.auto_bank_ram(mem, 1)
-    assert auto.total_bytes == int(23.5 * GiB * 0.4) - 2 * GiB  # 7.4 GiB, not 15.6
-    assert "CUDA pin budget 9.4 GiB" in auto.reason() and "RAM alone would allow 15.6 GiB" in auto.reason()
-    # where RAM is the tighter of the two, RAM decides and says so
-    small = dp.auto_bank_ram({"MemTotal": int(23.5 * GiB), "MemAvailable": 12 * GiB}, 1)
-    assert small.total_bytes == int(12 * GiB - 4.5 * GiB - 2 * GiB) and "MemAvailable 12.0" in small.reason()
-    monkeypatch.setenv("FREETOKEN_PIN_BUDGET_GB", "12")
-    assert dp.auto_bank_ram(mem, 1).total_bytes == 10 * GiB
+    assert auto.total_bytes == int(22.1 * GiB) - int(4.5 * GiB) - 2 * GiB  # RAM: 15.6 GiB
+    why = auto.reason()
+    assert "MemAvailable 22.1" in why
+    assert "CUDA pin budget 9.4 GiB" in why and "the rest decode on the CPU" in why
+    # a budget over the residency has nothing to say
+    monkeypatch.setenv("FREETOKEN_PIN_BUDGET_GB", "64")
+    assert "CUDA pin budget" not in dp.auto_bank_ram(mem, 1).reason()
 
 
 def test_fault_read_copies_through_a_mapping(tmp_path):

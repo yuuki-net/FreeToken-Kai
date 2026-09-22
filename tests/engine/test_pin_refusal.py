@@ -69,8 +69,8 @@ def test_a_refusal_records_the_cap_it_measured(monkeypatch, tmp_path):
 
 
 class _Banks:
-    def __init__(self, registered_bytes, hot_blocks, registered_blocks):
-        self.registered_bytes = registered_bytes
+    def __init__(self, registered_layers, hot_blocks=144, registered_blocks=144):
+        self.registered_layers = set(registered_layers)
         self.hot_blocks = hot_blocks
         self.registered_blocks = registered_blocks
 
@@ -84,24 +84,34 @@ class _Tier:
         self.banks = banks
 
 
-def test_a_mapping_registered_in_part_is_not_addressable():
-    """The warning promises every miss goes to the CPU; the decision has to agree.
-
-    Reading "some bytes registered" left every layer labelled PINNED, and the copy plan then
-    asked for the device address of a block that was never registered -- issue #2's crash with
-    an explicit --moe-bank-ram size on a host that stops registering partway.
-    """
-    part = _Tier(_Banks(registered_bytes=1 * GiB, hot_blocks=144, registered_blocks=30))
-    assert not engine._mapped_bank_is_addressable(part)
+def test_the_layers_the_budget_missed_decode_on_the_cpu():
+    """Registration walks the file layer by layer and stops when the budget is spent, so the
+    layers outside the covered set have no device address. Reading "some bytes registered"
+    instead labelled every layer PINNED and the copy plan then asked for the device address of a
+    block that was never registered -- issue #2's crash with an explicit --moe-bank-ram size."""
+    part = _Tier(_Banks(range(5), registered_blocks=30))
+    assert engine._mapped_cpu_layers(part, 24) == frozenset(range(5, 24))
 
 
-def test_a_mapping_registered_whole_is_addressable():
-    whole = _Tier(_Banks(registered_bytes=16 * GiB, hot_blocks=144, registered_blocks=144))
-    assert engine._mapped_bank_is_addressable(whole)
+def test_every_layer_covered_leaves_nothing_on_the_cpu():
+    whole = _Tier(_Banks(range(24)))
+    assert engine._mapped_cpu_layers(whole, 24) == frozenset()
 
 
-def test_nothing_registered_and_no_mapping_are_both_unaddressable():
-    none = _Tier(_Banks(registered_bytes=0, hot_blocks=144, registered_blocks=0))
-    assert not engine._mapped_bank_is_addressable(none)
-    assert not engine._mapped_bank_is_addressable(_Tier(None))
-    assert not engine._mapped_bank_is_addressable(None)
+def test_nothing_covered_and_no_mapping():
+    assert engine._mapped_cpu_layers(_Tier(_Banks([], registered_blocks=0)), 3) == frozenset(range(3))
+    assert engine._mapped_cpu_layers(_Tier(None), 3) == frozenset(range(3))
+    assert engine._mapped_cpu_layers(None, 3) == frozenset()  # no --moe-bank-ram at all
+
+
+def test_a_bank_object_without_the_set_falls_back_to_all_or_nothing():
+    """An older bank object (or a stub in a test) has no registered_layers."""
+
+    class _Old:
+        fully_registered = True
+
+    class _OldPartial:
+        fully_registered = False
+
+    assert engine._mapped_cpu_layers(_Tier(_Old()), 3) == frozenset()
+    assert engine._mapped_cpu_layers(_Tier(_OldPartial()), 3) == frozenset(range(3))
