@@ -121,6 +121,32 @@ def offload_unpinnable(hw: dict) -> tuple[str, str] | None:
             f"{banks / gib:.1f} GiB of experts, does not start and is not tried.")
 
 
+# Share of the expert banks the measured page-lock cap has to cover before the PCIe fetch is
+# worth keeping. Below it, only a couple of layers can fetch at all and the fetch loses to the
+# CPU; above it the fetch wins. The two measured points are 11% (loses) and 99% (wins), so this
+# sits between them -- guides/58 7.3.
+PIN_FETCH_SHARE = 1 / 3
+
+
+def pin_starves_the_fetch(hw: dict) -> tuple[str, str] | None:
+    """Why fetching nothing deserves a standard trial on this host, when it does.
+
+    A miss is gathered straight out of page-locked host memory, so a cap far below the banks
+    leaves only a couple of layers able to fetch at all. Measured on a 2060 with the cap forced
+    to 1 GiB against 9.47 GiB of experts, fetching from those two layers was 12% SLOWER than
+    fetching nothing (12.64 vs 14.17 tok/s); with the cap covering the banks the same flag loses
+    (16.78 vs 14). It is the ratio that decides, which is why this is a gate and not a default."""
+    pin = ((hw or {}).get("measurements") or {}).get("pin") or {}
+    cap, banks = pin.get("cap_bytes"), pin.get("banks_bytes")
+    if not cap or not banks or cap >= banks * PIN_FETCH_SHARE:
+        return None
+    gib = 1 << 30
+    return (f"ページロックできる RAM は実測 {cap / gib:.2f} GiB で、エキスパート {banks / gib:.1f} GiB の"
+            f"ごく一部しか GPU から読めない。取り寄せる層が数層しか無いときは、取り寄せないほうが速いことがある。",
+            f"This machine page-locks {cap / gib:.2f} GiB (measured) of the {banks / gib:.1f} GiB of experts, so only a "
+            f"couple of layers can fetch at all -- and with that few, not fetching can be faster.")
+
+
 def unavailable(facts: dict, hw: dict, modules: set[str] | None = None) -> list[dict]:
     """What was left out of the plan, for the page's list of what was not measured."""
     modules = installed_modules() if modules is None else modules
@@ -174,9 +200,12 @@ def plan(args: list[str], facts: dict, hw: dict, mode: str = "standard", modules
                           what_ja=f"CPU スレッドを 1 つ減らして {fewer} にする（空いたコアで GPU への指示や転送が待たされなくなることがある）",
                           what_en=f"one CPU thread fewer ({fewer}): the core left free can keep GPU launches and transfers from waiting"))
         if strategy == "hybrid":
-            add(Candidate("fetch_none", {"--moe-hybrid-max-fetch": "0"}, thorough=True,
-                          what_ja="足りないエキスパートを GPU へ送らず、すべて CPU で計算する",
-                          what_en="fetch no missing expert over PCIe: the CPU computes them all"))
+            starved = pin_starves_the_fetch(hw)
+            add(Candidate("fetch_none", {"--moe-hybrid-max-fetch": "0"}, thorough=starved is None,
+                          what_ja="足りないエキスパートを GPU へ送らず、すべて CPU で計算する"
+                                  + (f"。{starved[0]}" if starved else ""),
+                          what_en="fetch no missing expert over PCIe: the CPU computes them all"
+                                  + (f" {starved[1]}" if starved else "")))
 
         # --- kernels for the expert format
         fmt = expert_format(facts.get("quant"))

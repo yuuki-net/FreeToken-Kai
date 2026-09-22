@@ -64,6 +64,33 @@ def test_a_dense_model_is_not_told_about_expert_banks():
                    for e in search.unavailable({}, _hw(1, 17), modules=set()))
 
 
+def test_a_cap_far_below_the_banks_makes_fetching_nothing_a_standard_trial():
+    """The fetch reads page-locked memory, so a cap that covers almost none of the banks leaves
+    a couple of layers fetching -- measured slower than not fetching at all (guides/58 7.3)."""
+    args = ["--moe-strategy", "hybrid", "--moe-cpu-layers", "auto"]
+    std = lambda hw: {c.key for c in search.plan(args, MOE, hw, "standard", modules=set())}  # noqa: E731
+
+    assert "fetch_none" in std(_hw(1, 9.47))  # the reporter's regime: 11% of the banks
+    assert "fetch_none" not in std(_hw(9.39, 9.47))  # the 2060: the cap covers them
+    assert "fetch_none" not in std({})  # nothing measured stays a thorough-only trial
+    assert "fetch_none" in {c.key for c in search.plan(args, MOE, _hw(9.39, 9.47), "thorough", modules=set())}
+
+
+def test_the_starved_fetch_says_what_it_measured():
+    why = search.pin_starves_the_fetch(_hw(1, 9.47))
+    assert why and "1.00 GiB" in why[0] and "9.5 GiB" in why[0]
+    assert "1.00 GiB" in why[1] and "not fetching can be faster" in why[1]
+    assert search.pin_starves_the_fetch(_hw(9.39, 9.47)) is None
+    for hw in ({}, {"measurements": {}}, _hw(), _hw(cap_gib=1), _hw(banks_gib=9.47)):
+        assert search.pin_starves_the_fetch(hw) is None
+
+
+def test_the_starved_host_is_told_why_in_the_candidate_text():
+    args = ["--moe-strategy", "hybrid", "--moe-cpu-layers", "auto"]
+    c = next(c for c in search.plan(args, MOE, _hw(1, 9.47), "standard", modules=set()) if c.key == "fetch_none")
+    assert "1.00 GiB" in c.what_ja and "1.00 GiB" in c.what_en
+
+
 # ------------------------------------------------------------------ what derive proposes
 
 def _measurements(cpu_gbs, pcie_gbs, **extra):
