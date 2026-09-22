@@ -1587,12 +1587,10 @@ class Engine:
         )
         # before set_bank_sources: the residency validation and the copy plan's skip of non-pinned layers key on the CPU-layer set
         cache.cpu_layer_ids = cpu_layer_ids
-        mapped_pinned = bank_tier is not None and bool(
-            bank_tier.banks and bank_tier.banks.registered_bytes
-        )
+        mapped_pinned = _mapped_bank_is_addressable(bank_tier)
         if bank_tier is not None and not mapped_pinned:
-            # Nothing registered: a mapped bank then has no device address at all, so
-            # every layer has to decode on the CPU executor -- which is the state the
+            # Nothing the GPU can address: a mapped bank then has no device address it can
+            # trust, so every layer has to decode on the CPU executor -- which is the state the
             # residency label below declares, and set_bank_sources checks the two agree.
             # This costs the VRAM expert cache, so it is the fallback, not the plan.
             cache.cpu_layer_ids = frozenset(range(len(next(iter(banks.sources.values())))))
@@ -3063,6 +3061,21 @@ def _linear_state_host_bytes(config) -> int:
         getattr(config.model_config, "slot_states", ()),
     )
     return n * per
+
+
+def _mapped_bank_is_addressable(bank_tier) -> bool:
+    """Whether the GPU may take an address inside a ``--moe-bank-ram`` mapping.
+
+    ``fully_registered``, never "some bytes registered": a mapping registered in PART is the
+    same as an unregistered one to the cache. ``mapped_bank.fully_registered`` says so and the
+    start-up warning promises every miss then goes to the CPU executor -- but this decision used
+    to read ``registered_bytes``, so a host that stops registering partway left every layer
+    labelled PINNED and the copy plan asked ``device_ptr()`` for a block that was never
+    registered: ``cudaHostGetDevicePointer``, "invalid argument", before the first token
+    (FreeToken-Kai#2, an explicit ``--moe-bank-ram`` size over the host's cap).
+    """
+    banks = getattr(bank_tier, "banks", None) if bank_tier is not None else None
+    return bool(banks is not None and banks.fully_registered)
 
 
 def _pin_budget_bytes(reserved: int = 0) -> int | None:

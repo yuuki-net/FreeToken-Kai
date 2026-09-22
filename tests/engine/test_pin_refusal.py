@@ -64,3 +64,44 @@ def test_a_refusal_records_the_cap_it_measured(monkeypatch, tmp_path):
     pin_probe.remember(1 * GiB, how="refused mid-load", proc=str(proc))
     assert pin_probe.budget(proc=str(proc)) == 1 * GiB
     assert pin_probe.source(str(proc)) == "measured (refused mid-load)"
+
+# ------------------------------------------------- a mapping registered only in part
+
+
+class _Banks:
+    def __init__(self, registered_bytes, hot_blocks, registered_blocks):
+        self.registered_bytes = registered_bytes
+        self.hot_blocks = hot_blocks
+        self.registered_blocks = registered_blocks
+
+    @property
+    def fully_registered(self) -> bool:  # mapped_bank's own rule
+        return self.hot_blocks > 0 and self.registered_blocks == self.hot_blocks
+
+
+class _Tier:
+    def __init__(self, banks):
+        self.banks = banks
+
+
+def test_a_mapping_registered_in_part_is_not_addressable():
+    """The warning promises every miss goes to the CPU; the decision has to agree.
+
+    Reading "some bytes registered" left every layer labelled PINNED, and the copy plan then
+    asked for the device address of a block that was never registered -- issue #2's crash with
+    an explicit --moe-bank-ram size on a host that stops registering partway.
+    """
+    part = _Tier(_Banks(registered_bytes=1 * GiB, hot_blocks=144, registered_blocks=30))
+    assert not engine._mapped_bank_is_addressable(part)
+
+
+def test_a_mapping_registered_whole_is_addressable():
+    whole = _Tier(_Banks(registered_bytes=16 * GiB, hot_blocks=144, registered_blocks=144))
+    assert engine._mapped_bank_is_addressable(whole)
+
+
+def test_nothing_registered_and_no_mapping_are_both_unaddressable():
+    none = _Tier(_Banks(registered_bytes=0, hot_blocks=144, registered_blocks=0))
+    assert not engine._mapped_bank_is_addressable(none)
+    assert not engine._mapped_bank_is_addressable(_Tier(None))
+    assert not engine._mapped_bank_is_addressable(None)
