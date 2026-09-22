@@ -154,12 +154,17 @@ to read the thread count as a tuned value.
 | same | `openai/gpt-oss-20b` (MXFP4) | 20k of context with the defaults (`--moe-strategy hybrid --disable-moe-prefill-overlap`, bf16, `--kv-reserve-tokens 20480`: 20,868 tokens allocated, K + V = 0.58 GiB, 34 expert slots). Decode 14-16 tok/s measured against the depth held: 16.1 tok/s median at 1,845 tokens, 15.3 at 8,035, 14.4 at 15,953 (2026-09-13). One run fell to 9.1 at 19,315 with the pool 93% full; a `--memory-ratio 0.95` run (30,817 tokens) did not drop at the same depth, so the cause is not the length, and it is not pinned down. That `--memory-ratio 0.95` run leaves 0.12 GiB free and decodes slower (9.8 tok/s at 7.4k), so 20k is the usable figure. `--kv-cache-dtype` is refused (`HybridSWAKVCache`). Prefill is the cost: a 19k prompt took about 6.5 minutes, and consecutive prompts sharing a prefix showed `#cached-token: 0`. The earlier 13-14 tok/s was the Turing patch alone on upstream |
 | The two-GPU machine above (`--pp-size 2`, GPU 1 on the chipset x4 slot) | `RadixArk/Qwen3.8-Flash-Next-NVFP4` (125B MoE, vision), `--pp-size 2 --dense-quant fp8` Runs with 128k of context on the two cards; one card also runs it (see [below](#running-qwen38-flash-next-on-one-rtx-3060-12-gb)). 18-20 tok/s plain, 13-27 tok/s with `--spec-mtp 5` (2.1-4.5 tokens accepted per step; the verify window and the draft head run as CUDA graphs on both ranks). Image input validated end to end on upstream's image path with the vision tower on the CPU (`--mm-encoder-weights cpu`) and on the GPU (`host`, computing in float32): colour probe 6/6, a four-quadrant image described to the end, and 2.6-5.8 tokens accepted per step with `--spec-mtp 5` after the image (2026-09-15). A follow-up turn behind a cached prefix answers in 2.4-4.5 s (9 s before the CPU short-prefill path) |
 | same | `ornith-ai/Ornith-1.5-35B-A3B-NVFP4` | One card (`--gpu 0`), `--moe-strategy hybrid`: 41-46 tok/s, 2,947 expert slots (2026-09-06; the context length of that run was not recorded). The same one-card configuration takes 256k of context (`--max-seq-len-override 262144 --kv-reserve-tokens 262144`, 262154 tokens allocated, K + V = 5.00 GiB, 1.33 GiB free after initialisation) with the expert cache cut to 680 slots. Measured against the depth actually held, 22 sampled steps each: 39.2 tok/s median at 8,185 tokens, 34.8 at 63,655 (-11%), 25.2 at 249,948 (-36%, KV at 95% of capacity). Prefill of the 250k context took 435 s in 8,192-token chunks, the per-chunk rate falling from 896 tok/s over the first chunk to 371 at a depth of 221k. On this host the expert transfer is not the bottleneck, so the cache can be spent on context almost for free; the cost lands on prefill. The first steps after any prefill run at 31-37 until the cache warms. Two cards, `--pp-layers 25 --moe-strategy offload`: 40-44 tok/s, 3,833 slots per card; the even split with hybrid is slower (25-30 tok/s). `--spec-mtp 5` on one card: 19-35 tok/s (a 6-row verify step costs 68-92 ms against 23 ms for one row: the window multiplies the expert traffic, as on the 2060) |
-| same | `openai/gpt-oss-120b` (MXFP4, 57 GB of expert banks) | One card: 9-12 tok/s (202 expert slots; the banks exceed the pin budget, so 9 layers decode on the CPU). Two cards, `--pp-layers 26 --moe-strategy hybrid`: 12-17 tok/s (394 slots per card, every bank pinned). All gpt-oss-120b runs used 32k of context (`--max-seq-len-override 32768 --kv-reserve-tokens 32768`), not the 128k of the Flash-Next row above: 18 of its 36 layers are full attention at 2048 B per token per layer, so 128k of KV would want 4.7-5.5 GiB against 1.62 GiB free. Untested at 128k |
+| Quadro RTX 3000 6 GB (sm_75), i7-9850H (6 cores), 32 GB DDR4-2667, Windows 10 + WSL2 (`memory=24GB`) — **reported in [#2](https://github.com/yuuki-net/FreeToken-Kai/issues/2), not measured here** | `nvidia/Qwen3.6-35B-A3B-NVFP4` | Every expert on the CPU: on this Windows 10 host the pin budget measured 1 GiB, which no expert bank fits (see [Known limitations](#known-limitations)), so `--moe-cpu-layers 1.0`. With `--moe-strategy hybrid --disable-moe-prefill-overlap --max-running-req 1 --moe-cpu-threads 6 --dtype float16 --kv-cache-dtype q8_0 --memory-ratio 0.9 --mm-encoder-weights cpu` and `--kv-reserve-tokens` at the window plus 1024. Decode at 10 / 50 / 90% of the window held: **13.6 / 13.5 / 12.1 tok/s at 32k**, **11.4 / 11.4 / 9.3 at 64k**. First token at 90% full: 109-245 s for a 29k prompt, 240-243 s for 59k. Without `q8_0`, 32k stopped 53 MiB short of its cache budget at `--memory-ratio 0.85`. The CPU is what decides these figures, not the card |
+| same | `openai/gpt-oss-20b` (MXFP4) | 20k of context, as on the 2060 above. **5.6 tok/s at 90% full**, first token 270 s for a 17.6k prompt. Every expert on the CPU as above, `--memory-ratio 0.9` |
+| same | `openai/gpt-oss-120b` (MXFP4, 57 GB of expert banks) | One card: 9-12 tok/s (202 expert slots; the banks exceed the pin budget, so 9 layers decode on the CPU -- see [Known limitations](#known-limitations) for where that budget comes from and why it is not raised). Two cards, `--pp-layers 26 --moe-strategy hybrid`: 12-17 tok/s (394 slots per card, every bank pinned). All gpt-oss-120b runs used 32k of context (`--max-seq-len-override 32768 --kv-reserve-tokens 32768`), not the 128k of the Flash-Next row above: 18 of its 36 layers are full attention at 2048 B per token per layer, so 128k of KV would want 4.7-5.5 GiB against 1.62 GiB free. Untested at 128k |
 
 The two-card rows are the only measurements of the layer split; the hand-off between the ranks
 costs under 1 ms per step (`FT_STEP_PROFILE`), and the rest is the two forwards in sequence.
-Other Turing cards (RTX 2070/2080, T4, GTX 16 series without tensor cores) should behave like
-the 2060 but are unverified; so should other Ampere and newer cards.
+The Quadro RTX 3000 row is the one report from a Turing card other than the 2060, and the one
+from Windows 10; every expert runs on its CPU there, so it measures that host's CPU and memory
+rather than what the card can do. Other Turing cards (RTX 2070/2080, T4, GTX 16 series without
+tensor cores) should behave like the 2060 but are unverified; so should other Ampere and newer
+cards.
 
 ## Ampere and newer
 
@@ -211,7 +216,7 @@ ft serve \
 | Flag / variable | Why |
 |---|---|
 | `--moe-strategy hybrid` | Experts live in host RAM; misses are split between PCIe and the CPU (`ft bench bw` once to calibrate). NVFP4 experts decode at 50 GB/s with the six threads set below |
-| `--moe-cpu-layers auto` | WSL caps how much host RAM CUDA will pin, and the 17 GB of banks are over that cap. `auto` locks just enough head and tail layers to fit and decodes those on the CPU. Required since upstream stopped doing this silently: without the flag the boot stops and asks for it |
+| `--moe-cpu-layers auto` | WSL caps how much host RAM CUDA will pin, and the 17 GB of banks are over that cap. `auto` locks just enough head and tail layers to fit and decodes those on the CPU. Required since upstream stopped doing this silently: without the flag the boot stops and asks for it. `ft doctor pin` says what this machine will page-lock; the split is planned against that figure only where the driver refuses one, and against a 40% estimate otherwise (see [Known limitations](#known-limitations)) |
 | `--disable-moe-prefill-overlap` | The prefill double buffer needs 2 x 256 expert slots, which a 6 GB card cannot spare |
 | `--max-running-req 1` | GDN state slots 8 -> 2 and one CUDA graph; saves ~200 MB |
 | `--kv-reserve-tokens 16384` | KV pages are carved from the same budget as the expert cache; the default 8192 was too small for Open WebUI prompts, 4096 far too small |
@@ -396,6 +401,8 @@ model that does). Not yet measured on a card.
 | `FREETOKEN_RANK_JOIN_TIMEOUT_SECONDS` | `3600` | Multi-rank: how long a rank that reaches a startup agreement (KV page count, prefill chunk, the scheduler's first sync) waits for the others. The serving timeout between ranks is unchanged (see [pipeline.md](pipeline.md)) |
 | `FREETOKEN_RANK_WAIT_WARN_SECONDS` | `60` | Multi-rank: warn when a blocking send or receive between ranks has waited this long, naming what for; repeats every 60 s, nothing times out (see [pipeline.md](pipeline.md)); `0` disables |
 | `FREETOKEN_PREMAP_VRAM` | off | Pre-map the remaining VRAM into the allocator cache at startup; an experiment that did not help on the 2060 (per-stream pools), left as a knob |
+| `FREETOKEN_PIN_CAP_FILE` | `~/.cache/freetoken/pin_cap.json` | Where this host's measured page-lock cap is recorded (`ft doctor pin`, or a start that was refused mid-load). Keyed by kernel build and guest RAM, so a new `.wslconfig` `memory=` is measured again rather than reusing the old figure |
+| `FREETOKEN_SAFETENSORS_CPU_LOAD` | auto | Read the checkpoint through host memory and copy each tensor to the GPU, instead of `safe_open(device="cuda")`. `auto` turns it on only where this host's pin budget is under a quarter of the checkpoint; `1` / `0` force it. See [Known limitations](#known-limitations) |
 
 ## Known limitations
 
@@ -413,6 +420,58 @@ model that does). Not yet measured on a card.
   of up to `FREETOKEN_CPU_PREFILL_MAX_TOKENS` (256) rows -- a chat turn behind a cached prefix
   -- skip the streaming and compute their experts on the CPU executor instead (a follow-up
   turn answers in 2-3 s including 64 generated tokens, against ~6 s before).
+- **safetensors 0.8.0 keeps page-locked host memory when it reads straight onto the GPU.**
+  Measured on gpt-oss-20b (13,123 MB in three shards, every handle held open the way the loader
+  holds them): the process ends 2,492 MB above the same read staged through host memory, and
+  closing every handle does not give it back (3,100 MB resident against 607 MB). It is a pool
+  that is kept rather than memory that is lost -- reading the same checkpoint a second and third
+  time adds nothing at all, so 2.5 GB is the high-water mark and not a rate -- and nothing
+  accumulates per tensor either: the cost arrives when a shard is opened and read. On a host with a
+  large pin budget that is waste; where the budget is around 1 GiB the load dies as `CUDA error:
+  out of memory` with the GPU nearly empty, since what ran out was page-locked host memory
+  (upstream report: safetensors#858). 0.7.0 is reported not to do it, which is not something
+  checked here; either way transformers 5.16 requires safetensors >= 0.8.0, so holding the older
+  version back is not open to anything that imports transformers. This fork reads the
+  checkpoint through host memory instead where the pin budget is under a quarter of the
+  checkpoint's size, and `FREETOKEN_SAFETENSORS_CPU_LOAD` forces that either way. It is not on
+  everywhere because the cost is not known: what the staged path adds is a host-memory copy of
+  the whole checkpoint, and the two 13 GB runs it was timed against (8-9 s staged, 5-11 s direct)
+  put whichever ran second ahead, so the page cache decided the order rather than the path did.
+  That copy is host memory bandwidth, and the hosts that need the staged read tend to be older
+  ones least able to afford it, while this was timed on DDR5-4800.
+- **How much host RAM CUDA will page-lock is capped under WSL2, and the cap cannot be derived.**
+  The expert banks have to be page-locked before the GPU may read them, so this decides whether
+  `--moe-strategy offload` and `hybrid` start at all. NVIDIA's own answer is that no formula gives
+  the figure on any supported OS, that Windows sets it and the driver does not, and that WSL2
+  lands below the native Windows figure. Measured on two machines here -- one of them at two
+  `.wslconfig` sizes -- and reported on a third, no fraction of anything describes them.
+  **On Windows 11 nothing refused at all**: 5.50 GiB held in a 7.75 GiB guest (71% of it),
+  12 GiB in a 23.5 GiB guest on the same machine (51%, and there the *host's* free RAM ran out
+  first), and 93.50 GiB in a 110 GiB guest on the other -- 85% of the guest, and 78% of that host's 128 GB, so half
+  of physical RAM is not a ceiling either, whatever the Windows-side figure in upstream
+  FreeToken#529 suggests. **On Windows 10 a 24 GiB guest stops at 1 GiB**, 4%, and the boot dies
+  mid-load (reported in #2; microsoft/WSL#14078 reports 500 MiB on the same Windows build).
+  Whatever sets the cap, a guest cannot compute it.
+
+  So run `ft doctor pin` once per machine, or just run the web console's benchmark, whose first
+  step takes the same measurement. It records one thing: a cap the driver refused at. A start
+  then plans against that, and a start that is itself refused mid-load records its registered
+  total the same way, so the next one plans against the truth instead of dying in the same
+  place. Where nothing has refused -- every Windows 11 host measured here -- nothing is recorded
+  and a start falls back to 40% of the guest's RAM.
+
+  That estimate is a guess at the wrong quantity: it does not predict the driver, which allowed
+  78% of physical RAM on the host above. What it does do is keep a server inside what the host
+  can spare, and that is the quantity that decides whether the machine keeps working. **Do not
+  raise `FREETOKEN_PIN_BUDGET_GB` to match what a ladder held.** On that 110 GiB guest the
+  ladder held 93.50 GiB, and a 90 GiB budget pinned all 63.46 GiB of a model's expert banks,
+  reached "Scheduler is idle", then served no token at all in 180 s and took the guest down with
+  it. Pinned pages are never reclaimed, so what one process holds for a moment with nothing else
+  running is not what a server can commit and still work.
+
+  Where the cap is around 1 GiB nothing can pin expert banks at all: serve with `--moe-cpu-layers 1.0` (every expert on the CPU), or with
+  `--moe-bank-ram`, which maps the banks and locks only a resident prefix so the cap stops
+  deciding.
 - Under WSL2 on a full 6 GB card, PyTorch's expandable-segment allocator intermittently died
   with `CUDA driver error: device not ready` when it had to release cached segments while
   other streams were busy. The Turing prefill scratches (MoE dequant chunks, fp8 dequant) are

@@ -105,13 +105,23 @@ while one holds the GPU.
    hybrid fetch split), so everything after it runs on figures measured with this version. The
    version is written into the profile; the setup card lists each GPU's profile with the version
    that measured it, and a profile from the desktop app or an older `ft bench bw` shows none.
-2. **Hardware** (a few minutes, `webui/hwbench.py` in a child process): PCIe transfer per GPU
-   against the link's theoretical rate, the memory read rate, reading the model's own file from the
-   SSD with its page cache dropped, the model's experts computed on the CPU at each thread count,
-   the experts moved to each GPU, and both at once. These are upstream's `ft bench bw` kernels
-   driven with the model's own expert geometry.
+2. **Hardware** (a few minutes, `webui/hwbench.py` in a child process): how much host RAM this
+   machine will page-lock, PCIe transfer per GPU against the link's theoretical rate, the memory
+   read rate, reading the model's own file from the SSD with its page cache dropped, the model's
+   experts computed on the CPU at each thread count, the experts moved to each GPU, and both at
+   once. These are upstream's `ft bench bw` kernels driven with the model's own expert geometry.
+   - Page-locking comes first, in a child of its own, and before anything else pins: the cap is a
+     quota every process shares and the transfer steps hold pinned buffers, so measuring it later
+     would answer for what this run was already holding. It writes the same record `ft doctor pin`
+     does, so a machine that has been benchmarked needs nothing from that command. It changes a
+     plan only when the driver refuses: that refusal is this host's cap and every later start
+     plans `--moe-cpu-layers auto` against it. A ladder that merely ran out of RAM records
+     nothing -- see [kai.md](kai.md#known-limitations) for why that figure is not a budget.
    - `--moe-strategy`: `hybrid` when computing on the CPU is more than twice the transfer to the
-     slowest GPU, `offload` otherwise (upstream's rule).
+     slowest GPU, `offload` otherwise (upstream's rule) -- except where the banks are larger than
+     this machine can page-lock, since a plain `offload` start pins every one of them and would
+     not come up at all. There it stays `hybrid`, and the `offload` trial is skipped and listed
+     with the reason.
    - `--moe-cpu-threads`: the fewest threads within 95% of the best, not the maximum.
    - These figures stay in the result; the profile is `ft bench bw`'s alone.
 3. **Real runs** (optional). Setting A is the recommended settings plus the above. Each later run

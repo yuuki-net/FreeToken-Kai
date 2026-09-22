@@ -14,6 +14,7 @@ ft <command> [args]
 | `ft bank` | Inspect, pack, verify, unpack or reorder the `--moe-bank-ram` bank file |
 | `ft bench bw` | Benchmark CPU vs PCIe bandwidth to calibrate the MoE backend |
 | `ft doctor disk` | Check whether `--moe-bank-ram` suits this host's disk and RAM, and what to set (no GPU, no root) |
+| `ft doctor pin` | Measure and record how much host RAM this machine will page-lock, and which MoE flags that figure calls for (needs a GPU) |
 
 `ft --version` prints the installed version (torch-free; nightly wheels carry a
 `+g<sha>` build stamp, tagged releases a bare version). Every command supports
@@ -100,11 +101,11 @@ See [models.md](models.md#moe-strategies) for what each strategy does.
 | `--pp-prefill-group` | 1 | Qwen3.8-Flash-Next with `--pp-size 2`, offloaded experts and `--max-running-req 1`: the second rank holds up to this many consecutive prefill chunks of a prompt and runs them layer by layer, so each layer's expert bank is copied to that GPU once per group instead of once per chunk. It cuts that rank's wait on its banks (0.27 to 0.08 s per 1k tokens measured), but on the two RTX 3060s of [pipeline.md](pipeline.md) the prefill came out no faster, so it stays off by default; it is here for a rank whose link is slower still. Costs one residual stream of VRAM per held chunk on that rank (98 MiB for a 5,120-token Flash-Next chunk). See [pipeline.md](pipeline.md#two-knobs-for-a-slow-second-rank) |
 | `--prefill-profile` | off | Log one line per prefill forward on every rank: its wall time split into waiting for the other pipeline rank, host copies of expert rows the GPU cannot read directly (the `--moe-bank-ram` remainder; page faults on the bank file land here), per-layer-embedding disk reads, and the GPU plus the rest; then the GiB those copies moved and their rate, major faults and storage reads, the page cache's share of the non-resident rows when the forward began, and the achieved PCIe rate of the registered rows. Go by the storage reads, not the share: a chunk can re-read nearly all of the rows while a third are cached, because reading one layer evicts the one before. On an RTX 2060 host with Ornith at `--moe-bank-ram 6G`: 0.7 s of a 4.5 s chunk with RAM to spare; with the server held to 13 GiB, 9.2 s of 13 s, 10.6 GiB re-read from the disk each chunk at 1.2 GiB/s. One device sync per prefill forward |
 | `--moe-cpu-threads` | physical cores | CPU worker threads for the cpu/hybrid executor |
-| `--moe-cpu-layers` | all on GPU | With `offload`: which MoE layers decode on CPU (`3,7,11`, a count, a fraction, or `auto`). `auto` is for Windows/WSL only, where CUDA pinned memory is capped; every value needs an expert format the CPU executor serves (bf16, nvfp4, mxfp4), so fp8 experts cannot use it |
+| `--moe-cpu-layers` | all on GPU | With `offload`: which MoE layers decode on CPU (`3,7,11`, a count, a fraction, or `auto`). `auto` is for Windows/WSL only, where CUDA pinned memory is capped; it splits against a cap `ft doctor pin` recorded for this host, which exists only where the driver has refused one; otherwise a 40%-of-guest-RAM estimate stands (see [kai.md](kai.md#known-limitations)). Every value needs an expert format the CPU executor serves (bf16, nvfp4, mxfp4), so fp8 experts cannot use it |
 | `--moe-hybrid-max-fetch` | auto | With `hybrid`: max experts fetched over PCIe per layer per step; rest computed on CPU |
 | `--moe-prefill-hit-d2d` | off | Prefill: copy cache-hit experts device-side, stream only misses (CUDA >= 13) |
 | `--disable-moe-prefill-overlap` | overlap on | Disable the two-buffer prefill copy overlap. `--moe-cache-auto` turns it off by itself when its 2 x num_experts slot floor does not fit next to the KV reserve |
-| `--moe-bank-ram` | off | Half the RAM: keep only the frequently routed experts resident, map the rest from disk. Whole-host cap (`48G`), split across ranks. `auto` = MemAvailable at startup − 4.5 GiB per rank − a page cache margin (5% of MemTotal, at least 2 GiB), and under WSL2 no more than the CUDA pin budget (40% of MemTotal, `FREETOKEN_PIN_BUDGET_GB`) − 2 GiB, with the arithmetic logged. Needs `RLIMIT_MEMLOCK` (`ulimit -l`) at least as large as one rank's share, or the resident half is quietly smaller than asked. See [bank-ram.md](bank-ram.md) |
+| `--moe-bank-ram` | off | Half the RAM: keep only the frequently routed experts resident, map the rest from disk. Whole-host cap (`48G`), split across ranks. `auto` = MemAvailable at startup − 4.5 GiB per rank − a page cache margin (5% of MemTotal, at least 2 GiB), and under WSL2 no more than the CUDA pin budget (a cap `ft doctor pin` recorded for this host, else 40% of MemTotal; `FREETOKEN_PIN_BUDGET_GB` overrides) − 2 GiB, with the arithmetic logged. Needs `RLIMIT_MEMLOCK` (`ulimit -l`) at least as large as one rank's share, or the resident half is quietly smaller than asked. See [bank-ram.md](bank-ram.md) |
 | `--moe-bank-stats` | — | Routing histograms (from `--moe-stats-out`, every rank's file) that decide which experts stay resident. A change reorders the bank file in place; without the flag the order already in the file is kept |
 | `--moe-bank-dir` | `~/.cache/freetoken/bankmap/<model>` | Where the bank file (`bank.ftmb`, one for every rank) lives. A checkpoint packed by `ft bank pack` keeps its own inside it. The startup log warns when that is a 9p/drvfs, network or tmpfs mount, a USB, SATA or rotating disk |
 | `--moe-bank-readahead` | off | With `--moe-bank-ram`: `auto` writes the recommended device `read_ahead_kb` for the model's block geometry, a number writes that many kB; `off` only logs the current window and the command to change it. Each rank sets it before opening its mapping, since an open mapping keeps the window it was opened with. Device-wide and left set after exit. See [bank-ram.md](bank-ram.md#3-set-the-device-readahead) |
@@ -272,6 +273,51 @@ and no root; reads `/proc` and `/sys` and nothing else unless it benchmarks.
   (`--prefill-read-gbs` to supply it) and the factor the page-cache rate would cost, and the
   transfer time at the slowest host -> GPU rate. Data
   movement only; compare with the server's `--prefill-profile` lines.
+
+## ft doctor pin
+
+```bash
+ft doctor pin                 # measure, record, and say what the figure calls for
+ft doctor pin --no-measure    # print what is already on record and lock nothing
+ft doctor pin --ceiling 4     # lock at most 4 GiB (default: the budget a start would use)
+```
+
+How much host RAM this machine will page-lock. The expert banks must be page-locked before the
+GPU may read them, WSL caps how much of that a host allows, and the cap cannot be computed from
+anything the guest can read (see [kai.md](kai.md#known-limitations) for the measurements). This
+locks memory 256 MiB at a time until the driver refuses, records what it learned, and prints
+which MoE flags that calls for.
+
+It records one thing: a cap the driver refused at. That figure is this host's, and `ft serve`
+plans `--moe-cpu-layers auto` against it, as do `--moe-bank-ram auto` and the web console's
+recommendation. A ladder that merely ran out of guest or host RAM -- what happens on every
+Windows 11 host measured so far -- records nothing, and the 40%-of-guest-RAM estimate stands.
+
+Do not read the figure such a run prints as a budget. It is what one process held for a moment
+with nothing else running; raising `FREETOKEN_PIN_BUDGET_GB` to match it pinned a model's whole
+bank set on one host, reached "Scheduler is idle", served no token in 180 s and took the guest
+down with it. Pinned pages are never reclaimed.
+
+It stops at the budget a start would plan against and searches no higher, because that is the
+only range where the answer changes anything. A cap above the budget is irrelevant -- nothing
+plans for more than the budget either way. A cap below it is the case that breaks a start, and
+that is the case this finds: on the Windows 10 host in [kai.md](kai.md#known-limitations) the
+driver refused at 1 GiB against a 9.6 GiB budget, well inside the search. Climbing past the
+budget would answer a question nobody asks, and the bytes are real and never reclaimed. So a run
+holds, for a moment, what a server holds for hours -- and no more. `--ceiling` raises it, and
+should not.
+
+Unlike `ft doctor disk` it needs a GPU, because only CUDA can answer. Run it with no server up:
+the cap is a quota shared by every process, so a server already holding part of it makes the
+answer smaller than the host's.
+
+The record lives in `~/.cache/freetoken/pin_cap.json` (`FREETOKEN_PIN_CAP_FILE`), keyed by kernel
+build and guest RAM, so changing `.wslconfig` `memory=` asks for a new measurement rather than
+reusing the old one.
+
+The console's benchmark takes the same measurement as its first step and writes it to the same
+place, so a machine that has been benchmarked needs nothing from this command. It is here for
+getting the figure without a benchmark -- and for `--no-measure`, which says what is on record.
 
 ## ft bench bw
 
