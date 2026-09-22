@@ -37,7 +37,16 @@ _BLK = 4096  # O_DIRECT alignment (page size)
 
 
 class PinFailed(RuntimeError):
-    """cudaHostRegister refused a bank: the host is out of pinnable RAM or over its pin quota."""
+    """cudaHostRegister refused a bank: the host is out of pinnable RAM or over its pin quota.
+
+    ``registered_bytes`` is what this process had page-locked when the refusal came, and that
+    is the host's cap. The bank that happened to ask for the byte over it says nothing about
+    how much there was -- reporting only its size is what read as "failed for 0.0 GiB" (#2)."""
+
+    def __init__(self, message: str, *, bank_bytes: int = 0, registered_bytes: int = 0):
+        super().__init__(message)
+        self.bank_bytes = bank_bytes
+        self.registered_bytes = registered_bytes
 
 
 class HostResidency(str, Enum):
@@ -56,6 +65,24 @@ _DEFAULT_CHUNK = 8 << 20
 
 # Hold the mmaps for the process lifetime; the offload cache reads from these banks forever.
 _LIVE_BUFFERS: list[mmap.mmap] = []
+
+# Page-locking is a process-wide quota, so the running total is what a refusal reports and what
+# pin_probe remembers as this host's cap. PinPipeline registers on its own thread; born-pinned
+# banks (cudaHostAlloc) spend the same quota, so they count here too.
+_pinned_total = 0
+_pinned_lock = threading.Lock()
+
+
+def registered_bytes() -> int:
+    """Host bytes this process has page-locked so far."""
+    with _pinned_lock:
+        return _pinned_total
+
+
+def _count_pinned(nbytes: int) -> None:
+    global _pinned_total
+    with _pinned_lock:
+        _pinned_total += nbytes
 
 def _env_born_pinned() -> bool | None:
     """``FREETOKEN_BANK_CUDA_ALLOC`` tri-state: unset -> ``None`` (default applies), else the parsed boolean."""
@@ -108,6 +135,7 @@ class HostBank:
             self.addr = raw.data_ptr() + off
             assert self.addr % _BLK == 0
             self._pinned = True  # born pinned+mapped; pin() is a no-op
+            _count_pinned(asize + _BLK)  # cudaHostAlloc spends the same quota as cudaHostRegister
         else:
             self._buf = mmap.mmap(-1, asize)  # lazy: address space only, no resident pages yet
             _LIVE_BUFFERS.append(self._buf)
@@ -140,7 +168,14 @@ class HostBank:
         try:
             host_register(self.addr, len(self._buf))
         except RuntimeError as exc:
-            raise PinFailed(f"cudaHostRegister failed for {len(self._buf) / 2**30:.1f} GiB") from exc
+            total = registered_bytes()
+            raise PinFailed(
+                f"cudaHostRegister refused a {len(self._buf) / 2**20:.0f} MiB bank after "
+                f"{total / 2**30:.2f} GiB of this process was already page-locked",
+                bank_bytes=len(self._buf),
+                registered_bytes=total,
+            ) from exc
+        _count_pinned(len(self._buf))
         self._pinned = True
 
     def release(self) -> None:

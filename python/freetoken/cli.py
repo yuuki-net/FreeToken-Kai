@@ -112,6 +112,8 @@ def _print_doctor_help(file: TextIO) -> None:
 Subcommands:
   disk   Whether --moe-bank-ram is usable on this host: storage, readahead, memory,
          a read benchmark and a per-RAM-cap estimate (no GPU, no root)
+  pin    How much host RAM this machine will page-lock, measured and recorded, and which
+         MoE flags that figure calls for (needs a GPU; run it with no server up)
 
 Use "ft doctor <subcommand> --help" for subcommand-specific options.""",
         file=file,
@@ -130,6 +132,10 @@ def _run_doctor(argv: list[str]) -> int:
         from freetoken.moe.disk_doctor import main
 
         return main(argv[1:], prog="ft doctor disk")
+    if sub == "pin":
+        from freetoken.moe.pin_doctor import main
+
+        return main(argv[1:], prog="ft doctor pin")
     print(f"unknown ft doctor subcommand: {sub}", file=sys.stderr)
     _print_doctor_help(sys.stderr)
     return 2

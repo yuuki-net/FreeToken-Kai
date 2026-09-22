@@ -449,14 +449,21 @@ HEADROOM_FRACTION = 0.05
 HEADROOM_MIN_BYTES = 2 * GiB
 
 
-# The resident rows are cudaHostRegistered, and WSL2's CUDA caps page-locked host memory near half
-# of the VM's RAM, shared by every process (engine._pin_budget_bytes budgets 40%; the same
-# FREETOKEN_PIN_BUDGET_GB overrides it). MemAvailable alone does not see that cap: measured on the
-# 2060 host (23.5 GiB), auto took 15.6 GiB, 141 of 240 resident blocks registered and the boot died
-# in a CUDA allocation. PIN_RESERVE_BYTES stays out of the budget for what else the server pins
-# (a host embedding, staging buffers).
+# The resident rows are cudaHostRegistered, and WSL2's CUDA caps page-locked host memory, shared by
+# every process. MemAvailable alone does not see that cap: measured on the 2060 host (23.5 GiB),
+# auto took 15.6 GiB, 141 of 240 resident blocks registered and the boot died in a CUDA allocation.
+# The cap is not derivable from anything the guest can read -- freetoken.moe.pin_probe has the
+# measurements and the reasoning -- so a figure measured on this host is preferred and the fraction
+# below is only the fallback for a host that has never measured one. PIN_RESERVE_BYTES stays out of
+# the budget for what else the server pins (a host embedding, staging buffers).
 PIN_BUDGET_FRACTION = 0.4
 PIN_RESERVE_BYTES = 2 * GiB
+
+
+def _pin_source(proc: str = "/proc") -> str:
+    from freetoken.moe.pin_probe import source
+
+    return source(proc)
 
 
 def pin_budget_bytes(mem: dict[str, int], proc: str = "/proc") -> int | None:
@@ -466,7 +473,11 @@ def pin_budget_bytes(mem: dict[str, int], proc: str = "/proc") -> int | None:
         return int(float(env) * GiB)
     if not is_wsl(proc) or not mem.get("MemTotal"):
         return None
-    return int(mem["MemTotal"] * PIN_BUDGET_FRACTION)
+    from freetoken.moe.pin_probe import remembered
+
+    known = remembered(proc)
+    # only a refusal bounds anything (freetoken.moe.pin_probe)
+    return known.cap_bytes if known else int(mem["MemTotal"] * PIN_BUDGET_FRACTION)
 
 
 @dataclass
@@ -492,7 +503,7 @@ class AutoBankRam:
         if self.pin_cap is not None and self.pin_cap < by_ram:
             text += (
                 f" = the CUDA pin budget {(self.pin_cap + PIN_RESERVE_BYTES) / GiB:.1f} GiB "
-                f"({PIN_BUDGET_FRACTION:.0%} of MemTotal under WSL2, FREETOKEN_PIN_BUDGET_GB overrides) - "
+                f"({_pin_source()}; 'ft doctor pin' measures this host, FREETOKEN_PIN_BUDGET_GB overrides) - "
                 f"{PIN_RESERVE_BYTES / GiB:.1f} GiB for other pinned buffers, since the resident rows are "
                 f"registered with CUDA; RAM alone would allow {by_ram / GiB:.1f} GiB"
             )
@@ -519,12 +530,24 @@ def auto_bank_ram(mem: dict[str, int], ranks: int, proc: str = "/proc") -> AutoB
     ranks = max(1, int(ranks))
     nonbank = NONBANK_PER_RANK_BYTES * ranks
     headroom = max(HEADROOM_MIN_BYTES, int(total * HEADROOM_FRACTION))
-    budget = avail - nonbank - headroom
+    by_ram = avail - nonbank - headroom
     pin = pin_budget_bytes(mem, proc)
-    pin_cap = None if pin is None else pin - PIN_RESERVE_BYTES
-    if pin_cap is not None:
-        budget = min(budget, pin_cap)
+    # max(0, ...): a *measured* cap can be smaller than the reserve itself (1 GiB on Windows 10,
+    # FreeToken-Kai#2), and a negative cap used to reach the message below as a negative size
+    pin_cap = None if pin is None else max(0, pin - PIN_RESERVE_BYTES)
+    budget = by_ram if pin_cap is None else min(by_ram, pin_cap)
     if budget < GiB:
+        if pin_cap is not None and pin_cap < by_ram:
+            # the pin cap is what binds, and freeing memory cannot raise it -- the old message
+            # said "free some memory" to hosts with 22 GiB of it available
+            raise ValueError(
+                f"--moe-bank-ram auto: the CUDA pin budget is {pin / GiB:.2f} GiB, leaving "
+                f"{pin_cap / GiB:.2f} GiB once {PIN_RESERVE_BYTES / GiB:.1f} GiB is kept for the server's "
+                f"other pinned buffers -- too little to size the resident rows from, though RAM alone "
+                f"would allow {by_ram / GiB:.1f} GiB. Freeing memory does not raise this cap "
+                f"({_pin_source(proc)}); pass an explicit size, which maps the banks and page-locks what "
+                f"it can, or serve every expert on the CPU with --moe-cpu-layers 1.0"
+            )
         raise ValueError(
             f"--moe-bank-ram auto: MemAvailable is {avail / GiB:.1f} GiB"
             + (f" and the CUDA pin budget {pin / GiB:.1f} GiB" if pin is not None else "")
