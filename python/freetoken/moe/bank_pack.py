@@ -467,8 +467,18 @@ def pack_checkpoint(model_path: str, out_dir: str, *, config, bank_path: str, li
                 f"its own layers; start the server once with each rank's layers (or --pp-size 1) "
                 f"with --moe-bank-ram so the file is complete"
             )
-        if bank.canonical_for(manifest):
-            raise PackError(f"{bank_path} is already the only copy of the experts of {bank.canonical_for(manifest)}")
+        marked = bank.canonical_for(manifest)
+        if marked and os.path.exists(marked):
+            raise PackError(f"{bank_path} is already the only copy of the experts of {marked}")
+        if marked:
+            # the packed checkpoint the mark protects is gone, so the mark protects nothing and a
+            # pack would otherwise be refused forever with no way to clear it (measured twice on
+            # the same host: guides/39 8.4). One bank backs one packed checkpoint, so a pack that
+            # re-points it would retire that one anyway.
+            log(f"{bank_path} was the only copy of the experts of {marked}, which no longer "
+                f"exists; dropping that mark")
+            bank.set_canonical_for(None)
+            manifest = bank.manifest()
         kernel, cfg = kernel_for(layout)
         kind = QuantKind(layout.meta["kind"])
         weight_map, index_text = _weight_map(folder)

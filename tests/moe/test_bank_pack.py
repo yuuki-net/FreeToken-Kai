@@ -209,6 +209,34 @@ def test_pack_removes_only_what_the_bank_gives_back_and_touches_nothing_else(tmp
             assert manifest["shards"][shard]["sha256"] == hashlib.sha256(f.read()).hexdigest()
 
 
+def test_a_mark_whose_checkpoint_is_still_there_blocks_a_second_pack(tmp_path):
+    """One bank backs one packed checkpoint: packing again would leave the first unservable."""
+    model, _, bank_path, _, _ = _served_nvfp4_bank(tmp_path)
+    pack_checkpoint(model, str(tmp_path / "slim"), config=CONFIG, bank_path=bank_path,
+                    keep_bank=True, log=lambda _m: None)
+    with pytest.raises(PackError, match="already the only copy"):
+        pack_checkpoint(model, str(tmp_path / "slim2"), config=CONFIG, bank_path=bank_path,
+                        keep_bank=True, log=lambda _m: None)
+
+
+def test_a_mark_whose_checkpoint_is_gone_is_dropped_instead_of_blocking_pack(tmp_path):
+    """A --keep-bank pack whose packed checkpoint is later deleted used to refuse every later
+    pack, with no command to clear the mark (hit twice on the same host, guides/39 8.4)."""
+    import shutil
+
+    model, _, bank_path, _, _ = _served_nvfp4_bank(tmp_path)
+    slim = str(tmp_path / "slim")
+    pack_checkpoint(model, slim, config=CONFIG, bank_path=bank_path, keep_bank=True, log=lambda _m: None)
+    shutil.rmtree(slim)
+
+    said = []
+    second = str(tmp_path / "slim2")
+    pack_checkpoint(model, second, config=CONFIG, bank_path=bank_path, keep_bank=True, log=said.append)
+    assert any("no longer exists" in m and "dropping that mark" in m for m in said)
+    with BankFile.open(bank_path) as bank:
+        assert bank.canonical_for() == second  # and the mark now points at the pack that exists
+
+
 def test_a_dry_run_reads_no_tensor_and_writes_nothing(tmp_path, monkeypatch):
     model, _, bank_path, _, _ = _served_nvfp4_bank(tmp_path)
     import freetoken.moe.bank_pack as bp

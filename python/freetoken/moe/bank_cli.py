@@ -78,8 +78,10 @@ def cmd_info(args) -> int:
         _say(f"  committed layers: {_ranges(present)}" + (f"; missing {_ranges(missing)}" if missing else " (complete)"))
         if identity:
             _say(f"  checkpoint order (no placement applied): layers {_ranges(identity)}")
-        if bank.canonical_for(manifest):
-            _say(f"  the only copy of the experts of: {bank.canonical_for(manifest)}")
+        marked = bank.canonical_for(manifest)
+        if marked:
+            gone = "" if os.path.exists(marked) else " -- which no longer exists; the next pack drops the mark"
+            _say(f"  the only copy of the experts of: {marked}{gone}")
         journals = glob.glob(glob.escape(path) + ".journal.L*")
         if journals:
             _say(f"  unfinished reorder journals: {len(journals)} (resolved on the next open for writing)")
