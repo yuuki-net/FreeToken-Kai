@@ -250,6 +250,29 @@ caps decode on a machine like this one -- reading a step's experts from host mem
 costs about 13 ms, more than the GPU spends on everything else. A host that reports far less there
 will be slower whatever the GPU is.
 
+### Where few layers can fetch, fetching can lose
+
+The split above assumes the fetch is available to every layer. It is not on a host whose
+page-lock cap leaves only a couple of layers registered: what the GPU fetches for those layers
+still stalls the step, and there are too few of them for the saving to pay for it. Measured on the
+RTX 2060 6 GB (i7-10750H, WSL2), `gpt-oss-20b`, with the cap forced to 1 GiB
+(`FREETOKEN_PIN_BUDGET_GB=1`, which makes `--moe-cpu-layers auto` put 22 of 24 layers on the CPU
+and leave 2 registered), a fixed 1k prompt and 128 generated tokens, median of the log's
+`gen throughput`:
+
+| `--moe-hybrid-max-fetch` | Decode |
+|---|---|
+| `auto` (default) | 12.64 tok/s |
+| `0` (fetch nothing, every miss on the CPU) | **14.17 tok/s** |
+
+With the cap left alone on the same machine and model -- 23 of 24 layers registered -- the same
+flag loses by more than it won above: 16.78 tok/s with the fetch against about 14 without it.
+
+So it is the ratio that decides, not the flag: the more layers can fetch, the more the fetch is
+worth, and below a handful it costs. `ft mgr`'s benchmark tries `--moe-hybrid-max-fetch 0` as a
+standard candidate when the measured cap covers less than a third of the banks, so a host in that
+state finds this without being told.
+
 ## Running Qwen3.8-Flash-Next on one RTX 3060 (12 GB)
 
 ```bash
