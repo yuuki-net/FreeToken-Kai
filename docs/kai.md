@@ -508,6 +508,14 @@ model that does). Not yet measured on a card.
   of whatever spills out of the resident rows. Where the banks do not fit AND the cap is small,
   residency and registration part company: RAM sizes the resident rows and the cap decides how
   many of the layers the GPU can address, layer by layer, with the rest decoding on the CPU.
+
+  **This cap is a WSL/WDDM quantity. Native Linux has none**, and `pin_budget_bytes` returns
+  nothing there, so residency has always been RAM's decision on that side and the split above
+  changes nothing for it -- a driver that refuses is simply taken at its word, one refusal and
+  the engine stops asking. What a native host can still hit is a driver with no
+  `cudaHostRegisterReadOnly` (measured on an RTX 3060 pair on native Ubuntu with the open kernel
+  module, where both flags fail): nothing registers, every layer decodes on the CPU, and the
+  answer there is the parallel prefill read rather than anything about pinning.
 - Under WSL2 on a full 6 GB card, PyTorch's expandable-segment allocator intermittently died
   with `CUDA driver error: device not ready` when it had to release cached segments while
   other streams were busy. The Turing prefill scratches (MoE dequant chunks, fp8 dequant) are
