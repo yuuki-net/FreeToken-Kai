@@ -69,10 +69,12 @@ def test_a_refusal_records_the_cap_it_measured(monkeypatch, tmp_path):
 
 
 class _Banks:
-    def __init__(self, registered_layers, hot_blocks=144, registered_blocks=144):
+    def __init__(self, registered_layers, hot_blocks=144, registered_blocks=144, layers=24):
         self.registered_layers = set(registered_layers)
         self.hot_blocks = hot_blocks
         self.registered_blocks = registered_blocks
+        self.layers = list(range(layers))
+        self.registered_bytes = registered_blocks << 20
 
     @property
     def fully_registered(self) -> bool:  # mapped_bank's own rule
@@ -96,6 +98,29 @@ def test_the_layers_the_budget_missed_decode_on_the_cpu():
 def test_every_layer_covered_leaves_nothing_on_the_cpu():
     whole = _Tier(_Banks(range(24)))
     assert engine._mapped_cpu_layers(whole, 24) == frozenset()
+
+
+def test_overlap_runs_only_when_every_mapped_layer_is_registered():
+    """3060, 2026-09-23: a pin budget that covered 23 of 24 layers left one LOCKED layer beside
+    the prefill overlap, and set_bank_sources refused the pair at boot. Only "nothing registered"
+    used to turn the overlap off."""
+    assert engine._mapped_overlap_blocker(None) is None  # no --moe-bank-ram at all
+    assert engine._mapped_overlap_blocker(_Tier(_Banks(range(24)))) is None
+    part = engine._mapped_overlap_blocker(_Tier(_Banks(range(23), registered_blocks=138)))
+    assert part and "23 of 24" in part
+    assert "nothing registered" in engine._mapped_overlap_blocker(_Tier(_Banks([], registered_blocks=0)))
+    assert "nothing registered" in engine._mapped_overlap_blocker(_Tier(None))
+
+
+def test_the_draft_head_layer_is_not_a_mapped_layer():
+    """--spec-mtp appends the head's expert layer after the mapped ones, in pinned memory of its
+    own. The engine passes only the mapped count, so a fully covered mapping leaves nothing on
+    the CPU; asked about the appended index it would call it LOCKED -- the boot crash every
+    Flash-Next run with --spec-mtp and --moe-bank-ram hit on its last rank (da98521)."""
+    whole = _Tier(_Banks(range(24)))
+    sources_with_head = 25
+    assert engine._mapped_cpu_layers(whole, sources_with_head - 1) == frozenset()
+    assert engine._mapped_cpu_layers(whole, sources_with_head) == frozenset({24})  # the old call
 
 
 def test_nothing_covered_and_no_mapping():

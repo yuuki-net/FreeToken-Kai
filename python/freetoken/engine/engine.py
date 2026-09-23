@@ -1519,19 +1519,12 @@ class Engine:
         if bank_tier is not None:
             bank_tier.finish()
             banks.sources.update(bank_tier.sources)
-            if config.moe_prefill_overlap and not (
-                bank_tier.banks and bank_tier.banks.registered_bytes
-            ):
-                # Nothing registered: no part of the bank is a legal async DMA source,
-                # so the overlap prefetch cannot run at all. With the prefix registered
-                # it can -- prefetch_prefill_layer sends those rows on the copy stream
-                # and bounces the rest. Decided here rather than in _build_bank_tier so
-                # it keys on what actually got registered, and before --moe-cache-auto
-                # so the VRAM plan sees the right answer.
-                logger.info_rank0(
-                    "--moe-bank-ram: disabling MoE prefill overlap (nothing registered, "
-                    "so no part of a mapped bank is a legal async DMA source)"
-                )
+            blocker = _mapped_overlap_blocker(bank_tier)
+            if config.moe_prefill_overlap and blocker:
+                # Decided here rather than in _build_bank_tier so it keys on what actually got
+                # registered, and before --moe-cache-auto so the VRAM plan sees the right
+                # answer. Per rank, and said by every rank: each registers its own layers.
+                logger.info(f"--moe-bank-ram: disabling MoE prefill overlap ({blocker})")
                 object.__setattr__(config, "moe_prefill_overlap", False)
         self._mtp_bank_layers = self._append_mtp_bank(banks)
         if config.moe_cache_auto:
@@ -1587,7 +1580,13 @@ class Engine:
         )
         # before set_bank_sources: the residency validation and the copy plan's skip of non-pinned layers key on the CPU-layer set
         cache.cpu_layer_ids = cpu_layer_ids
-        mapped_cpu = _mapped_cpu_layers(bank_tier, len(next(iter(banks.sources.values()))))
+        # Only the mapping's own layers: --spec-mtp appends the draft head's expert layer after
+        # them (_append_mtp_bank), in pinned memory of its own. Counted as a mapped layer the
+        # registration never reached, it was labelled LOCKED, which the prefill overlap refuses
+        # -- every Flash-Next boot with --spec-mtp and --moe-bank-ram died there, on the last rank.
+        mapped_cpu = _mapped_cpu_layers(
+            bank_tier, len(next(iter(banks.sources.values()))) - self._mtp_bank_layers
+        )
         mapped_pinned = bank_tier is None or not mapped_cpu
         if bank_tier is not None and mapped_cpu:
             # Nothing the GPU can address: a mapped bank then has no device address it can
@@ -3089,6 +3088,32 @@ def _mapped_cpu_layers(bank_tier, num_layers: int) -> frozenset[int]:
     if covered is None:  # older bank object: fall back to the all-or-nothing answer
         covered = set(range(num_layers)) if banks.fully_registered else set()
     return frozenset(i for i in range(num_layers) if i not in covered)
+
+
+def _mapped_overlap_blocker(bank_tier) -> str | None:
+    """Why the MoE prefill overlap cannot run on this ``--moe-bank-ram`` mapping, or None.
+
+    Nothing registered: no part of the bank is a legal async DMA source. Registered in part --
+    the pin budget ran out before the last layer -- the layers it missed decode on the CPU and
+    are labelled LOCKED, and ``set_bank_sources`` refuses the overlap next to any LOCKED layer.
+    Only "nothing" was handled, so a budget that covered 23 of 24 layers died at boot (the
+    3060, once the budget was split between the ranks). With every layer registered it runs:
+    prefetch_prefill_layer sends the registered prefix on the copy stream and bounces the rest.
+    """
+    if bank_tier is None:
+        return None
+    banks = getattr(bank_tier, "banks", None)
+    if not banks or not banks.registered_bytes:
+        return "nothing registered, so no part of a mapped bank is a legal async DMA source"
+    covered = getattr(banks, "registered_layers", None)
+    layers = getattr(banks, "layers", None)
+    if covered is None or layers is None:  # older bank object: all or nothing
+        return None if banks.fully_registered else "the mapping is registered only in part"
+    missed = len(layers) - len(covered)
+    if missed > 0:
+        return (f"the pin budget covered {len(covered)} of {len(layers)} layers; the rest decode "
+                f"on the CPU, and a LOCKED layer cannot feed the async prefill copy")
+    return None
 
 
 def _pin_budget_bytes(reserved: int = 0) -> int | None:
