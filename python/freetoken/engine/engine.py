@@ -2069,10 +2069,14 @@ class Engine:
                     logits = self.graph_runner.replay(batch, timed=sampling)
                 else:
                     logits = run_forward(self.model.forward, timed=sampling)
-                if sampling:
-                    sampler.collect(rows)
             finally:
                 self.ctx.pp_hidden_in = None
+        if sampling:
+            # After forward_host_ctx has exited, never inside it: its exit is what releases the
+            # forward on Flash-Next's disk PLE (the deferred fill signals the flag the decode
+            # graph waits on). Waiting for the forward before that deadlocked every sampled plain
+            # decode step there -- --spec-mtp 0 and the one-card flash1 profile hung for good.
+            sampler.collect(rows)
         if sg is not None:
             # the rollback reads the GDN stashes recorded at capture (rewritten by the replay)
             self.ctx.spec_stash = sg.stash_timed if sampling else sg.stash

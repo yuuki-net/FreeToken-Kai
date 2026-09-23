@@ -131,3 +131,32 @@ def test_a_captured_forward_times_its_parts_on_every_replay():
     ms = r["ms"]
     assert abs(sum(ms.values()) - r["total_ms"]) < 1e-3
     assert ms["gpu_experts"] > ms["fetch"] > 0 and ms["cpu"] > 0 and ms["other"] > 0
+
+
+def test_the_sampled_step_is_read_after_the_host_context_exits():
+    """3060, 2026-09-23: Flash-Next's disk PLE releases a decode graph from forward_host_ctx's exit
+    (the deferred fill signals the flag the graph waits on). Reading the timed step inside that
+    context waited for a forward that was waiting for the exit: every sampled plain decode step
+    hung for good (--spec-mtp 0, the one-card flash1 profile). The read has to come after it."""
+    import ast
+    import inspect
+    import textwrap
+
+    from freetoken.engine import engine
+
+    tree = ast.parse(textwrap.dedent(inspect.getsource(engine.Engine._forward_batch)))
+
+    def calls(node):
+        return [
+            n for n in ast.walk(node)
+            if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) and n.func.attr == "collect"
+            and isinstance(n.func.value, ast.Name) and n.func.value.id == "sampler"
+        ]
+
+    host = [
+        w for w in ast.walk(tree) if isinstance(w, ast.With)
+        and any("forward_host_ctx" in ast.unparse(item.context_expr) for item in w.items)
+    ]
+    assert len(host) == 1
+    assert not calls(host[0]), "sampler.collect inside forward_host_ctx deadlocks the disk PLE"
+    assert calls(tree), "the sampled step is no longer read at all"
