@@ -68,7 +68,7 @@ which is the point.
 generation at 19 tok/s, the same as on two cards, prompts at 190 tok/s, 128k of context. The automatic plan
 starts on such a card too, but its first long prompt ran at 60 tok/s; the console's
 **Recommended** proposes the faster settings for such a card. See [docs/kai.md](docs/kai.md#running-qwen38-flash-next-on-one-rtx-3060-12-gb) for the
-command, what each flag is for, and why 262k is not offered.
+command, what each flag is for, and how to get 262k (the vision tower moves to the CPU).
 
 **You have two GPUs and upstream will only use one.** See [docs/pipeline.md](docs/pipeline.md).
 `--pp-size 2` needs neither NCCL nor peer access, so it works on consumer boards where P2P is

@@ -309,9 +309,16 @@ the last.
 | `--memory-ratio 0.95` | Nearly all of the card. The card used here had 10.97 GiB free before loading; a card with less free (a display, other programs) may not start |
 | `--moe-strategy hybrid --moe-cpu-layers auto` | As on two cards: 63 GiB of banks against a 41 GiB pin budget under WSL, so 17 head and tail layers decode on the CPU |
 
-**Why not 262k.** It fits (`--num-tokens 270336`: 1.94 GiB of KV), but prompt processing falls to
-72 tok/s, and a 250k-token prompt ended the server with `CUDA driver error: device not ready`:
-at 0.95 the card has no room left for the rest. 128k is the setting to use on one 12 GB card.
+**262k: move the vision tower to the CPU.** Add
+`--mm-encoder-weights cpu --num-tokens 266240 --max-seq-len-override 262144` to the command above.
+With the tower on the CPU the card has 1.81 GiB free after initialisation, a 16k-token prompt still
+reads at 173 tok/s, and a 215,410-token prompt with a code planted in its middle was read in 1,244 s
+(173 tok/s) and answered correctly; generation ran at 15.5-18 tok/s (2026-09-26). The price is image
+input: the tower then encodes on the CPU. With the tower left on the GPU the same 262k allocates
+(1.12 GiB free after initialisation, prompt chunks of 3,328 tokens), but a long prompt ends the server
+with `CUDA driver error: device not ready` (2026-09-19, again on 2026-09-26). The one run with the
+tower on the CPU that stopped, on 2026-09-23, stopped at its first generated token: the decode
+timeline deadlock fixed in `82a8990`, not the context length.
 
 The console's **Recommended** proposes these flags when the model is Qwen3.8-Flash-Next and there
 is one card whose VRAM the non-expert weights nearly fill; with `--num-tokens` set, the benchmark
