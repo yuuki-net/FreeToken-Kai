@@ -9,7 +9,7 @@ how they trade against each other on your card. Now a benchmark in the browser m
 with the model, tries the settings one at a time, and hands you the fastest as a launch profile.
 
 > An unofficial fork of [FlashML-org/FreeToken](https://github.com/FlashML-org/FreeToken), merged
-> with upstream `main` at `cab110e` (2026-09-22). Not affiliated with, endorsed by, or supported by
+> with upstream `main` at `f5b9700` (2026-09-25). Not affiliated with, endorsed by, or supported by
 > FlashML. The license is unchanged (Apache-2.0).
 >
 > **Please keep questions and bug reports about this fork in this repository.** The FreeToken
@@ -29,6 +29,9 @@ with the model, tries the settings one at a time, and hands you the fastest as a
    ```
 
    CUDA kernels are JIT-compiled on first use (CUDA 13 toolkit with `nvcc`, as upstream).
+   After a `git pull` that changes the C++ extensions, rebuild them in place with
+   `python setup.py build_ext --inplace` (venv active). Since `f5b9700` the disk PLE store is
+   `_row_store`, and `--ple-backend disk` does not start until it is built.
 
 2. **Open the console.**
 

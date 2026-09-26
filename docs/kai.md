@@ -1,7 +1,7 @@
 # FreeToken Kai (改)
 
 An unofficial fork of [FlashML-org/FreeToken](https://github.com/FlashML-org/FreeToken),
-merged with upstream `main` at commit `cab110e` (2026-09-22). It is not affiliated with, endorsed
+merged with upstream `main` at commit `f5b9700` (2026-09-25). It is not affiliated with, endorsed
 by, or supported by FlashML. The license is unchanged (Apache-2.0).
 
 The fork adds nine things upstream does not have:
@@ -202,6 +202,12 @@ The build targets the GPU the process is bound to, so on a machine that mixes GP
 builds for the one `--gpu` picks. The first start after an update that changes the build flags
 compiles the kernels again (Ornith on the RTX 2060 took about 10 s longer: two kernels, a few
 seconds each); later starts load them from the cache.
+
+After a `git pull` that changes the C++ extensions, rebuild them in place with
+`python setup.py build_ext --inplace` (venv active). Re-running `uv pip install -e` is not
+enough on its own: uv reuses its cached build unless `pyproject.toml` or `setup.py` changed.
+Upstream `f5b9700` renamed the disk PLE store to `_row_store`; until it is built,
+`--ple-backend disk` (Flash-Next) fails at import. Other backends are not affected.
 
 ## Running Ornith-1.5-35B-A3B on an RTX 2060 (6 GB) under WSL2
 
