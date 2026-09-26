@@ -9,9 +9,11 @@ and the page / slot accounting afterwards is exactly what an in-memory donate le
 
 from __future__ import annotations
 
+import concurrent.futures as cf
 import json
 import os
 import tempfile
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -147,6 +149,33 @@ def _admit(disk, req):
         disk.wait_for_load(1.0)
 
 
+def _hold_reads(rig):
+    """Keep the rig's disk reads from finishing until the returned event is set. Without it a
+    small entry can be read before admit_gate looks at the future (seen on a GPU run: 8 of 40),
+    and the first call restores instead of waiting."""
+    release = threading.Event()
+    real_load = rig.store.load
+
+    def held(entry, expect_ids=None):
+        release.wait(10)
+        return real_load(entry, expect_ids=expect_ids)
+
+    rig.store.load = held
+    return release
+
+
+class _InlineReader:
+    """A reader whose reads are done by the time submit returns."""
+
+    def submit(self, fn, *args):
+        fut = cf.Future()
+        fut.set_result(fn(*args))
+        return fut
+
+    def shutdown(self, wait=True, cancel_futures=False):
+        pass
+
+
 @pytest.mark.parametrize("device", DEVICES)
 @pytest.mark.parametrize("page_size,quant,qsa", [(1, None, False), (4, "q4_0", False), (8, None, True)])
 def test_written_at_idle_and_restored_after_a_restart(tmp_path, page_size, quant, qsa, device):
@@ -165,8 +194,38 @@ def test_written_at_idle_and_restored_after_a_restart(tmp_path, page_size, quant
     b.donate(torch.arange(9000, 9000 + 16 * page_size, dtype=torch.int32))  # shift the free lists
     prompt = torch.cat([ids, torch.tensor([7, 7, 7], dtype=torch.int32)])
     req = _pending(prompt)
+    release = _hold_reads(b)
     assert b.disk.admit_gate(req) is False, "waits while the entry loads"
+    release.set()
     _admit(b.disk, req)
+    n, kv_idx, snap = b.pages_of(prompt[:-1])
+    assert n == 64 and snap is not None
+    _same(_page_bytes(b.kv, kv_idx, page_size), want_kv)
+    _same(_state_bytes(b.lin, snap), want_state)
+    assert b.disk.stats["restored"] == 1
+    b.check_conservation()
+    b.disk.close(wait=True)
+
+
+@pytest.mark.parametrize("device", DEVICES)
+@pytest.mark.parametrize("page_size,quant,qsa", [(1, None, False), (4, "q4_0", False)])
+def test_a_read_done_before_the_first_look_restores_at_once(tmp_path, page_size, quant, qsa, device):
+    """A small entry on a fast disk is read before admit_gate looks at the future: the same
+    call restores it, with the same bytes as the waiting path."""
+    ids = torch.arange(100, 100 + 64, dtype=torch.int32)
+    a = Rig(tmp_path, page_size=page_size, quant=quant, qsa=qsa, device=device)
+    a.fill_random(1)
+    tokens, slot = a.donate(ids)
+    want_kv, want_state = _page_bytes(a.kv, tokens, page_size), _state_bytes(a.lin, slot)
+    a.disk.persist_idle()
+    a.disk.close(wait=True)
+
+    b = Rig(tmp_path, page_size=page_size, quant=quant, qsa=qsa, device=device)
+    b.fill_random(2)
+    b.disk._reader = _InlineReader()
+    prompt = torch.cat([ids, torch.tensor([7, 7, 7], dtype=torch.int32)])
+    assert b.disk.admit_gate(_pending(prompt)) is True
+    assert not b.disk.loading
     n, kv_idx, snap = b.pages_of(prompt[:-1])
     assert n == 64 and snap is not None
     _same(_page_bytes(b.kv, kv_idx, page_size), want_kv)
@@ -363,7 +422,9 @@ def test_the_restore_waits_until_it_is_first_in_a_pass(tmp_path):
 
     b = Rig(tmp_path)
     req = _pending(torch.cat([ids, ids[:1]]))
+    release = _hold_reads(b)
     assert b.disk.admit_gate(req) is False
+    release.set()
     b.disk.wait_for_load(5.0)
     assert b.disk.admit_gate(req, can_restore=False) is False
     assert b.pages_of(ids)[0] == 0
@@ -383,8 +444,11 @@ def test_an_aborted_wait_does_not_leave_a_load_behind(tmp_path):
     a.disk.close(wait=True)
     b = Rig(tmp_path)
     req = _pending(torch.cat([ids, ids[:1]]))
+    release = _hold_reads(b)
     assert b.disk.admit_gate(req) is False
+    assert b.disk.loading
     del req                                   # aborted: nobody asks again
+    release.set()
     b.disk.wait_for_load(5.0)
     b.disk._reader.shutdown(wait=True)
     assert not b.disk.loading
