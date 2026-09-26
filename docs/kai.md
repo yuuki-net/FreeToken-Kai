@@ -525,6 +525,17 @@ model that does). Not yet measured on a card.
   residency and registration part company: RAM sizes the resident rows and the cap decides how
   many of the layers the GPU can address, layer by layer, with the rest decoding on the CPU.
 
+  Registration does not spend the whole budget. The server page-locks more after the banks --
+  the parallel prefill reader's buffers (2 x 8 x 16 MiB by default), two 32 MiB staging buffers
+  and the CPU executor's I/O -- so each rank leaves about 384 MiB of it for them. Spent to the
+  byte, a simulated 1 GiB cap served short prompts and killed the scheduler on the first long one.
+  (The budget is not divided between `--pp-size` ranks: on an RTX 3060 pair that took the last
+  layer or two out of registration, and with them the prefill overlap -- 433 to 298 tok/s.) If the host refuses a
+  registration before the budget runs out (the budget is an estimate, or another process holds
+  part of the quota), the engine unregisters layers from the end until that much is free again
+  and says so in the log; if the staging buffers still cannot be page-locked, whole-layer copies
+  go through pageable memory instead -- slower, not fatal.
+
   **This cap is a WSL/WDDM quantity. Native Linux has none**, and `pin_budget_bytes` returns
   nothing there, so residency has always been RAM's decision on that side and the split above
   changes nothing for it -- a driver that refuses is simply taken at its word, one refusal and
