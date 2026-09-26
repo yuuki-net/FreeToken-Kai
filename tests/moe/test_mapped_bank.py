@@ -251,6 +251,75 @@ def test_a_view_of_a_prefix_registered_block_is_not_pinned(tmp_path, monkeypatch
         banks.close()
 
 
+def test_staging_buffers_the_host_refuses_fall_back_to_the_plain_copy(monkeypatch):
+    """43c: 登録が枠を使い切った後、最初の長いプロンプトでステージングの cudaHostAlloc が
+    断られ、例外がスケジューラまで上がってサーバが落ちた。遅くても正しい普通のコピーに落とし、
+    断られたことは覚えて 2 度目は頼まない。"""
+    if not torch.cuda.is_available():
+        pytest.skip("needs a CUDA device")
+    import freetoken.kernel.pinned as pinned
+    from freetoken.moe.offload_cache import OffloadMoeCache
+
+    asked = []
+
+    def refuse(*shape, dtype):
+        asked.append(shape)
+        raise RuntimeError("cudaHostAlloc: out of memory")
+
+    monkeypatch.setattr(pinned, "alloc_pinned_tensor", refuse)
+    monkeypatch.delenv("FREETOKEN_STAGED_COPY", raising=False)
+
+    class _Stage:
+        _staging = OffloadMoeCache._staging
+        bank_reader = None
+
+    stage = _Stage()
+    src = torch.arange(1 << 20, dtype=torch.int32).view(256, -1)
+    for _ in range(2):
+        dst = torch.empty_like(src, device="cuda")
+        OffloadMoeCache._staged_h2d(stage, dst, src)
+        torch.cuda.synchronize()
+        assert torch.equal(dst.cpu(), src)
+    assert len(asked) == 1  # 1 本目で断られたら、それきり
+
+
+def test_refused_staging_still_copies_a_prefix_registered_block(tmp_path, monkeypatch):
+    """上の縮退を dst.copy_(src) で書いたら、実機で `CUDA error: invalid argument` で落ちた。
+    登録済みの先頭と未登録の残りにまたがる 1 回のコピーをドライバが断る。自前の
+    ページ可能メモリを経由して片ごとに運ぶ。"""
+    import freetoken.kernel.pinned as pinned
+    from freetoken.moe.offload_cache import OffloadMoeCache
+
+    monkeypatch.setenv("FREETOKEN_BANK_MAP", "shared")
+    monkeypatch.setenv("FREETOKEN_STAGED_COPY_MB", "1")  # 1 ブロックを複数の片に分ける
+    src = {"packed": [torch.full((64, 131072), layer + 1, dtype=torch.uint8) for layer in range(2)]}
+    lay = layout_from_sample({"packed": src["packed"][0]}, [0, 1], 64)
+    path = str(tmp_path / "b.ftmb")
+    with BankFile.create(path, lay) as w:
+        for layer in (0, 1):
+            w.write_layer(layer, {"packed": src["packed"][layer]}, list(range(64)))
+    banks = MappedBanks(path, layers=[0, 1], hot_per_layer=16)
+    try:
+        if not banks.fully_registered:
+            pytest.skip("this device registers nothing")
+
+        def refuse(*shape, dtype):
+            raise RuntimeError("cudaHostAlloc: out of memory")
+
+        monkeypatch.setattr(pinned, "alloc_pinned_tensor", refuse)
+
+        class _Stage:
+            _staging = OffloadMoeCache._staging
+            bank_reader = None
+
+        dst = torch.empty((64, 131072), dtype=torch.uint8, device="cuda")
+        OffloadMoeCache._staged_h2d(_Stage(), dst, banks.sources["packed"][0])
+        torch.cuda.synchronize()
+        assert torch.equal(dst.cpu(), src["packed"][0])
+    finally:
+        banks.close()
+
+
 # ----- madvise ranges -------------------------------------------------------------------
 from freetoken.moe.mapped_bank import advise_range  # noqa: E402
 
@@ -378,6 +447,7 @@ class _FakeCudart:
         self.ok = ok
         self.calls = 0
         self.refusals = 0
+        self.unregistered = []
 
     def cudaHostRegister(self, addr, nbytes, flags):
         self.calls += 1
@@ -387,10 +457,11 @@ class _FakeCudart:
         return 2  # any non-zero is a refusal
 
     def cudaHostUnregister(self, addr):  # close() gives the registrations back
+        self.unregistered.append(addr)
         return 0
 
 
-def _registered_bank(monkeypatch, tmp_path, *, ok=10**9, budget=None, hot=4):
+def _registered_bank(monkeypatch, tmp_path, *, ok=10**9, budget=None, hot=4, keep_free=0):
     import torch
 
     from freetoken.moe import mapped_bank as mb
@@ -399,7 +470,7 @@ def _registered_bank(monkeypatch, tmp_path, *, ok=10**9, budget=None, hot=4):
     monkeypatch.setattr(torch.cuda, "cudart", lambda: fake)
     monkeypatch.setattr(mb, "clear_cuda_error", lambda: None)
     _, _placement, _, path = _built(tmp_path, hot=hot)
-    return mb.MappedBanks(path, hot_per_layer=hot, register_budget=budget), fake
+    return mb.MappedBanks(path, hot_per_layer=hot, register_budget=budget, keep_free=keep_free), fake
 
 
 def test_registration_counts_whole_layers_and_stops_at_the_first_refusal(monkeypatch, tmp_path):
@@ -448,6 +519,103 @@ def test_a_budget_stops_at_a_layer_boundary_without_asking(monkeypatch, tmp_path
         assert fake.refusals == 0  # 断られてから気づくのではなく、先に数えて止める
     finally:
         banks.close()
+
+
+def _per_layer(monkeypatch, tmp_path):
+    """(1 層あたりのブロック数, 1 層あたりの登録バイト数) -- 全部登録できる状態で測る。
+
+    shared 形式に固定する: auto は最初に 1 回登録して外す探り（_pick_map_mode）を入れるので、
+    登録と解除の回数が 1 ずつずれ、端数の層を狙って作れない。"""
+    monkeypatch.setenv("FREETOKEN_BANK_MAP", "shared")
+    banks, _ = _registered_bank(monkeypatch, tmp_path)
+    try:
+        return len(banks.layout.banks), banks.registered_bytes // 3
+    finally:
+        banks.close()
+
+
+def test_a_refusal_unregisters_the_layer_it_left_short(monkeypatch, tmp_path):
+    """43c: 断られた層の登録済みブロックは GPU が使わない（層単位でしか数えない）のに枠だけ
+    食っていた。返せば、その分は後から固定するもの（読み込み・ステージング）に回る。"""
+    blocks, _ = _per_layer(monkeypatch, tmp_path)
+    banks, fake = _registered_bank(monkeypatch, tmp_path, ok=2 * blocks + 1)
+    try:
+        assert banks.registered_layers == {0, 1}
+        assert banks.registered_blocks == 2 * blocks  # 層 2 の 1 ブロックは外した
+        assert len(fake.unregistered) == 1
+        assert banks.given_back_layers == 0  # keep_free=0 なので揃った層は返さない
+    finally:
+        banks.close()
+
+
+def test_a_refusal_gives_back_whole_layers_until_keep_free_is_free(monkeypatch, tmp_path):
+    """見積もりの予算より手前で断られたら、枠は使い切られている。そのままだと最初の長い
+    プロンプトでステージングの cudaHostAlloc が断られてスケジューラが落ちた（偽の 1 GiB 上限で
+    実測）。後ろの層から keep_free 分を返す。返した層は CPU でデコードされる。"""
+    blocks, layer_bytes = _per_layer(monkeypatch, tmp_path)
+    banks, fake = _registered_bank(monkeypatch, tmp_path, ok=2 * blocks + 1, keep_free=layer_bytes)
+    try:
+        # 層 2 の端数（1 ブロック）では足りないので層 1 も返す
+        assert banks.registered_layers == {0}
+        assert banks.registered_bytes == layer_bytes
+        assert banks.given_back_layers == 1
+        assert banks.given_back_bytes >= layer_bytes
+        assert len(fake.unregistered) == 1 + blocks
+        assert banks.refused
+    finally:
+        banks.close()
+
+
+def test_the_budget_stopping_first_gives_nothing_back(monkeypatch, tmp_path):
+    """予算で止まったのなら断られていない: 予約は予算の側で既に引いてあるので返さない。"""
+    blocks, layer_bytes = _per_layer(monkeypatch, tmp_path)
+    banks, fake = _registered_bank(monkeypatch, tmp_path, budget=2 * layer_bytes,
+                                   keep_free=10 * layer_bytes)
+    try:
+        assert banks.registered_layers == {0, 1}
+        assert not banks.refused and banks.given_back_bytes == 0
+        assert fake.unregistered == []
+    finally:
+        banks.close()
+
+
+def test_the_registrations_count_in_the_process_total(monkeypatch, tmp_path):
+    """43c: host_banks.registered_bytes() はプロセス全体の固定量として PinFailed の文面と
+    記憶する上限（remember）に使われるのに、マッピングの登録が入っていなかった。後から
+    バンクが断られると、その分だけ小さい上限が記憶された。"""
+    from freetoken.moe import host_banks
+
+    base = host_banks.registered_bytes()
+    blocks, _ = _per_layer(monkeypatch, tmp_path)
+    assert host_banks.registered_bytes() == base  # close() で戻る
+    banks, _ = _registered_bank(monkeypatch, tmp_path, ok=2 * blocks + 1)
+    try:
+        assert host_banks.registered_bytes() - base == banks.registered_bytes  # 返した分も引く
+    finally:
+        banks.close()
+    assert host_banks.registered_bytes() == base
+
+
+def test_what_is_left_for_after_the_banks(monkeypatch):
+    """登録予算から外す量 = 並列読み込み（2 組 x スレッド x 片）+ ステージング 2 本 + 余裕。
+    どちらも切れば余裕だけ。"""
+    from freetoken.moe import mapped_bank as mb
+    from freetoken.moe.bank_reader import ALIGN
+
+    for name in ("FREETOKEN_BANK_PREAD", "FREETOKEN_BANK_READ_THREADS",
+                 "FREETOKEN_BANK_READ_PIECE_MB", "FREETOKEN_STAGED_COPY", "FREETOKEN_STAGED_COPY_MB"):
+        monkeypatch.delenv(name, raising=False)
+    assert mb.pinned_after_banks() == (
+        2 * 8 * ((16 << 20) + 3 * ALIGN) + 2 * (32 << 20) + mb.PIN_AFTER_BANKS_MARGIN
+    )
+    monkeypatch.setenv("FREETOKEN_BANK_READ_THREADS", "4")
+    monkeypatch.setenv("FREETOKEN_STAGED_COPY_MB", "8")
+    assert mb.pinned_after_banks() == (
+        2 * 4 * ((16 << 20) + 3 * ALIGN) + 2 * (8 << 20) + mb.PIN_AFTER_BANKS_MARGIN
+    )
+    monkeypatch.setenv("FREETOKEN_BANK_PREAD", "0")
+    monkeypatch.setenv("FREETOKEN_STAGED_COPY", "0")
+    assert mb.pinned_after_banks() == mb.PIN_AFTER_BANKS_MARGIN
 
 
 def test_nothing_registered_falls_back_to_the_cpu_for_every_miss(tmp_path):
@@ -513,7 +681,7 @@ def _bare_bank(libc=None, private=False):
     bank._map = _mmap.mmap(-1, 1 << 20)  # a real mapping: _settle advises it before locking
     bank.locked_bytes = bank.requested_bytes = bank.registered_bytes = 0
     bank.lock_errno = 0
-    bank._registered = []
+    bank._layer_regs, bank._pos = {}, 0
     bank.hot_blocks = bank.registered_blocks = 0
     bank.private = private
     bank._buf = torch.frombuffer(bank._map, dtype=torch.uint8) if private else None

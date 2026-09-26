@@ -48,6 +48,7 @@ import torch
 from freetoken.utils.prefill_profile import major_faults as _major_faults
 
 ALIGN = 4096
+READ_SETS = 2
 
 
 def _env_int(name: str, default: int) -> int:
@@ -65,7 +66,7 @@ class DirectRangeReader:
     can be refilled while the device still drains the previous one.
     """
 
-    def __init__(self, path: str, *, threads: int = 8, piece_bytes: int = 16 << 20, sets: int = 2,
+    def __init__(self, path: str, *, threads: int = 8, piece_bytes: int = 16 << 20, sets: int = READ_SETS,
                  alloc: Callable[[int], torch.Tensor] | None = None, direct: bool = True) -> None:
         self.path = path
         self.threads = max(1, threads)
@@ -162,6 +163,16 @@ def read_mode(value: str | None) -> str | None:
     if v in ("0", "off", "no", "false"):
         return None
     return "direct" if v == "direct" else "buffered"
+
+
+def pinned_bytes() -> int:
+    """Page-locked bytes the BankReader takes as configured, 0 when ``FREETOKEN_BANK_PREAD`` turns it
+    off: what the pin budget has to leave for it (mapped_bank.pinned_after_banks)."""
+    if read_mode(os.environ.get("FREETOKEN_BANK_PREAD")) is None:
+        return 0
+    threads = _env_int("FREETOKEN_BANK_READ_THREADS", 8)
+    piece = max(ALIGN, (_env_int("FREETOKEN_BANK_READ_PIECE_MB", 16) << 20) // ALIGN * ALIGN)
+    return READ_SETS * threads * (piece + 3 * ALIGN)  # DirectRangeReader: a piece + 3 pages each
 
 
 class BankReader:

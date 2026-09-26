@@ -2792,9 +2792,12 @@ class Engine:
         # resident rows save the CPU executor a disk read whether or not the GPU can
         # address them). FreeToken-Kai#2: asking for the whole residency stopped partway
         # and left the run with no usable layer at all.
+        # Less what is page-locked already: the PLE table, and the --spec-mtp head's expert
+        # bank, quantized into pinned memory before this and appended to the cache after it.
+        mtp_head = sum(t.nbytes for t in (getattr(self, "_mtp_bank_host", None) or {}).values())
         return build_tier(
             config, method, pp=try_get_pp_info(), log=logger.info, warn=logger.warning,
-            register_budget=_pin_budget_bytes(self._host_tables_bytes),
+            register_budget=_pin_budget_bytes(self._host_tables_bytes + mtp_head),
         )
 
     def write_moe_stats_idle(self) -> None:

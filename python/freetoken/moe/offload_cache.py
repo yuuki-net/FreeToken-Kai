@@ -87,6 +87,20 @@ _BANK_SCHEMAS: dict[str, tuple[str, ...]] = {
 from freetoken.kernel.aot_models import fp8_block_scale_pad
 
 
+def _staged_copy_off() -> bool:
+    return os.environ.get("FREETOKEN_STAGED_COPY") == "0"
+
+
+def _staging_piece_bytes() -> int:
+    return max(1, int(os.environ.get("FREETOKEN_STAGED_COPY_MB", "32") or 32)) << 20
+
+
+def staging_bytes() -> int:
+    """Page-locked bytes of the two staging buffers (``OffloadMoeCache._staging``), 0 when
+    ``FREETOKEN_STAGED_COPY=0`` does without them: what the pin budget has to leave for them."""
+    return 0 if _staged_copy_off() else 2 * _staging_piece_bytes()
+
+
 # bytes per (expert, layer) as f(hidden, moe_intermediate), from the bank shapes above; keep in sync with _BANK_SCHEMAS
 # keyed by the config-time format tag (expert_quant / moe_weight_format), not quant_format: "mxfp4" sizes the mxfp4_triton banks, "nvfp4" also covers its repacked variants
 _BANK_BYTES_PER_EXPERT = {
@@ -1088,17 +1102,29 @@ class OffloadMoeCache:
     # ----- non-pinned layers: staged whole-layer copy -------------------------------------
     def _staging(self):
         """Two pinned staging buffers (``FREETOKEN_STAGED_COPY_MB`` each, default 32) and their
-        DMA-done events, allocated on first use."""
+        DMA-done events, allocated on first use -- or None when the host would not page-lock them.
+
+        That happens where page-locking is capped (WSL) and the cap is spent: the first long
+        prompt used to die here, in the scheduler, with the registration that spent it long
+        done (43c). A pageable bounce is slower but correct, so it is what the layer gets."""
         st = getattr(self, "_stage", None)
         if st is None:
             from freetoken.kernel.pinned import alloc_pinned_tensor
 
-            mb = int(os.environ.get("FREETOKEN_STAGED_COPY_MB", "32") or 32)
-            size = max(1, mb) << 20
-            bufs = [alloc_pinned_tensor(size, dtype=torch.uint8) for _ in range(2)]
+            size = _staging_piece_bytes()
+            try:
+                bufs = [alloc_pinned_tensor(size, dtype=torch.uint8) for _ in range(2)]
+            except RuntimeError as exc:
+                logger.warning(
+                    f"prefill staging buffers could not be page-locked ({exc}); whole-layer "
+                    f"copies of the unpinned rows go through pageable memory instead, which is "
+                    f"slower. The host's page-lock budget is spent -- `ft doctor pin` measures it"
+                )
+                self._stage = False
+                return None
             events = [torch.cuda.Event() for _ in range(2)]
             st = self._stage = (bufs, events, size)
-        return st
+        return st or None
 
     def _staged_h2d(self, dst: torch.Tensor, src: torch.Tensor) -> None:
         """Host -> device copy of a whole bank layer that lives in non-pinned (LOCKED or
@@ -1111,7 +1137,7 @@ class OffloadMoeCache:
         if (
             dst.device.type != "cuda"
             or src.is_pinned()
-            or os.environ.get("FREETOKEN_STAGED_COPY") == "0"
+            or _staged_copy_off()
         ):
             dst.copy_(src)
             return
@@ -1121,7 +1147,20 @@ class OffloadMoeCache:
         d = dst.reshape(-1).view(torch.uint8)
         s = src.reshape(-1).view(torch.uint8)
         assert d.numel() == s.numel(), (dst.shape, src.shape, dst.dtype, src.dtype)
-        bufs, events, size = self._staging()
+        st = self._staging()
+        if st is None:
+            # Not dst.copy_(src): the source can be a prefix-registered block, and one copy over
+            # registered and unregistered pages at once is refused -- "CUDA error: invalid
+            # argument" (43c, measured). Pieces through pageable memory of its own instead.
+            bounce = getattr(self, "_stage_bounce", None)
+            if bounce is None:
+                bounce = self._stage_bounce = torch.empty(_staging_piece_bytes(), dtype=torch.uint8)
+            for off in range(0, d.numel(), bounce.numel()):
+                m = min(bounce.numel(), d.numel() - off)
+                bounce[:m].copy_(s[off : off + m])
+                d[off : off + m].copy_(bounce[:m])  # pageable: returns once the bounce is read
+            return
+        bufs, events, size = st
         stream = torch.cuda.current_stream(dst.device)
         n = d.numel()
         off = 0

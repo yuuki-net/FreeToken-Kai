@@ -40,6 +40,33 @@ import warnings
 
 from freetoken.utils.torch_utils import clear_cuda_error
 
+# What the server page-locks after the banks besides the reader and the staging buffers: the CPU
+# executor's I/O (one set per batch shape it has seen -- decode widths and the 64-row prefill
+# piece) and the scheduler's small pinned tensors. On gpt-oss-20b 32 MiB was page-locked between
+# the registration and the reader (a fake-cap run's running total); doubled.
+PIN_AFTER_BANKS_MARGIN = 64 << 20
+
+
+def pinned_after_banks() -> int:
+    """Bytes this server page-locks after the mapped banks are registered.
+
+    The registration runs first and a host-wide cap counts both, so a budget spent on the banks
+    left the prefill reader and the staging buffers to be refused -- the reader falls back to page
+    faults, the staging buffers took the scheduler down on the first long prompt (43c)."""
+    from freetoken.moe.bank_reader import pinned_bytes
+    from freetoken.moe.offload_cache import staging_bytes
+
+    return pinned_bytes() + staging_bytes() + PIN_AFTER_BANKS_MARGIN
+
+
+def _count_pinned(nbytes: int) -> None:
+    """Add to the process-wide page-locked total (host_banks.registered_bytes), which a
+    PinFailed message and the remembered cap read. The mapping's registrations were missing from
+    it, so a bank refused after them was remembered as a cap that much too small."""
+    from freetoken.moe.host_banks import _count_pinned as count
+
+    count(nbytes)
+
 from .bank_file import (  # noqa: F401  (re-exported: the on-disk format lives in bank_file)
     ALIGN,
     BankFile,
@@ -120,7 +147,7 @@ class MappedBanks:
     """
 
     def __init__(self, path: str, register: bool = True, layers=None, hot_per_layer: int | None = None,
-                 register_budget: int | None = None):
+                 register_budget: int | None = None, keep_free: int = 0):
         import torch
 
         # FREETOKEN_BANK_REGISTER: prefix (default) registers only the locked rows; "all"
@@ -183,7 +210,15 @@ class MappedBanks:
             self._fd, map_end - self._map_offset, offset=self._map_offset,
             access=mmap.ACCESS_COPY if self.private else mmap.ACCESS_READ,
         )
-        self._registered: list[int] = []
+        # position -> (address, bytes) of every block of that layer that registered
+        self._layer_regs: dict[int, list[tuple[int, int]]] = {}
+        self._pos = -1  # the layer _settle is registering for
+        # Bytes to hand back if the host refuses a registration: the server page-locks this much
+        # more after the banks (pinned_after_banks), and a refusal means nothing is left for it.
+        self.keep_free = max(0, int(keep_free))
+        self.refused = False  # a registration was refused (not stopped by the budget)
+        self.given_back_bytes = 0
+        self.given_back_layers = 0
         # Bytes registration may spend (the CUDA pin budget), or None for as much as it takes.
         # Residency is a RAM decision and is NOT capped by this: the resident rows earn their
         # keep on the CPU executor too, which reads the mapping directly (FreeToken-Kai#2).
@@ -276,6 +311,7 @@ class MappedBanks:
                     registering = False
                     self._register_stopped = True
             before, blocks = self.registered_blocks, 0
+            self._pos = pos
             for name, row_shape, dtype_name, row_bytes in self.layout.banks:
                 dtype = _dtype_of(dtype_name)
                 off = self.layout.offset_of(name, layer)
@@ -299,12 +335,15 @@ class MappedBanks:
                     # Every refused attempt also has to clear the CUDA error slot.
                     registering = False
                     self._register_stopped = True
+                    self.refused = True
                 self._advise(hint, rel, span, len(self._map))
                 if preload:
                     self._touch(buf, rel, span)
                 blocks += 1
             if registering and blocks and self.registered_blocks - before == blocks:
                 self.registered_layers.add(pos)
+        if self.refused:
+            self._give_back()
         self.sources = views
         self.cold_spans.sort()
         self.settle_seconds = time.perf_counter() - started
@@ -510,9 +549,44 @@ class MappedBanks:
             if int(cudart.cudaHostRegister(addr, nbytes, flags)) == 0:
                 self.registered_bytes += nbytes
                 self.registered_blocks += 1
-                self._registered.append(addr)
+                self._layer_regs.setdefault(self._pos, []).append((addr, nbytes))
+                _count_pinned(nbytes)
                 return
             clear_cuda_error()
+
+    def _give_back(self) -> None:
+        """After a refusal: unregister what the GPU cannot use, then ``keep_free`` bytes more.
+
+        A refusal means the host-wide page-lock quota is spent -- the budget was an estimate,
+        or another process took its share -- and the server still page-locks after the banks:
+        the parallel prefill reader, the staging buffers, the CPU executor's I/O
+        (:func:`pinned_after_banks`). Left with nothing, the first long prompt died in the
+        staging buffers' cudaHostAlloc (43c, measured under a fake 1 GiB cap). So the refused
+        layer's blocks go first -- no layer short of a block is addressed by the GPU, so they
+        only held quota -- then whole layers from the end until ``keep_free`` is free again.
+        The layers given back decode on the CPU like any other uncovered layer."""
+        import torch
+
+        cudart = torch.cuda.cudart()
+        freed = 0
+
+        def drop(pos: int) -> None:
+            nonlocal freed
+            for addr, nbytes in self._layer_regs.pop(pos, ()):
+                cudart.cudaHostUnregister(addr)
+                self.registered_bytes -= nbytes
+                self.registered_blocks -= 1
+                _count_pinned(-nbytes)
+                freed += nbytes
+
+        for pos in [p for p in self._layer_regs if p not in self.registered_layers]:
+            drop(pos)
+        while freed < self.keep_free and self.registered_layers:
+            pos = max(self.registered_layers)
+            self.registered_layers.discard(pos)
+            drop(pos)
+            self.given_back_layers += 1
+        self.given_back_bytes = freed
 
     def cold_residency(self) -> float:
         """Share of the file-backed rows the page cache holds right now (1.0 when there are none).
@@ -574,9 +648,11 @@ class MappedBanks:
     def close(self) -> None:
         import torch
 
-        for addr in self._registered:
-            torch.cuda.cudart().cudaHostUnregister(addr)
-        self._registered.clear()
+        for regs in self._layer_regs.values():
+            for addr, nbytes in regs:
+                torch.cuda.cudart().cudaHostUnregister(addr)
+                _count_pinned(-nbytes)
+        self._layer_regs.clear()
         self.sources.clear()
         os.close(self._fd)
 
@@ -834,8 +910,17 @@ class MappedTier:
         # next start. It also means the settle already reads with the window decode will use.
         self._apply_readahead()
         self.log("--moe-bank-ram: faulting in and locking the resident rows")
-        self.banks = MappedBanks(self.path, layers=self.layers, hot_per_layer=self.hot_per_layer,
-                                 register_budget=self.register_budget)
+        # The budget is the host's; the registration may not spend what the server page-locks
+        # after it (43c: spent to the byte, the staging buffers were refused on the first long
+        # prompt and the scheduler died). And if the host refuses before the budget runs out,
+        # the banks give that much back.
+        after = pinned_after_banks()
+        self.banks = MappedBanks(
+            self.path, layers=self.layers, hot_per_layer=self.hot_per_layer,
+            register_budget=None if self.register_budget is None
+            else max(0, self.register_budget - after),
+            keep_free=after,
+        )
         b = self.banks
         if b.probe_refused:
             self.log(
@@ -860,7 +945,20 @@ class MappedTier:
                 f"{len(b.layers)} layers ({b.registered_blocks} of {b.hot_blocks} resident "
                 f"blocks); those layers fetch over PCIe as usual and the rest decode on the "
                 f"CPU executor -- their resident rows still save the disk read. "
+                f"{after / 2**20:.0f} MiB of the budget is left for what the server page-locks "
+                f"after the banks. "
                 f"`ft doctor pin` measures this host; FREETOKEN_BANK_REGISTER=none stops asking"
+            )
+        # a refusal of the very first block is a device that takes neither flag (_settle), not a quota
+        if b.refused and (b.registered_bytes or b.given_back_bytes):
+            self.warn(
+                f"--moe-bank-ram: the host refused a registration before the pin budget ran out "
+                f"(the budget is an estimate, or another process holds part of the host-wide "
+                f"quota); gave back {b.given_back_bytes / 2**20:.0f} MiB"
+                + (f" ({b.given_back_layers} layer{'s' if b.given_back_layers != 1 else ''})"
+                   if b.given_back_layers else "")
+                + " so the prefill reader and the staging buffers can still be page-locked. "
+                f"`ft doctor pin` measures this host"
             )
         if b.lock_errno and not b.fully_registered:
             import resource
