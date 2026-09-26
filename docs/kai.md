@@ -1,7 +1,7 @@
 # FreeToken Kai (改)
 
 An unofficial fork of [FlashML-org/FreeToken](https://github.com/FlashML-org/FreeToken),
-merged with upstream `main` at commit `f5b9700` (2026-09-25). It is not affiliated with, endorsed
+merged with upstream `main` at commit `0d652e7` (2026-09-26). It is not affiliated with, endorsed
 by, or supported by FlashML. The license is unchanged (Apache-2.0).
 
 The fork adds nine things upstream does not have:
@@ -444,6 +444,16 @@ model that does). Not yet measured on a card.
 
 ## Known limitations
 
+- AMD GPUs (ROCm) are not supported yet. Upstream `0d652e7`
+  ([#132](https://github.com/FlashML-org/FreeToken/pull/132)) added only the build foundation;
+  upstream calls it experimental and a work in progress ([install_amd.md](install_amd.md), and the
+  roadmap in [upstream issue #541](https://github.com/FlashML-org/FreeToken/issues/541)). Routing
+  ROCm away from NVIDIA-only kernels ([#134](https://github.com/FlashML-org/FreeToken/pull/134))
+  and CPU/hybrid MoE graph safety on ROCm
+  ([#378](https://github.com/FlashML-org/FreeToken/pull/378), which fixes a reported risk of
+  silently wrong output) are still open upstream. This fork's own additions (the Turing paths, the
+  bank mapping, `--pp-size`, `--spec-mtp`) were written and tested for CUDA only, and none of this
+  fork has been run on an AMD GPU.
 - Video is not covered.
 - Token log probabilities are not available. `/v1/chat/completions` and `/v1/completions`
   answer a request for `logprobs` / `top_logprobs` with a 400 rather than a response without

@@ -9,7 +9,7 @@ how they trade against each other on your card. Now a benchmark in the browser m
 with the model, tries the settings one at a time, and hands you the fastest as a launch profile.
 
 > An unofficial fork of [FlashML-org/FreeToken](https://github.com/FlashML-org/FreeToken), merged
-> with upstream `main` at `f5b9700` (2026-09-25). Not affiliated with, endorsed by, or supported by
+> with upstream `main` at `0d652e7` (2026-09-26). Not affiliated with, endorsed by, or supported by
 > FlashML. The license is unchanged (Apache-2.0).
 >
 > **Please keep questions and bug reports about this fork in this repository.** The FreeToken
@@ -91,6 +91,13 @@ Upstream's vision tower lives on the GPU; `--mm-encoder-weights cpu` keeps it of
 **You are on Ampere or newer.** Nothing here is taken away from you: every Turing change is behind
 a compute-capability check, and the layer split, the bank mapping, image input, `--spec-mtp` and
 `--host-embedding` are architecture-independent. See the "Ampere and newer" section of
+[docs/kai.md](docs/kai.md).
+
+**You have an AMD Radeon card (RDNA 3 / RDNA 4).** Not yet. Upstream `0d652e7` added the ROCm build
+foundation and this fork carries it, but upstream calls AMD support experimental and a work in
+progress. Keeping ROCm away from NVIDIA-only kernels, and making the CPU/hybrid MoE graphs safe on
+ROCm (which fixes a reported risk of silently wrong output), are still open upstream pull requests,
+and nothing in this fork has been run on an AMD GPU. See the "Known limitations" section of
 [docs/kai.md](docs/kai.md).
 
 ## The web console
