@@ -47,6 +47,8 @@ def test_short_extend_is_computed_in_pieces(monkeypatch):
 
 
 def test_dispatch_threshold_and_disable(monkeypatch):
+    # the paths the split prefill falls back to (tests/moe/test_prefill_split.py covers the split)
+    monkeypatch.setenv("FREETOKEN_PREFILL_SPLIT", "0")
     ex = _FakeExecutor(piece=64)
     layer = _layer(ex)
     monkeypatch.setattr(layer, "_prefill_on_cpu", lambda *a: "cpu")

@@ -429,7 +429,8 @@ model that does). Not yet measured on a card.
 | `FREETOKEN_NVFP4_MOE_SCRATCH` | arch (on below Ampere) | NVFP4 prefill MoE as chunked dequant + per-expert cuBLAS instead of the inline-dequant kernel |
 | `FREETOKEN_NVFP4_MOE_ARITH` | arch (on up to Ampere) | Arithmetic (gather-free) e2m1 dequant in the prefill MoE kernel; bit-identical, speed knob only |
 | `FREETOKEN_ATTN_SCRATCH` / `FREETOKEN_ATTN_SCRATCH_MB` / `FREETOKEN_ATTN_SCRATCH_MIN_ROWS` | arch (on below Ampere) / `48` / `1` | Prefill attention as gather + cuBLAS instead of the fused extend kernel; the query tile's scratch budget; the shortest extend that takes it (`docs/turing.md` §7) |
-| `FREETOKEN_CPU_PREFILL_MAX_TOKENS` | `256` | Prefill extends up to this many rows compute their routed experts on the CPU executor (offload/hybrid) instead of streaming every layer's bank; `0` disables |
+| `FREETOKEN_CPU_PREFILL_MAX_TOKENS` | `256` | Prefill extends up to this many rows that do not split (below) compute their routed experts on the CPU executor (offload/hybrid) instead of streaming every layer's bank; `0` disables |
+| `FREETOKEN_PREFILL_SPLIT` / `FREETOKEN_PREFILL_SPLIT_MAX_TOKENS` / `FREETOKEN_PREFILL_SPLIT_RATIO` | on / `1024` / `4` | Split prefill (offload/hybrid, layers whose banks are pinned, 64 rows and up): the experts a forward routes to least are computed by the CPU executor while only the rest are moved to the GPU, at the same time. The ratio is what moving one expert costs in CPU routes; the cut is where both sides finish together. On two RTX 3060s (Flash-Next) the first token of a fresh 270-token prompt came after 3.0 s instead of 8.4 s (64 tokens: 2.1 s instead of 5.6; 1024: 6.8 instead of 8.0). `0` turns it off |
 | `FREETOKEN_STAGED_COPY` / `FREETOKEN_STAGED_COPY_MB` | on / `32` | Whole-layer prefill copies of non-pinned bank layers go through two pinned staging buffers of this size |
 | `FREETOKEN_BANK_PREAD` | `buffered` | With `--moe-bank-ram`: how a prefill chunk reads the non-resident rows. `buffered` reads them from the file on several threads through the page cache; `direct` with `O_DIRECT` (about 5% more prefill where the page cache is far short of the rows; where it nearly holds them, decode loses the rows a prefill would have cached, -15% measured); `0` faults them in through the mapping as before |
 | `FREETOKEN_BANK_READ_THREADS` / `FREETOKEN_BANK_READ_PIECE_MB` | `8` / `16` | Threads and piece size of those reads (two sets of pinned buffers of this many pieces) |
@@ -470,11 +471,16 @@ model that does). Not yet measured on a card.
 - `--pp-size`: the ranks run in sequence, so two cards are never faster than one card that
   holds everything; every rank needs one layer of each attention kind; the runtime cache
   rebuild (`ft ctl`) is not available with more than one rank. See [pipeline.md](pipeline.md).
-- On Turing, use `--dtype float16`. A long prefill chunk costs ~5 s of expert streaming on the
-  2060 under WSL (every layer's bank crosses PCIe at ~3.4 GB/s) plus ~1.3 ms per token; extends
-  of up to `FREETOKEN_CPU_PREFILL_MAX_TOKENS` (256) rows -- a chat turn behind a cached prefix
-  -- skip the streaming and compute their experts on the CPU executor instead (a follow-up
-  turn answers in 2-3 s including 64 generated tokens, against ~6 s before).
+- On Turing, use `--dtype float16`. A long prefill chunk moves every layer's experts to the GPU:
+  ~2 s for Ornith's 40 layers on the 2060 under WSL (9.4 GB/s, measured 2026-09-27; it was ~5 s
+  when this was first written) plus ~1.3 ms per token. A chat turn behind a cached prefix is
+  short, so that movement is most of it. Extends of 64 to 1024 rows split each layer instead:
+  the CPU executor computes the experts that few rows use while the GPU receives only the
+  others, at once. Per layer, against what ran before (the production layer at Ornith's
+  geometry with real routing, no model): 64 rows 0.78x, 128 0.63x, 256 0.51x, 512 0.64x.
+  Layers whose banks could not be pinned, and extends under 64 rows, keep the CPU path up to
+  `FREETOKEN_CPU_PREFILL_MAX_TOKENS` (256) rows (a follow-up turn answers in 2-3 s including
+  64 generated tokens, against ~6 s before it).
 - **safetensors 0.8.0 keeps page-locked host memory when it reads straight onto the GPU.**
   Measured on gpt-oss-20b (13,123 MB in three shards, every handle held open the way the loader
   holds them): the process ends 2,492 MB above the same read staged through host memory, and

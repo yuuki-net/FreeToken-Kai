@@ -994,6 +994,35 @@ class OffloadMoeCache:
         self._pending_whole_layer = True
         materialize_layer(self, layer_id)
 
+    def materialize_experts(self, layer_id: int, experts: torch.Tensor, experts_host: list[int]) -> None:
+        """``materialize_layer`` + ``copy_missing`` for part of a layer: only ``experts`` (sorted
+        layer-local ids on the device; ``experts_host`` is the same list on the host) are moved,
+        into slots ``[0, num_experts)`` with position == expert id, the layout the full-layer
+        prefill GEMM reads. The positions of the experts left out are unmapped, so a later decode
+        misses on them instead of reading whatever those slots held. Used by the split prefill
+        (``OffloadMoELayer._prefill_split``), whose CPU executor computes the rest. The layer's
+        host banks must be device-addressable (the scattered rows are gathered by the GPU)."""
+        from freetoken.moe.offload_kernels import materialize_layer
+
+        assert self.prefix_pinned_rows is None, "a mapped bank's prefill streams the whole layer"
+        assert layer_id not in self._unpinned_layers, "an unpinned layer's prefill stages the whole layer"
+        materialize_layer(self, layer_id)  # maps every expert of the layer to slot == id
+        E = self.num_experts
+        drop = torch.ones(E, dtype=torch.bool, device=self.device)
+        drop[experts.long()] = False
+        self.slot_for_id[layer_id].masked_fill_(drop, -1)
+        self.id_of_slot[:E].masked_fill_(drop, -1)
+        self.usage[:E].masked_fill_(drop, 0)
+        m = len(experts_host)
+        if m == 0:
+            return
+        self.evict_slots[:m].copy_(experts)
+        self.src_indices[:m].copy_(experts)
+        self.num_indices.fill_(m)
+        self._pending_src_layer = layer_id
+        self._pending_whole_layer = False
+        self.copy_missing()
+
     def reset(self) -> None:
         from freetoken.moe.offload_kernels import reset_cache
 

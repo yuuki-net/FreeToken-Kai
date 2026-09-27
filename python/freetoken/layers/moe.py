@@ -420,6 +420,12 @@ class OffloadMoELayer(MoELayer):
         cache = self.offload_cache
         assert cache is not None
         apply_permutation(topk_ids, self.expert_perm)
+        if (
+            PREFILL_SPLIT_MIN_TOKENS <= hidden_states.shape[0] <= prefill_split_max_tokens(cache)
+            and not self.apply_router_weight_on_input
+            and not cache.is_unpinned_layer(self.layer_id)
+        ):
+            return self._prefill_split(cache, hidden_states, topk_weights, topk_ids)
         # short extends take the CPU executor whether or not the overlap double buffer is on:
         # the decision is per forward (every layer sees the same row count), so a forward that
         # goes this way never touches the overlap machinery
@@ -456,6 +462,65 @@ class OffloadMoELayer(MoELayer):
             alphas=cache.alphas_for_layer(self.layer_id),
             is_prefill=True,
         )
+
+    def _prefill_split(
+        self,
+        cache: OffloadMoeCache,
+        hidden_states: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        """Prefill with the CPU and the GPU at once. The CPU executor's cost grows with the rows
+        routed to an expert, moving an expert to the GPU costs the same however many rows use
+        it: the experts this forward routes to least go to the CPU, the rest are the only ones
+        moved to the GPU (not the whole layer), and the two run concurrently -- the CPU pieces on
+        a side stream, the partial copy and the GEMM on this one. ``plan_prefill_split`` picks the
+        cut where both sides would finish together. Each route is computed exactly once: the GPU
+        sees the CPU's routes with weight 0 on an expert it holds, the CPU sees the GPU's as -1."""
+        E = self.num_experts
+        counts = torch.bincount(topk_ids.reshape(-1).long(), minlength=E)[:E].tolist()  # syncs
+        cpu_experts, gpu_experts = plan_prefill_split(counts, prefill_split_ratio())
+        if not gpu_experts:
+            return self._prefill_on_cpu(cache, hidden_states, topk_weights, topk_ids)
+        device = topk_ids.device
+        gpu_idx = torch.tensor(gpu_experts, dtype=torch.int32, device=device)
+        main = torch.cuda.current_stream(device)
+        pending = None
+        if cpu_experts:
+            on_cpu = torch.zeros(E, dtype=torch.bool, device=device)
+            on_cpu[torch.tensor(cpu_experts, dtype=torch.long, device=device)] = True
+            route_cpu = on_cpu[topk_ids.long()]
+            cpu_ids = torch.where(route_cpu, topk_ids, topk_ids.new_full((), -1))
+            # the GPU GEMM may overwrite hidden_states in place: the CPU reads its own copy
+            x_cpu, w_cpu = hidden_states.clone(), topk_weights.clone()
+            side = _split_stream(device)
+            side.wait_stream(main)
+            with torch.cuda.stream(side):
+                cpu_out = self._prefill_on_cpu(cache, x_cpu, w_cpu, cpu_ids)
+            for t in (x_cpu, w_cpu, cpu_ids):
+                t.record_stream(side)
+            done = torch.cuda.Event()
+            done.record(side)
+            pending = (cpu_out, done)
+            topk_weights = torch.where(route_cpu, topk_weights.new_zeros(()), topk_weights)
+            topk_ids = torch.where(route_cpu, topk_ids.new_full((), gpu_experts[0]), topk_ids)
+        cache.materialize_experts(self.layer_id, gpu_idx, gpu_experts)
+        out = self._expert_gemm(
+            cache,
+            hidden_states,
+            topk_weights,
+            topk_ids,
+            views=cache.bank_views(E),
+            n=E,
+            alphas=cache.alphas_for_layer(self.layer_id),
+            is_prefill=True,
+        )
+        if pending is not None:
+            cpu_out, done = pending
+            main.wait_event(done)
+            cpu_out.record_stream(main)
+            out = out + cpu_out
+        return out
 
     def _prefill_on_cpu(
         self,
@@ -563,6 +628,84 @@ def cpu_prefill_max_tokens() -> int:
     """Longest prefill extend the CPU executor computes instead of streaming the layer banks
     (``FREETOKEN_CPU_PREFILL_MAX_TOKENS``, default 256; 0 disables)."""
     return int(os.environ.get("FREETOKEN_CPU_PREFILL_MAX_TOKENS", "256") or 0)
+
+
+# Split prefill (OffloadMoELayer._prefill_split). The ratio is what moving one expert to the
+# GPU costs, in CPU-executor routes. Measured on an RTX 2060 host (Ornith, real routing, both
+# sides running at once): 4 was fastest from 32 to 1024 rows; the ratio of the two costs taken
+# one at a time is ~7, but the CPU kernels and the DMA slow each other down when they overlap.
+PREFILL_SPLIT_RATIO = 4.0
+# Where it pays, per layer on that host (the production layer at Ornith's geometry, real routing,
+# against what ran before -- the CPU short path up to 256 rows, the whole layer above): 64 rows
+# 0.78x, 128 0.63x, 256 0.51x, 512 0.64x; 32 and 1024 went either way between runs (the fixed
+# cost of the split -- a routing count read back, the side stream, the partial copy -- against
+# a CPU that is already quick, or a GPU that needs nearly every expert anyway). Hence the range.
+# Layers without a device address (LOCKED/PAGEABLE) never split: their experts can only be staged
+# through pinned buffers, and staging scattered experts one run at a time was slower than staging
+# the whole layer (1024 rows: 92 ms against 63).
+PREFILL_SPLIT_MIN_TOKENS = 64
+PREFILL_SPLIT_MAX_TOKENS = 1024
+
+
+def prefill_split_enabled() -> bool:
+    """``FREETOKEN_PREFILL_SPLIT=0`` turns the split prefill off (the CPU short path and the
+    whole-layer streaming take over again)."""
+    return os.environ.get("FREETOKEN_PREFILL_SPLIT", "1") != "0"
+
+
+def prefill_split_ratio() -> float:
+    return float(os.environ.get("FREETOKEN_PREFILL_SPLIT_RATIO", "") or PREFILL_SPLIT_RATIO)
+
+
+def prefill_split_limit() -> int:
+    """``PREFILL_SPLIT_MAX_TOKENS`` or ``FREETOKEN_PREFILL_SPLIT_MAX_TOKENS``; 0 when the split
+    is off. The same with the prefill overlap double buffer on: it streams the next layer before
+    that layer's routing is known, so a split layer is not hidden behind the previous one, but on
+    two RTX 3060s (Flash-Next, overlap on, 2026-09-27) the first token still came much sooner:
+    64 tokens 5.56 -> 2.05 s, 270 8.37 -> 3.01 s, 512 7.99 -> 4.02 s, 1024 7.97 -> 6.76 s."""
+    if not prefill_split_enabled():
+        return 0
+    return int(os.environ.get("FREETOKEN_PREFILL_SPLIT_MAX_TOKENS", "") or PREFILL_SPLIT_MAX_TOKENS)
+
+
+def prefill_split_max_tokens(cache) -> int:
+    """Longest prefill forward of this cache that splits its experts between the CPU and the GPU
+    (``prefill_split_limit``); 0 when it cannot: no CPU executor, or a --moe-bank-ram mapped bank
+    (its prefill has its own reader)."""
+    if getattr(cache, "cpu_executor", None) is None:
+        return 0
+    if getattr(cache, "prefix_pinned_rows", None) is not None or getattr(cache, "bank_reader", None) is not None:
+        return 0
+    return prefill_split_limit()
+
+
+def plan_prefill_split(counts: list[int], ratio: float) -> tuple[list[int], list[int]]:
+    """``counts[e]`` = rows routed to expert ``e`` in this forward. Returns the experts for the
+    CPU and for the GPU (each ascending; experts nobody routed to are in neither). The CPU
+    takes the least-routed experts, as many as keeps ``max(CPU routes, ratio * GPU experts)``
+    lowest -- the time both sides need when they run at once, in CPU routes."""
+    used = sorted((c, e) for e, c in enumerate(counts) if c > 0)
+    n = len(used)
+    best, best_k, cum = ratio * n, 0, 0
+    for k in range(1, n + 1):
+        cum += used[k - 1][0]
+        cost = max(cum, ratio * (n - k))
+        if cost < best:
+            best, best_k = cost, k
+    return sorted(e for _, e in used[:best_k]), sorted(e for _, e in used[best_k:])
+
+
+_SPLIT_STREAMS: dict = {}
+
+
+def _split_stream(device: torch.device) -> "torch.cuda.Stream":
+    """The side stream the split prefill runs its CPU pieces on (their host-node waits would
+    otherwise hold back the partial copy and the GEMM on the main stream)."""
+    key = device.index if device.index is not None else torch.cuda.current_device()
+    s = _SPLIT_STREAMS.get(key)
+    if s is None:
+        s = _SPLIT_STREAMS[key] = torch.cuda.Stream(device=device)
+    return s
 
 
 def make_moe_layer(

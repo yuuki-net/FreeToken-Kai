@@ -979,9 +979,12 @@ class Engine:
         if group is None:
             return None
         from freetoken.engine.prefill_group import groupable
-        from freetoken.layers.moe import cpu_prefill_max_tokens
+        from freetoken.layers.moe import cpu_prefill_max_tokens, prefill_split_limit
 
-        deferrable = groupable(batch, cpu_prefill_max_tokens=cpu_prefill_max_tokens())
+        # a chunk the split prefill takes moves only part of each layer, like one the CPU takes
+        # whole: neither streams banks, so neither is grouped
+        short = max(cpu_prefill_max_tokens(), prefill_split_limit())
+        deferrable = groupable(batch, cpu_prefill_max_tokens=short)
         if not (deferrable and group.accepts(batch)):
             self.flush_deferred_prefill()
         return self._defer_prefill_chunk(batch) if deferrable else None
@@ -1700,11 +1703,12 @@ class Engine:
         # Decode batches never exceed max_running_req, but CUDA-graph padding can
         # round a batch up to the largest captured size; cover both.
         # An MTP verify window ships spec_k + 1 rows through the CPU executor at once, and a
-        # short prefill extend goes through it in CPU_PREFILL_PIECE-row pieces.
-        from freetoken.layers.moe import CPU_PREFILL_PIECE, cpu_prefill_max_tokens
+        # short prefill extend and the CPU share of a split prefill go through it in
+        # CPU_PREFILL_PIECE-row pieces.
+        from freetoken.layers.moe import CPU_PREFILL_PIECE, cpu_prefill_max_tokens, prefill_split_enabled
 
         max_tokens = max(config.max_running_req, config.cuda_graph_max_bs or 0, 1, self.spec_k + 1)
-        if cpu_prefill_max_tokens() > 0:
+        if cpu_prefill_max_tokens() > 0 or prefill_split_enabled():
             max_tokens = max(max_tokens, CPU_PREFILL_PIECE)
         executor = CpuMoeExecutor(
             cache,
