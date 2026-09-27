@@ -19,6 +19,8 @@ FTI18N.add({
   bm_fromlast_more: "（採用された候補しだいで、あとから増えることがあります）",
   bm_short_missing: "前回の結果は「短い質問」（チャットの続きで最初の文字が出るまで）を測る前のものです。続きから測ると、今の設定をこの項目込みで測り直し、hybrid / offload の選び方も試し直します（短い質問が CPU と GPU の分担で速くなったため、選び方が変わることがあります）。",
   bm_result_short_missing: "この結果には「短い質問」の測定がありません（新しい版で増えた項目です）。「前回の続きから」で測ると、この項目込みで設定を見直します。",
+  bm_from_last_none_kept: "試した候補はどれも今の設定を上回らなかったので、設定は前回のまま（設定 A）です。",
+  bm_short_explain: "「短い質問」は、新しい 256 トークンの質問で最初の文字が出るまでの秒です（チャットの続きの待ち時間）。短い質問を CPU と GPU で分けて計算する仕組み（分担プリフィル）は既定で有効で、どの設定にも入っています。hybrid 以外（offload など）にすると使えなくなり、この秒数が大きく延びます。",
   bm_time_fromlast: "基準の測り直し 1 回と候補 {n} 件ぶん（1 件あたり、これまでの 1 回の測定と同じくらい）",
   bm_ph_from_last: "前回の結果から続けています",
   bm_from_last_note: "{when} の結果から続けた測定です（まだ試していなかった候補だけ）。それ以前の測定は下に畳んであります。",
@@ -90,6 +92,8 @@ FTI18N.add({
   bm_fromlast_more: "(a kept change can open more along the way)",
   bm_short_missing: "The last result predates the short prompt (the wait for the first token of a chat turn). Picking up measures the current settings again with it and tries hybrid / offload again: short prompts now split their experts between the CPU and the GPU, which can change that choice.",
   bm_result_short_missing: "This result has no short-prompt figure (a newer build measures it). Picking up from it reviews the settings with that figure.",
+  bm_from_last_none_kept: "None of the candidates tried beat the current settings, so they stay as they were (setting A).",
+  bm_short_explain: "\"Short prompt\" is the wait for the first token of a fresh 256-token prompt (what a chat turn waits for). Splitting a short prompt's experts between the CPU and the GPU (the split prefill) is on by default and part of every setting; anything but hybrid (offload, say) cannot use it, and this wait grows a lot.",
   bm_time_fromlast: "one run of the current settings plus {n} candidates (each about as long as a run so far)",
   bm_ph_from_last: "Picking up from the last result",
   bm_from_last_note: "Picked up from the result of {when}: only the candidates it had not tried. The earlier runs are folded below.",
@@ -539,6 +543,7 @@ FTI18N.add({
   }
 
   let polling = false;
+  let setupReady = false;  // the setup form's lists are loaded; after a run they are loaded again
   async function poll() {
     if (polling) return;
     polling = true;
@@ -549,7 +554,11 @@ FTI18N.add({
       for (const e of st.events) { onEvent(e); seq = e.seq; }
       if (st.state === "running") { if ($("#bm-run").hidden) show("run"); }
       else if (!$("#bm-run").hidden) {
-        if (st.state === "done" && st.result) { show("result"); renderResult(st.result); }
+        if (st.state === "done" && st.result) {
+          show("result"); renderResult(st.result);
+          // the form above the result still showed what was untested before this run
+          if (setupReady) { loadLast(); loadPending(); }
+        }
         else if (st.state !== "idle") { $("#bm-phase").textContent = t(`bm_ph_${st.state}`) + (st.error ? ` — ${st.error}` : ""); setTimeout(() => show("setup"), 4000); }
       }
     } catch {} finally { polling = false; }
@@ -627,6 +636,7 @@ FTI18N.add({
   $("#bm-last").onclick = () => { show("result"); renderResult(lastResult); };
   loadLast();
   loadPending();
+  setupReady = true;
 
   $("#bm-start").onclick = async () => {
     const trials = $("#bm-trials").checked;
@@ -713,8 +723,13 @@ FTI18N.add({
     // a run that picked up from the last result: the runs it builds on, newest first, folded
     const earlier = (r.earlier || []).slice().reverse().map((e) => `<details style="margin-top:12px"><summary class="small">${esc(t("bm_earlier",
       { when: when(e.finished), mode: t(`bm_mode_${e.mode || "standard"}`), n: (e.trials || []).length }))}</summary>${tableOf(e.trials || [], e.chosen)}</details>`).join("");
+    // picked up and nothing kept: the settings are the last result's, confirmed -- say so, or the
+    // one "not kept" row reads as if the run changed nothing it was meant to
+    const noneKept = r.from_last && trials.length > 1 && !trials.some((x) => x.decision === "kept");
     const fromNote = (r.from_last ? `<p class="small muted">${esc(t("bm_from_last_note", { when: when(r.from_last.finished) }))}</p>` : "")
-      + (trials.length && !trials.some((x) => x.short_s != null) ? `<p class="small warn-text">${esc(t("bm_result_short_missing"))}</p>` : "");
+      + (noneKept ? `<p class="small"><b>${esc(t("bm_from_last_none_kept"))}</b></p>` : "")
+      + (trials.length && !trials.some((x) => x.short_s != null) ? `<p class="small warn-text">${esc(t("bm_result_short_missing"))}</p>`
+        : anyShort ? `<p class="small muted">${esc(t("bm_short_explain"))}</p>` : "");
     const trialTable = okTrials.length ? `<div class="card"><h2>${esc(t("bm_trials_title"))}</h2>
       <p class="hint">${esc(t("bm_trials_hint2"))}</p>${fromNote}${tableOf(okTrials, chosen)}${earlier}</div>` : "";
 

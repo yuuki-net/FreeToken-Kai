@@ -943,6 +943,37 @@ def test_a_result_measured_before_the_short_prompt_tries_hybrid_or_offload_again
     assert not doc["short_missing"] and "strategy_hybrid" not in [x["key"] for x in doc["items"]]
 
 
+def test_after_picking_up_the_retried_choice_is_no_longer_listed(tmp_path):
+    # the run the page showed on two 3060s: hybrid measured again with the short prompt, offload
+    # tried and not kept -- afterwards nothing is left to try and the notice is gone
+    rec = _moe_rec()
+    base = list(rec["flags"])
+    old = {"base_args": base, "args": base, "hw": {"measurements": {}}, "upstream": [{"gpu": 0}], "finished": 1.0,
+           "mode": "thorough", "tried": ["strategy_offload", "strategy", "budget_075"], "kept": [],
+           "trials": [{"key": None, "decision": "base"}, {"key": "strategy_offload", "decision": "rejected"}]}
+    m = FakeManager()
+    # offload halves generation and the short prompt waits longer, as on the 3060s (2.86 -> 7.70 s)
+    serve = FakeServe(m, effects={"--moe-strategy=offload": (0.48, 0.4, 0.46)})
+    job = _pickup_job(tmp_path, m, serve, rec=rec)
+    os.makedirs(tmp_path / "tune")
+    with open(tmp_path / "tune" / "M.json", "w") as fh:
+        json.dump(old, fh)
+    before = job.pending("/models/M", "thorough")
+    assert before["short_missing"] and "strategy_offload" in [x["key"] for x in before["items"]]
+    job._spawn = _no_hw
+    job.start("/models/M", True, mode="thorough", from_last=True)
+    job._thread.join(60)
+    st = job.status()
+    assert st["state"] == "done", st["error"]
+    r = st["result"]
+    decided = {t.get("key"): t.get("decision") for t in r["trials"]}
+    assert decided[None] == "base" and decided["strategy_offload"] == "rejected"
+    assert all(t.get("short_s") for t in r["trials"] if t.get("ok"))
+    after = job.pending("/models/M", "thorough")
+    assert not after["short_missing"] and "strategy_offload" not in [x["key"] for x in after["items"]]
+    assert after["items"] == []  # everything the pick-up listed was run
+
+
 def test_a_candidate_the_settings_already_carry_is_not_listed(tmp_path):
     # four prefill pieces set the chunk ceiling to 16384, so "raise the ceiling to 16384" changes
     # nothing: the run skips it without a start, and the list shown before must not count it
