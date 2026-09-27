@@ -22,11 +22,15 @@ const FTBreakdown = (() => {
     const perStep = kai.spec?.tokens_per_step || 1;
     const real = decodeTps > 0 ? 1000 * perStep / decodeTps : null;
     const many = samples.length > 1;
+    // one time axis for every rank: the longest step spans the bar, a shorter step stops short.
+    // Each bar scaled to its own total drew a 77 ms rank as long as a 213 ms one, and with less of
+    // it grey the faster rank looked the longer (the percentages below stay per rank)
+    const span = Math.max(1e-6, ...samples.map((s) => s.total_ms || 0));
     const rows = samples.map((s) => {
       const tot = Math.max(1e-6, s.total_ms);
       const seg = PARTS.map(([k, c]) => {
         const v = s.ms[k] || 0;
-        return v > 0 ? `<div style="width:${(100 * v / tot).toFixed(2)}%;background:var(${c})" title="${esc(t("tok_part_" + k))} ${esc(msv(v))}"></div>` : "";
+        return v > 0 ? `<div style="width:${(100 * v / span).toFixed(2)}%;background:var(${c})" title="${esc(t("tok_part_" + k))} ${esc(msv(v))}"></div>` : "";
       }).join("");
       const parts = PARTS.filter(([k]) => (s.ms[k] || 0) >= 0.05 * tot)
         .map(([k]) => `${t("tok_part_" + k)} ${msv(s.ms[k])} (${fmt.pct(s.ms[k] / tot, 0)})`).join(" · ");
