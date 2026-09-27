@@ -136,7 +136,10 @@ while one holds the GPU.
    - **Short prompt**: the first token of a fresh 256-token prompt, three times, the median. It is
      what a chat turn waits for, and it takes a path of its own (the split prefill, which a 16k
      prompt never takes): on two RTX 3060s it went from 8.4 s to 3.0 s for 270 tokens while the 16k
-     figure did not move, and a change such as offload instead of hybrid removes it.
+     figure did not move, and a change such as offload instead of hybrid removes it. A result saved
+     before this figure existed says so on its page and under "pick up from the last result";
+     picking up from it measures the chosen settings again with the figure and tries hybrid /
+     offload again, since that choice was made without it.
    - **Generation**: one untimed warm-up, then the best of three 300-token generations continuing
      prose, and, for a model with MTP weights, the same on Python, where MTP drafts far better. An
      MTP model is measured on Python in every run, not only the MTP ones, and a verdict compares

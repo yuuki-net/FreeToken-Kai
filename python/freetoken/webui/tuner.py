@@ -81,6 +81,28 @@ def prior_trials(prev: dict | None) -> tuple[set[str], set[str]]:
     return {t["key"] for t in trials}, {t["key"] for t in trials if t.get("decision") == "kept"}
 
 
+# What a result measured before the short prompt (2026-09-27) could not judge: hybrid or offload
+# decides whether there is a CPU executor at all, and with it whether a chat turn gets the split
+# prefill (two RTX 3060s: 8.4 s -> 3.0 s for 270 tokens). Picking up from such a result tries the
+# choice again, now with the short prompt in the verdict.
+SHORT_UNJUDGED = frozenset({"strategy", "strategy_offload", "strategy_hybrid"})
+
+
+def measured_short(prev: dict | None) -> bool:
+    """Whether ``prev`` (its own runs, not the earlier ones it builds on) timed the short prompt."""
+    return bool(prev) and any(t.get("short_s") for t in prev.get("trials") or [])
+
+
+def prior_for_pickup(prev: dict, facts: dict, hw: dict) -> tuple[set[str], set[str]]:
+    """(tried, kept) a run picking up from ``prev`` starts from: what it tried and the groups that
+    closes, less what it could not judge without the short prompt."""
+    done, kept = prior_trials(prev)
+    done |= closed_groups(prev, done, facts, hw)
+    if not measured_short(prev):
+        done -= SHORT_UNJUDGED
+    return done, kept
+
+
 def closed_groups(prev: dict, tried: set[str], facts: dict, hw: dict) -> set[str]:
     """The groups ``tried`` closes. A result records them itself (its ``tried`` holds groups too);
     for an older one they are read off the plans its first and final settings open: a group whose
@@ -519,9 +541,8 @@ class TuneJob:
             return {"available": False, "reason": why, "items": []}
         mode = mode if mode in MODES else "standard"
         rec = self._recommend(model) if self._recommend else {}
-        tried, kept = prior_trials(prev)
         facts, hw = host_facts(rec), prev.get("hw") or {}
-        tried |= closed_groups(prev, tried, facts, hw)
+        tried, kept = prior_for_pickup(prev, facts, hw)
         args = list(prev["args"])
         plan = search.plan(args, facts, hw, mode)
         # a candidate the settings already carry (the chunk ceiling four pieces set) is skipped by the
@@ -530,7 +551,10 @@ class TuneJob:
                  if c.key not in tried and c.group not in tried and (c.after is None or c.after in kept)
                  and set_flags(args, search.merge_changes(args, c.changes), c.drop) != args]
         return {"available": True, "items": items, "last": {"finished": prev.get("finished"), "mode": prev.get("mode"),
-                                                            "version": prev.get("freetoken_version")}}
+                                                            "version": prev.get("freetoken_version")},
+                # the page says the last result predates the short prompt: the settings are measured
+                # again with it and hybrid / offload is tried again
+                "short_missing": not measured_short(prev)}
 
     def cancel(self) -> dict:
         self._cancel.set()
@@ -599,10 +623,7 @@ class TuneJob:
                 if rec is None:
                     rec = self._recommend(model) if self._recommend else {"flags": [], "notes": []}
                 facts = host_facts(rec)
-                prior = None
-                if last is not None:
-                    done, kept = prior_trials(last)
-                    prior = (done | closed_groups(last, done, facts, hw), kept)
+                prior = prior_for_pickup(last, facts, hw) if last is not None else None
                 args, notes = self._trials(model, port, args, notes, result, facts, hw, mode, use, prior=prior)
             result["args"] = [a for a in args if a != "--moe-collect-stats"]
             result["notes"] = notes

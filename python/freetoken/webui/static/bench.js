@@ -17,6 +17,8 @@ FTI18N.add({
   bm_fromlast: "前回の続きから", bm_fromlast_hint: "前回の結果の設定から始めて、まだ試していない候補だけを測ります（ハードウェアの測定は前回のものを使います）。新しい版で増えた候補や、標準のあとの徹底の分だけを測るときに。",
   bm_fromlast_items: "未測定の候補 {n} 件: {list}", bm_fromlast_nothing: "未測定の候補はありません。前回の結果のままで足ります。",
   bm_fromlast_more: "（採用された候補しだいで、あとから増えることがあります）",
+  bm_short_missing: "前回の結果は「短い質問」（チャットの続きで最初の文字が出るまで）を測る前のものです。続きから測ると、今の設定をこの項目込みで測り直し、hybrid / offload の選び方も試し直します（短い質問が CPU と GPU の分担で速くなったため、選び方が変わることがあります）。",
+  bm_result_short_missing: "この結果には「短い質問」の測定がありません（新しい版で増えた項目です）。「前回の続きから」で測ると、この項目込みで設定を見直します。",
   bm_time_fromlast: "基準の測り直し 1 回と候補 {n} 件ぶん（1 件あたり、これまでの 1 回の測定と同じくらい）",
   bm_ph_from_last: "前回の結果から続けています",
   bm_from_last_note: "{when} の結果から続けた測定です（まだ試していなかった候補だけ）。それ以前の測定は下に畳んであります。",
@@ -86,6 +88,8 @@ FTI18N.add({
   bm_fromlast: "Pick up from the last result", bm_fromlast_hint: "Start from the settings the last result chose and measure only the candidates it has not tried (the hardware figures are the last result's). For the candidates a newer build added, or the thorough ones after a standard run.",
   bm_fromlast_items: "{n} untested: {list}", bm_fromlast_nothing: "Nothing untested: the last result still stands.",
   bm_fromlast_more: "(a kept change can open more along the way)",
+  bm_short_missing: "The last result predates the short prompt (the wait for the first token of a chat turn). Picking up measures the current settings again with it and tries hybrid / offload again: short prompts now split their experts between the CPU and the GPU, which can change that choice.",
+  bm_result_short_missing: "This result has no short-prompt figure (a newer build measures it). Picking up from it reviews the settings with that figure.",
   bm_time_fromlast: "one run of the current settings plus {n} candidates (each about as long as a run so far)",
   bm_ph_from_last: "Picking up from the last result",
   bm_from_last_note: "Picked up from the result of {when}: only the candidates it had not tried. The earlier runs are folded below.",
@@ -613,9 +617,9 @@ FTI18N.add({
     row.hidden = false;
     const items = pendingDoc.items || [];
     const name = (it) => lang() === "ja" ? (it.what || it.key) : (it.what_en || it.key);
-    $("#bm-fromlast-items").textContent = items.length
+    $("#bm-fromlast-items").textContent = (pendingDoc.short_missing ? `${t("bm_short_missing")}\n` : "") + (items.length
       ? `${t("bm_fromlast_items", { n: items.length, list: items.map(name).join(" / ") })}\n${t("bm_fromlast_more")}`
-      : t("bm_fromlast_nothing");
+      : pendingDoc.short_missing ? "" : t("bm_fromlast_nothing"));
   }
   $("#bm-model").onchange = () => { loadLast(); loadPending(); };
   for (const r of document.querySelectorAll('input[name="bm-mode"]')) r.addEventListener("change", loadPending);
@@ -709,7 +713,8 @@ FTI18N.add({
     // a run that picked up from the last result: the runs it builds on, newest first, folded
     const earlier = (r.earlier || []).slice().reverse().map((e) => `<details style="margin-top:12px"><summary class="small">${esc(t("bm_earlier",
       { when: when(e.finished), mode: t(`bm_mode_${e.mode || "standard"}`), n: (e.trials || []).length }))}</summary>${tableOf(e.trials || [], e.chosen)}</details>`).join("");
-    const fromNote = r.from_last ? `<p class="small muted">${esc(t("bm_from_last_note", { when: when(r.from_last.finished) }))}</p>` : "";
+    const fromNote = (r.from_last ? `<p class="small muted">${esc(t("bm_from_last_note", { when: when(r.from_last.finished) }))}</p>` : "")
+      + (trials.length && !trials.some((x) => x.short_s != null) ? `<p class="small warn-text">${esc(t("bm_result_short_missing"))}</p>` : "");
     const trialTable = okTrials.length ? `<div class="card"><h2>${esc(t("bm_trials_title"))}</h2>
       <p class="hint">${esc(t("bm_trials_hint2"))}</p>${fromNote}${tableOf(okTrials, chosen)}${earlier}</div>` : "";
 

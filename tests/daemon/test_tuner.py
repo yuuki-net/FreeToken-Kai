@@ -915,6 +915,34 @@ def test_a_kept_change_closes_the_one_that_would_undo_it_in_an_older_result():
     assert "strategy" in tuner.closed_groups(prev, tried, facts, hw)
 
 
+def test_a_result_measured_before_the_short_prompt_tries_hybrid_or_offload_again(tmp_path):
+    # offload was kept on the 16k prompt and generation alone; with it a chat turn loses the split
+    # prefill, which the old result never saw -- picking up tries the choice again and says why
+    rec = _moe_rec()
+    facts, hw = tuner.host_facts(rec), {"measurements": {}}
+    base = list(rec["flags"])
+    final = tuner.set_flags(base, {"--moe-strategy": "offload"}, drop=("--moe-cpu-layers", "--moe-cpu-threads"))
+    old = {"base_args": base, "args": final, "hw": hw, "upstream": [{"gpu": 0}], "finished": 1.0, "mode": "standard",
+           "tried": ["strategy_offload", "strategy", "budget_075"], "kept": ["strategy_offload"],
+           "trials": [{"key": None, "decision": "base"}, {"key": "strategy_offload", "decision": "kept"}]}
+    tried, kept = tuner.prior_for_pickup(old, facts, hw)
+    assert not tried & tuner.SHORT_UNJUDGED and "budget_075" in tried and kept == {"strategy_offload"}
+    measured = dict(old, trials=old["trials"] + [{"key": "strategy_hybrid", "decision": "rejected", "short_s": 3.0}])
+    assert "strategy" in tuner.prior_for_pickup(measured, facts, hw)[0]  # judged once with it: closed again
+
+    m = FakeManager()
+    job = _pickup_job(tmp_path, m, FakeServe(m), rec=rec)
+    os.makedirs(tmp_path / "tune")
+    with open(tmp_path / "tune" / "M.json", "w") as fh:
+        json.dump(old, fh)
+    doc = job.pending("/models/M", "standard")
+    assert doc["short_missing"] and "strategy_hybrid" in [x["key"] for x in doc["items"]]
+    with open(tmp_path / "tune" / "M.json", "w") as fh:
+        json.dump(measured, fh)
+    doc = job.pending("/models/M", "standard")
+    assert not doc["short_missing"] and "strategy_hybrid" not in [x["key"] for x in doc["items"]]
+
+
 def test_a_candidate_the_settings_already_carry_is_not_listed(tmp_path):
     # four prefill pieces set the chunk ceiling to 16384, so "raise the ceiling to 16384" changes
     # nothing: the run skips it without a start, and the list shown before must not count it
