@@ -113,6 +113,11 @@ With the experts in host RAM, every prefill chunk streams every layer's expert b
 The number of chunks a prompt is cut into is the number of full bank transfers it pays, so a
 wider chunk is faster even when the arithmetic per token is the same.
 
+(A forward of 64 to 1024 tokens is the exception: it splits each layer between the CPU executor,
+which takes the experts few of its tokens use, and the GPU, which receives only the others --
+see `FREETOKEN_PREFILL_SPLIT` in [kai.md](kai.md). That is the last chunk of a prompt and a short
+prompt; the full-width chunks before it stream as described here.)
+
 What caps the width is the transient, and the transient is not the experts. Measured per part
 of one layer on the 2060 (Ornith, 1024 tokens):
 

@@ -66,6 +66,23 @@ def test_keep_by_goal_and_use():
     assert not tuner.keep(_t(251, 18.4), _t(517, 17.0), gen, "prose")  # but not at 8% of generation
 
 
+def test_the_short_prompt_must_hold_and_can_win_alone():
+    base = dict(_t(600, 30.0), short_s=3.0)
+    gen = search.Candidate("x", {"--a": "1"})
+    # faster on the long prompt and in generation, but a chat turn waits a third longer: not kept
+    assert not tuner.keep(base, dict(_t(700, 32.0), short_s=4.0), gen, "prose")
+    # within the swing seen between runs, the other figures decide as before
+    assert tuner.keep(base, dict(_t(620, 31.0), short_s=3.5), gen, "prose")
+    # the short prompt alone gained enough, the rest held
+    assert tuner.keep(base, dict(_t(600, 30.0), short_s=2.4), gen, "prose")
+    assert not tuner.keep(base, dict(_t(500, 30.0), short_s=2.4), gen, "prose")  # prompt processing fell
+    # a result saved before the short prompt was measured is compared on the other figures only
+    pre = search.Candidate("y", {"--b": "1"}, goal="prefill", gain=1.05)
+    assert tuner.keep(_t(600, 30.0), dict(_t(640, 29.2), short_s=9.0), pre, "prose")
+    # two runs of the same settings: the slower short prompt is the one that counts
+    assert tuner.slower_of(dict(_t(600, 30.0), short_s=2.0), dict(_t(620, 29.0), short_s=2.5))["short_s"] == 2.5
+
+
 def _geo(now=16384, kv=10880, slots=1104, per_expert=1775616, kv_max=249909):
     return {"num_pages": now, "page_size": 1, "moe_cache_size": slots,
             "unit_bytes": {"kv_per_token": kv, "moe_per_expert": per_expert},
@@ -412,6 +429,10 @@ def test_full_run_tries_each_candidate_once_and_brings_the_old_engine_back(tmp_p
     plans = [e for e in st["events"] if e["k"] == "plan"]
     assert not plans[0]["update"] and plans[-1]["update"] and plans[-1]["items"] == []  # sent before every run, empty at the end
     assert plans[0]["eta_s"] is not None and all(p["eta_s"] >= 0 for p in plans)  # the time left, from the runs so far
+    # every run measured a short prompt's first token too: 256 fresh tokens at the run's own rate
+    assert all(t["short_s"] > 0 for t in r["trials"] if t["ok"])
+    shorts = [e for e in st["events"] if e["k"] == "trial" and e.get("step") == "short" and e.get("state") == "done"]
+    assert len(shorts) == len([t for t in r["trials"] if t["ok"]])
 
 
 def test_a_kept_change_is_carried_into_every_later_run(tmp_path):

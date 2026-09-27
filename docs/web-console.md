@@ -133,6 +133,10 @@ while one holds the GPU.
      same two texts: on two RTX 3060s one 16k excerpt ran at 509 tok/s and another at 636 under the
      same flags, so different text per run would outweigh most settings. Only the first line differs
      per run, so nothing comes from the prefix cache.
+   - **Short prompt**: the first token of a fresh 256-token prompt, three times, the median. It is
+     what a chat turn waits for, and it takes a path of its own (the split prefill, which a 16k
+     prompt never takes): on two RTX 3060s it went from 8.4 s to 3.0 s for 270 tokens while the 16k
+     figure did not move, and a change such as offload instead of hybrid removes it.
    - **Generation**: one untimed warm-up, then the best of three 300-token generations continuing
      prose, and, for a model with MTP weights, the same on Python, where MTP drafts far better. An
      MTP model is measured on Python in every run, not only the MTP ones, and a verdict compares
@@ -143,6 +147,10 @@ while one holds the GPU.
    - **Kept**: a change is kept when prompt processing gains 5% or generation gains 3% while the
      other holds (90% for prompt processing, 97% for generation), whatever the change was tried for.
      A 16-bit KV cache is tried for generation, yet on two RTX 3060s it doubled prompt processing.
+     The short prompt must hold too -- a change after which it waits more than 25% longer is not
+     kept, however the other two moved -- and a change that shortens it by 15% while the other two
+     hold is kept for that alone. The bands are wide because the same settings gave 2.0-2.6 s on
+     the two 3060s. A result saved before the short prompt was measured is compared without it.
    - **Measured twice**: a change that clears the bar is started and measured again, and is kept
      only when that run clears it too. The slower figures of the two become the bar for what
      follows, so one lucky run cannot raise it.

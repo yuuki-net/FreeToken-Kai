@@ -679,6 +679,27 @@ def prefill_split_max_tokens(cache) -> int:
     return prefill_split_limit()
 
 
+def describe_prefill_split(cache) -> str | None:
+    """The start line saying which prefill forwards split, and on how many layers; None without a
+    CPU executor (nothing to split with)."""
+    if getattr(cache, "cpu_executor", None) is None:
+        return None
+    if not prefill_split_enabled():
+        return "prefill split: off (FREETOKEN_PREFILL_SPLIT=0)"
+    limit = prefill_split_max_tokens(cache)
+    if limit <= 0:
+        return "prefill split: off under --moe-bank-ram (a mapped bank's prefill reads its rows its own way)"
+    total = int(cache.num_layers)
+    unpinned = len(getattr(cache, "_unpinned_layers", ()) or ())
+    line = (f"prefill split: prompts of {PREFILL_SPLIT_MIN_TOKENS}-{limit} tokens compute each layer's "
+            f"least-routed experts on the CPU while the GPU receives only the others, on "
+            f"{total - unpinned} of {total} MoE layers")
+    if unpinned:
+        line += (f"; the {unpinned} without pinned banks (--moe-cpu-layers) keep the CPU-only / "
+                 f"whole-layer prefill")
+    return line
+
+
 def plan_prefill_split(counts: list[int], ratio: float) -> tuple[list[int], list[int]]:
     """``counts[e]`` = rows routed to expert ``e`` in this forward. Returns the experts for the
     CPU and for the GPU (each ascending; experts nobody routed to are in neither). The CPU

@@ -66,9 +66,9 @@ FTI18N.add({
   bm_use: "主な使い方", bm_use_sub: "MTP のように、文章の種類で効き方が変わる設定を採用するかどうかに使います。",
   bm_use_both: "両方", bm_use_code: "コード・ツール呼び出し（エージェント）", bm_use_prose: "文章・会話",
   bm_time_standard: "30 分〜2 時間（GPU とモデルしだい）", bm_time_thorough: "1〜3 時間以上（GPU とモデルしだい）",
-  bm_planned: "予定", bm_eta: "残り約 {min} 分", bm_eta_soon: "残りわずか", bm_axis_threads: "スレッド数", bm_fig_prefill: "プロンプト", bm_fig_prose: "文章", bm_fig_code: "コード", bm_row_loading: "読み込み", bm_row_prefill: "プロンプト処理", bm_row_decode: "生成（文章）", bm_row_decode_code: "生成（コード）",
+  bm_planned: "予定", bm_eta: "残り約 {min} 分", bm_eta_soon: "残りわずか", bm_axis_threads: "スレッド数", bm_fig_prefill: "プロンプト", bm_fig_prose: "文章", bm_fig_code: "コード", bm_fig_short: "短い質問", bm_row_loading: "読み込み", bm_row_prefill: "プロンプト処理", bm_row_short: "短い質問の最初のトークン", bm_row_decode: "生成（文章）", bm_row_decode_code: "生成（コード）",
   bm_dec_kept: "採用", bm_dec_rejected: "不採用", bm_dec_failed: "失敗", bm_dec_base: "基準", bm_dec_recheck: "速かったのでもう一度測る", bm_dec_rebase: "生成だけ落ちたので基準を測り直す", bm_dec_tiebreak: "結果が割れたので 3 回目を測る",
-  bm_col_decode_code: "生成（コード）", bm_col_decision: "判定",
+  bm_col_decode_code: "生成（コード）", bm_col_short: "短い質問", bm_col_decision: "判定",
   bm_skipped_title: "測らなかった項目と理由",
   bm_plan_note: "{n} 個の候補を 1 つずつ試します（採用したものによって、あとの候補が増減します）。",
 }, {
@@ -135,9 +135,9 @@ FTI18N.add({
   bm_use: "Main use", bm_use_sub: "Decides settings like MTP whose effect depends on the kind of text.",
   bm_use_both: "Both", bm_use_code: "Code and tool calls (agents)", bm_use_prose: "Prose and chat",
   bm_time_standard: "30 minutes to 2 hours (depends on the GPUs and the model)", bm_time_thorough: "1 to 3 hours or more (depends on the GPUs and the model)",
-  bm_planned: "planned", bm_eta: "about {min} min left", bm_eta_soon: "almost done", bm_axis_threads: "threads", bm_fig_prefill: "prompt", bm_fig_prose: "prose", bm_fig_code: "code", bm_row_loading: "loading", bm_row_prefill: "prompt", bm_row_decode: "generation (prose)", bm_row_decode_code: "generation (code)",
+  bm_planned: "planned", bm_eta: "about {min} min left", bm_eta_soon: "almost done", bm_axis_threads: "threads", bm_fig_prefill: "prompt", bm_fig_prose: "prose", bm_fig_code: "code", bm_fig_short: "short prompt", bm_row_loading: "loading", bm_row_prefill: "prompt", bm_row_short: "short prompt, first token", bm_row_decode: "generation (prose)", bm_row_decode_code: "generation (code)",
   bm_dec_kept: "kept", bm_dec_rejected: "not kept", bm_dec_failed: "failed", bm_dec_base: "base", bm_dec_recheck: "faster: measuring again", bm_dec_rebase: "generation alone fell: measuring the base again", bm_dec_tiebreak: "the runs disagree: a third run",
-  bm_col_decode_code: "Generation (code)", bm_col_decision: "Verdict",
+  bm_col_decode_code: "Generation (code)", bm_col_short: "Short prompt", bm_col_decision: "Verdict",
   bm_skipped_title: "Not measured, and why",
   bm_plan_note: "{n} candidates, one at a time (what is kept can open or close later ones).",
 });
@@ -168,15 +168,17 @@ FTI18N.add({
     return s;
   }
 
-  const unitOf = (id) => /\.(prefill|decode|decode_code)$/.test(id) ? "tok/s" : /\.load$/.test(id) ? "%" : "GB/s";
-  const SUBS = ["load", "prefill", "decode", "decode_code"];
+  const unitOf = (id) => /\.(prefill|decode|decode_code)$/.test(id) ? "tok/s" : /\.short$/.test(id) ? "s" : /\.load$/.test(id) ? "%" : "GB/s";
+  const SUBS = ["load", "prefill", "short", "decode", "decode_code"];
   // a run's row: what it changed, where it is, and at the end its figures and verdict
   function runNote(row) {
     const T = row.id;
     if (row.decision) {
       const p = steps.get(`${T}.prefill`)?.value, d = steps.get(`${T}.decode`)?.value, c = steps.get(`${T}.decode_code`)?.value;
+      const sh = steps.get(`${T}.short`)?.value;
       const figs = [[p, "bm_fig_prefill"], [d, "bm_fig_prose"], [c, "bm_fig_code"]].filter(([v]) => v != null)
-        .map(([v, k]) => `${t(k)} ${v >= 100 ? Math.round(v) : v.toFixed(1)}`).join(" · ") + (p != null || d != null ? " tok/s" : "");
+        .map(([v, k]) => `${t(k)} ${v >= 100 ? Math.round(v) : v.toFixed(1)}`).join(" · ") + (p != null || d != null ? " tok/s" : "")
+        + (sh != null ? ` · ${t("bm_fig_short")} ${sh.toFixed(2)} s` : "");
       return figs || t(`bm_dec_${row.decision}`);
     }
     for (const k of [...SUBS].reverse()) {
@@ -185,11 +187,12 @@ FTI18N.add({
       if (k === "load") return s.note || `${t("bm_row_loading")} ${s.since ? Math.floor((Date.now() - s.since) / 1000) + " s" : ""}`;
       if (k === "prefill" && s.progress) return `${t("bm_row_prefill")} ${fmt.num(s.progress.done)} / ${fmt.num(s.progress.total)}`;
       const v = s.samples.length ? s.samples[s.samples.length - 1].v : s.value;
-      return `${t(`bm_row_${k}`)}${v != null ? " " + fmtVal(v, "tok/s") : ""}`;
+      return `${t(`bm_row_${k}`)}${v != null ? " " + fmtVal(v, unitOf(`${T}.${k}`)) : ""}`;
     }
     return "";
   }
-  const fmtVal = (v, unit) => v == null ? "—" : unit === "%" ? `${Math.round(v)}%` : unit === "tok/s" ? `${v >= 100 ? Math.round(v) : v.toFixed(1)} tok/s` : `${v.toFixed(1)} GB/s`;
+  const fmtVal = (v, unit) => v == null ? "—" : unit === "%" ? `${Math.round(v)}%` : unit === "s" ? `${v.toFixed(2)} s`
+    : unit === "tok/s" ? `${v >= 100 ? Math.round(v) : v.toFixed(1)} tok/s` : `${v.toFixed(1)} GB/s`;
 
   function hwLabel(id) {
     const m = /^(pcie|gather|upstream)(\d+)$/.exec(id);
@@ -676,6 +679,8 @@ FTI18N.add({
     const chosen = r.chosen;
     const okTrials = trials;
     const anyCode = trials.some((x) => x.decode_code_tps);
+    // results saved before the short prompt was measured have no such figure: no column for them
+    const anyShort = trials.some((x) => x.short_s != null) || (r.earlier || []).some((e) => (e.trials || []).some((x) => x.short_s != null));
     const decisionPill = (x) => {
       const d = x.decision || (x.ok ? null : "failed");
       if (!d) return "";
@@ -685,7 +690,7 @@ FTI18N.add({
     const whatOf = (x) => (x.what ? (lang() === "en" ? x.what[1] : x.what[0]) : changeText(x.change));
     const tableOf = (okTrials, chosen) => `<div class="tablewrap"><table class="bm-trials"><thead><tr><th>${esc(t("bm_col_setting"))}</th><th>${esc(t("bm_col_change"))}</th><th>${esc(t("bm_col_decision"))}</th>
         <th class="num">${esc(t("bm_col_ctx"))}</th><th class="num">${esc(t("bm_col_slots"))}</th><th class="num">${esc(t("bm_col_load"))}</th>
-        <th class="num">${esc(t("bm_col_prefill"))}</th><th class="num">${esc(t("bm_col_decode"))}</th>${anyCode ? `<th class="num">${esc(t("bm_col_decode_code"))}</th>` : ""}<th class="num">${esc(t("bm_col_hit"))}</th></tr></thead>
+        <th class="num">${esc(t("bm_col_prefill"))}</th>${anyShort ? `<th class="num">${esc(t("bm_col_short"))}</th>` : ""}<th class="num">${esc(t("bm_col_decode"))}</th>${anyCode ? `<th class="num">${esc(t("bm_col_decode_code"))}</th>` : ""}<th class="num">${esc(t("bm_col_hit"))}</th></tr></thead>
       <tbody>${okTrials.map((x) => {
         const win = x.ok && x.label === chosen ? "win" : "";
         return `<tr><td class="${win}"><b>${esc(x.label)}</b> ${win ? `<span class="pill ok">${esc(t("bm_chosen"))}</span>` : ""}</td>
@@ -695,6 +700,7 @@ FTI18N.add({
           <td class="num ${win}">${x.expert_slots != null ? fmt.num(x.expert_slots) : "—"}</td>
           <td class="num ${win}">${x.load_s != null ? `${x.load_s} s` : "—"}</td>
           <td class="num ${win}">${fmtVal(x.prefill_tps, "tok/s")}</td>
+          ${anyShort ? `<td class="num ${win}">${fmtVal(x.short_s, "s")}</td>` : ""}
           <td class="num ${win}">${fmtVal(x.decode_tps, "tok/s")}</td>
           ${anyCode ? `<td class="num ${win}">${fmtVal(x.decode_code_tps, "tok/s")}</td>` : ""}
           <td class="num ${win}">${fmt.pct(x.hit_rate)}</td></tr>`;
@@ -843,6 +849,10 @@ FTI18N.add({
           at(ms += 150, () => push("trial", { trial: T, step: "prefill", state: "start", tokens: 16384 }));
           for (let c = 1; c <= 3; c++) at(ms += 350, () => push("progress", { id: `${T}.prefill`, done: Math.min(16384, 5460 * c), total: 16384, rate: pre }));
           at(ms += 200, () => { push("sample", { id: `${T}.prefill`, value: pre }); push("trial", { trial: T, step: "prefill", state: "done", value: pre }); });
+          const sh = demoShort(pre);
+          at(ms += 150, () => push("trial", { trial: T, step: "short", state: "start", tokens: 256 }));
+          for (let i = 0; i < 3; i++) at(ms += 150, () => push("sample", { id: `${T}.short`, value: sh * (0.95 + Math.random() * 0.1) }));
+          at(ms += 100, () => push("trial", { trial: T, step: "short", state: "done", value: sh }));
           for (const [k, v] of [["decode", dec], ["decode_code", code]]) {
             if (v == null) continue;
             at(ms += 150, () => push("trial", { trial: T, step: k, state: "start", tokens: 300 }));
@@ -863,6 +873,10 @@ FTI18N.add({
       clearInterval(timer);
       timer = setInterval(() => { while (script.length && Date.now() - t0 >= script[0][0]) script.shift()[1](); if (!script.length) clearInterval(timer); }, 50);
     }
+    // a plausible short-prompt wait for a demo run: two 3060s gave ~3 s at ~450 tok/s of 16k prefill
+    function demoShort(pre) {
+      return Math.round((1350 / Math.max(1, pre)) * 100) / 100;
+    }
     function demoResult(trials) {
       const now = Date.now() / 1000;
       return {
@@ -876,7 +890,7 @@ FTI18N.add({
         } },
         trials: trials ? DEMO_RUNS.map(([label, key, what, what_en, change, pre, dec, code, decision], i) => ({
           label, key, what: what ? [what, what_en] : null, change, decision, ok: true, kv_tokens: label === "H" ? 131072 : 65536,
-          expert_slots: 1520 - i * 20, load_s: 95 + i * 3, prefill_tps: pre, decode_tps: dec, decode_code_tps: code, hit_rate: 0.58, args: [] })) : [],
+          expert_slots: 1520 - i * 20, load_s: 95 + i * 3, prefill_tps: pre, short_s: demoShort(pre), decode_tps: dec, decode_code_tps: code, hit_rate: 0.58, args: [] })) : [],
         skipped: [
           { flag: "--memory-ratio", why: "上げると他のアプリが GPU を使ったときに落ちます。速さではなく余裕の問題なので測りません。", why_en: "Raising it crashes when other apps use the GPU; it is headroom, not speed." },
           { flag: "--max-running-req", why: "同時に何人で使うかで決まる値で、速さの測定では決められません。", why_en: "It depends on how many people use the server at once, not on speed." },

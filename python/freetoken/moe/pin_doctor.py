@@ -105,9 +105,14 @@ def run(ns) -> str:
         say(f"  {_fmt(budget)} is too little to pin expert banks. Serve with --moe-cpu-layers 1.0 (every expert")
         say("  decodes on the CPU), or --moe-strategy cpu, and expect CPU-bound decode. --moe-bank-ram is the")
         say("  other way out: it maps the banks and locks only a resident prefix, so the cap stops deciding.")
+        say("  Either way a short prompt pays for it: splitting its experts between the CPU and the GPU")
+        say("  (the split prefill) needs pinned banks, and --moe-bank-ram does not take that path at all.")
     else:
         say(f"  Banks up to {_fmt(budget)} pin in full. Over that, --moe-cpu-layers auto locks the excess")
         say("  head and tail layers for CPU decode; the split is planned against the figure above.")
+        say("  Locked layers also keep the old prefill for short prompts (the CPU alone up to 256 tokens,")
+        say("  the whole layer above): splitting a layer's experts between the CPU and the GPU needs its")
+        say("  banks pinned. The start line \"prefill split: ...\" says how many layers take it.")
     if budget is not None:
         say(f"  To override the recorded figure anywhere: FREETOKEN_PIN_BUDGET_GB={budget / GiB:.2f}")
     say("  ft doctor disk covers the other half (the banks on disk, readahead, per-cap cost).")

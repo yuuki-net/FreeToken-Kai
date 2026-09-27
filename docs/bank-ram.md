@@ -592,6 +592,12 @@ were worth about a factor of two, and should not have been quoted as if they wer
 
 ## Limits and caveats
 
+- **Short prompts do not get the split prefill.** Without this flag a prompt of 64 to 1024
+  tokens splits each layer's experts between the CPU executor and the GPU (on two RTX 3060s a
+  fresh 270-token prompt: 3.0 s to the first token instead of 8.4). A mapped bank's prefill reads
+  its rows its own way, so under `--moe-bank-ram` a short prompt still takes the CPU alone (up to
+  256 tokens) or the whole-layer path.
+
 - **Prefill is slower.** Each chunk still streams every expert of every layer, and the quarter
   that is not registered goes through a pinned bounce buffer. The 2-7x first measured here predates
   the chunk work in [prefill-chunk.md](prefill-chunk.md): on the two RTX 3060s a 19.9k-token prompt

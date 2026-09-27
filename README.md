@@ -163,6 +163,7 @@ ignore the rest.
 | 7 | **A KV cache 1.9x or 3.6x smaller**, stored as block-quantized codes: 1.25 GiB down to 0.35 GiB at 64k on a 6 GB card. It buys VRAM, not speed — past a few thousand tokens of context it costs about a third of the decode rate. Plain paged-attention models and gpt-oss on the Triton backend, and Qwen3.8-Flash-Next on its own sparse backend — where the cost above does not apply: measured on two RTX 3060s, `q4_0` decode is flat from 8k to 125k of context (−1.4%) while the KV drops 1.55 GiB to 0.47 GiB per rank, because its attention reads a fixed budget of tokens however long the context is. On gpt-oss use `q8_0`: it runs gpt-oss-120b at 128k of context on two RTX 3060s, and `q4_0` breaks its answers. | `--kv-cache-dtype q4_0` (gpt-oss: `q8_0`) |
 | 8 | **The checkpoint's bf16 dense weights served as fp8.** Attention, GDN, shared expert, lm_head and the embedding are quantized per output row at load and read W8A16; the router, hyper-connection, QSA indexer, PLE and GDN gates stay bf16. Qwen3.8-Flash-Next's resident dense weights go from 4.9 GB per card to 2.9 GB, and the freed VRAM goes to the expert cache. | `--dense-quant fp8` |
 | 9 | **A prefill chunk sized to the VRAM that is actually free.** Upstream's fixed 8192 needs 0.97 GiB of transient on a 35B MoE; a 6 GB card does not have it, so long prompts crawled and sometimes died. The transient is measured at startup; the chunk itself is solved before every prefill, against the VRAM free at that moment, with `--max-prefill-length` left as the ceiling. Running the GDN and attention over pieces of a chunk, and the MoE over all of it, makes the chunk wider still: a 20k-token prompt went 490 → 722 tok/s on a 2060 and 437 → 546 on two 3060s. | automatic, `--prefill-chunk-budget`; `--prefill-mixer-pieces 2` |
+| 10 | **Short prompts prefilled by the CPU and the GPU at once.** A prefill moved every layer's whole expert bank to the GPU, however few tokens it held, and a short prompt uses most experts only once or twice. Now a prompt of 64 to 1024 tokens gives each layer's least-used experts to the CPU and moves only the others, both running at the same time. On two RTX 3060s a fresh 270-token prompt's first token came after 3.0 s instead of 8.4 s, a 64-token one after 2.1 s instead of 5.6. Layers whose banks could not be pinned, and `--moe-bank-ram`, keep the old path. | automatic (`FREETOKEN_PREFILL_SPLIT=0` turns it off) |
 
 Everything else is upstream FreeToken.
 
@@ -237,6 +238,20 @@ and two of the changes here are prefill changes.
 The follow-up-turn column is the one a person actually feels in a chat client: the prefix is
 already cached, only the new message is prefilled. Getting it from 9 s to 2.4–4.5 s took removing
 the expert streaming that a cached prefix was still paying for every turn.
+
+A message of a few hundred tokens is where the CPU-only path ran out: it computes every expert
+the message uses, and the CPU is slow at that past a couple of hundred tokens, while streaming the
+whole bank instead costs the same seven seconds on the two 3060s however short the message is.
+Splitting each layer between the two -- the CPU takes the experts few tokens use, the GPU receives
+only the rest, at once -- measured on the two 3060s with fresh prompts (A B A B, 2026-09-27):
+
+| Prompt | 64 tokens | 128 | 270 | 512 | 1024 |
+|---|---|---|---|---|---|
+| First token, before | 5.6 s | 6.8 s | 8.4 s | 8.0 s | 8.0 s |
+| First token, split | **2.1 s** | **2.3 s** | **3.0 s** | **4.0 s** | **6.8 s** |
+
+On the 2060 the gain is smaller (at most about half a second): 21 of Ornith's 40 layers there
+cannot be pinned, and those keep the old path.
 
 A card whose fused kernels do not fit pays for it here more than anywhere else. On the 2060 the
 prefill used to cost 3.2 s per 1k tokens at 4k of prompt and 5.2 s at 20k — the curve rose because

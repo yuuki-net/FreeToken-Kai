@@ -12,9 +12,11 @@ Two stages, one background job in ``ft mgr`` (torch-free; the GPU work runs in c
    settings after each run, so a kept change can open or close later ones.
 
 What a run measures, on this repository's own documents and code (a nonce first line keeps the
-prefix cache out of it): a 16k-token prompt twice, generation on prose three times (median), and
-generation on code three times when an MTP head is in play (its acceptance depends on the text).
-Which generation figure decides follows the use the person picked: prose, code, or both.
+prefix cache out of it): a 16k-token prompt twice, the first token of a 256-token prompt three
+times (median; what a chat turn behind a cached prefix waits for, and a path of its own -- the
+split prefill -- that a 16k prompt never takes), generation on prose three times, and generation
+on code three times when an MTP head is in play (its acceptance depends on the text). Which
+generation figure decides follows the use the person picked: prose, code, or both.
 
 The engine the manager was running is stopped first and started again at the end, whatever
 happened. Progress is a list of events the page polls.
@@ -49,6 +51,13 @@ PREFILL_TOKENS = 16384
 # three runs, median: on a 2060 two 200-token runs swung 31-36 tok/s between runs that should match
 DECODE_TOKENS = 300
 DECODE_RUNS = 3
+# a short prompt, fresh: the split prefill's range (64-1024 rows), where two RTX 3060s went from
+# 8.4 s to 3.0 s for 270 tokens -- none of which a 16k prompt shows. Its first token swung up to
+# 25% between runs of the same settings there (2.0-2.6 s), hence three runs and a loose hold.
+SHORT_TOKENS = 256
+SHORT_RUNS = 3
+SHORT_HOLD = 1.25  # a change is not kept when the short prompt waits longer than this
+SHORT_GAIN = 0.85  # ... and is kept when it waits no more than this while the rest holds
 USES = ("both", "prose", "code")
 MODES = ("standard", "thorough")
 
@@ -244,17 +253,26 @@ def generations(best: dict, t: dict, use: str) -> tuple[float, float]:
 
 def keep(best: dict, t: dict, c: search.Candidate, use: str) -> bool:
     """A change is kept when either figure gains while the other holds, whatever it was tried for:
-    a 16-bit KV cache is tried for generation, but on two 3060s it doubled prompt processing."""
+    a 16-bit KV cache is tried for generation, but on two 3060s it doubled prompt processing.
+    The short prompt's first token must hold too (``SHORT_HOLD``), and a change that shortens it
+    enough while the others hold is kept for that alone: moving the experts to the GPU for every
+    step (``--moe-strategy offload``) leaves no CPU executor, and with it no split prefill."""
     if not t.get("ok"):
         return False
     g0, g1 = generations(best, t, use)
     p0, p1 = best.get("prefill_tps") or 0.0, t.get("prefill_tps") or 0.0
+    s0, s1 = best.get("short_s"), t.get("short_s")
+    if s0 and s1 and s1 > SHORT_HOLD * s0:
+        return False
     gen_gain = c.gain if c.goal == "gen" else 1.03
     prefill_gain = c.gain if c.goal == "prefill" else 1.05
+    if s0 and s1 and s1 <= SHORT_GAIN * s0 and p1 >= c.hold_prefill * p0 and g1 >= c.hold_gen * g0:
+        return True
     return (g1 >= gen_gain * g0 and p1 >= c.hold_prefill * p0) or (p1 >= prefill_gain * p0 and g1 >= c.hold_gen * g0)
 
 
-FIGURES = ("prefill_tps", "decode_tps", "decode_code_tps")
+FIGURES = ("prefill_tps", "decode_tps", "decode_code_tps", "short_s")
+LOWER_IS_BETTER = ("short_s",)
 
 
 def close_on_generation(best: dict, t: dict, c: search.Candidate, use: str, band: float = 0.8) -> bool:
@@ -275,7 +293,7 @@ def slower_of(a: dict, b: dict) -> dict:
     out = dict(b)
     for k in FIGURES:
         if a.get(k) and b.get(k):
-            out[k] = min(a[k], b[k])
+            out[k] = max(a[k], b[k]) if k in LOWER_IS_BETTER else min(a[k], b[k])
     return out
 
 
@@ -906,20 +924,27 @@ class TuneJob:
                 g += f" (code {x['decode_code_tps']:.1f})"
             return f"{x.get('prefill_tps') or 0:.0f} / {g}"
 
+        def short(ja: bool) -> str:
+            if not (best.get("short_s") and t.get("short_s")):
+                return ""
+            if ja:
+                return f"短い質問の最初のトークンまでが {best['short_s']:.2f} → {t['short_s']:.2f} 秒。"
+            return f" A short prompt's first token went {best['short_s']:.2f} -> {t['short_s']:.2f} s."
+
         ch = c.change()
         if won:
             touched = set(c.changes) | set(c.drop)
             notes = [n for n in notes if n["flag"] not in touched]
-            why = f"実測で採用: {c.what_ja}。プロンプト処理 / 生成が {figs(best)} → {figs(t)} tok/s。"
-            why_en = f"Measured and kept: {c.what_en}. Prompt processing / generation went {figs_en(best)} -> {figs_en(t)} tok/s."
+            why = f"実測で採用: {c.what_ja}。プロンプト処理 / 生成が {figs(best)} → {figs(t)} tok/s。{short(True)}"
+            why_en = f"Measured and kept: {c.what_en}. Prompt processing / generation went {figs_en(best)} -> {figs_en(t)} tok/s.{short(False)}"
             for flag, value in c.changes.items():
                 notes.append({"flag": flag, "value": value, "source": "measured", "why": why, "why_en": why_en})
             for flag in c.drop:
                 notes.append({"flag": flag, "value": None, "source": "measured", "removed": True, "why": why, "why_en": why_en})
             return notes
         if t.get("ok"):
-            why = f"試して不採用: {c.what_ja}。プロンプト処理 / 生成が {figs(best)} → {figs(t)} tok/s で、採用の条件に届きませんでした。"
-            why_en = f"Tried, not kept: {c.what_en}. Prompt processing / generation went {figs_en(best)} -> {figs_en(t)} tok/s, short of the bar."
+            why = f"試して不採用: {c.what_ja}。プロンプト処理 / 生成が {figs(best)} → {figs(t)} tok/s で、採用の条件に届きませんでした。{short(True)}"
+            why_en = f"Tried, not kept: {c.what_en}. Prompt processing / generation went {figs_en(best)} -> {figs_en(t)} tok/s, short of the bar.{short(False)}"
         else:
             why = f"試して不採用: {c.what_ja}。起動または測定に失敗しました（{(t.get('error') or '')[:120]}）。"
             why_en = f"Tried, not kept: {c.what_en}. It failed to start or to finish the measurement ({(t.get('error') or '')[:120]})."
@@ -989,6 +1014,23 @@ class TuneJob:
             self._ev("sample", id=f"{label}.prefill", value=round(tps, 1))
         out["prefill_tps"] = max(prefill)
         self._ev("trial", trial=label, step="prefill", state="done", value=out["prefill_tps"])
+
+        self._check()
+        self._ev("trial", trial=label, step="short", state="start", tokens=SHORT_TOKENS)
+        waits = []
+        for i in range(SHORT_RUNS):
+            head = f"[{label}-s{i}-{os.urandom(5).hex()}]\n"  # fresh: the whole prompt is prefilled
+            if self._tokenizer is not None:
+                body = fit_tokens(self._tokenizer, excerpt(mixed, SHORT_TOKENS * 5, rng), SHORT_TOKENS - 16)
+            else:
+                body = excerpt(mixed, int(SHORT_TOKENS * chars_per_token * 0.8), rng)
+            t = self._clock()
+            self._http(port, "/v1/completions", {"model": model_id, "prompt": head + body, "max_tokens": 1, "ignore_eos": True},
+                       timeout=PROMPT_STALL_S)
+            waits.append(self._clock() - t)
+            self._ev("sample", id=f"{label}.short", value=round(waits[-1], 2))
+        out["short_s"] = round(sorted(waits)[len(waits) // 2], 2)
+        self._ev("trial", trial=label, step="short", state="done", value=out["short_s"])
 
         for kind in (("prose", "code") if code else ("prose",)):
             self._check()

@@ -63,6 +63,18 @@ def test_when_the_split_applies(monkeypatch):
     assert moe.prefill_split_max_tokens(_cache()) == 0
 
 
+def test_the_start_line_says_where_it_applies(monkeypatch):
+    monkeypatch.delenv("FREETOKEN_PREFILL_SPLIT", raising=False)
+    monkeypatch.delenv("FREETOKEN_PREFILL_SPLIT_MAX_TOKENS", raising=False)
+    assert moe.describe_prefill_split(_cache(cpu_executor=None)) is None
+    line = moe.describe_prefill_split(_cache(num_layers=40, _unpinned_layers=frozenset(range(21))))
+    assert "64-1024 tokens" in line and "on 19 of 40 MoE layers" in line and "the 21 without pinned banks" in line
+    assert "without pinned" not in moe.describe_prefill_split(_cache(num_layers=48, _unpinned_layers=frozenset()))
+    assert "--moe-bank-ram" in moe.describe_prefill_split(_cache(num_layers=48, prefix_pinned_rows=338))
+    monkeypatch.setenv("FREETOKEN_PREFILL_SPLIT", "0")
+    assert "off" in moe.describe_prefill_split(_cache(num_layers=48))
+
+
 def _fake_layer(monkeypatch, cache, weight_on_input=False):
     layer = moe.OffloadMoELayer.__new__(moe.OffloadMoELayer)
     layer.layer_id, layer.num_experts, layer.apply_router_weight_on_input = 0, 4, weight_on_input

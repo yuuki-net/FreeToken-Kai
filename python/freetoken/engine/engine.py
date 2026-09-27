@@ -1725,6 +1725,11 @@ class Engine:
         )
         cache.set_cpu_executor(executor)
         self.cpu_moe_executor = executor
+        from freetoken.layers.moe import describe_prefill_split
+
+        line = describe_prefill_split(cache)
+        if line:
+            logger.info(line)
 
     def _sync_get_memory(self) -> Tuple[int, int]:
         """Get the min and max free memory across TP ranks."""
