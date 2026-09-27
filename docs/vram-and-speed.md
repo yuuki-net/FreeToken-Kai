@@ -51,8 +51,9 @@ turns into expert slots: 358 → 902. Warm-cache hit rate 42.2% → 50.7%. Decod
 whole layers to the CPU — 21 of 40 here. Raising `FREETOKEN_PIN_BUDGET_GB` took that to 17,
 then 12. Decode: **+2-3%, inside the run-to-run noise.** (A short prompt's prefill is where the
 locked layers cost: splitting a layer's experts between the CPU and the GPU needs its banks
-pinned, so those 21 keep the older path, and the split gains at most about half a second on this
-card against 8.4 → 3.0 s for a 270-token prompt on two 3060s whose layers all pin. The start line
+pinned, so those 21 keep the older path. With 19 of 40 layers pinned the split gains at most
+about half a second here; with every layer pinned, as on two 3060s, a 270-token prompt went from
+8.4 s to 3.0 s. It is the pinned share that decides, not the card. The start line
 `prefill split: ...` gives the count.)
 
 **More CPU threads.** The daily setting was `--moe-cpu-threads 6` on a 16-core CPU. Tried 6,

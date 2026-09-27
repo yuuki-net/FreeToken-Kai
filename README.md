@@ -250,8 +250,11 @@ only the rest, at once -- measured on the two 3060s with fresh prompts (A B A B,
 | First token, before | 5.6 s | 6.8 s | 8.4 s | 8.0 s | 8.0 s |
 | First token, split | **2.1 s** | **2.3 s** | **3.0 s** | **4.0 s** | **6.8 s** |
 
-On the 2060 the gain is smaller (at most about half a second): 21 of Ornith's 40 layers there
-cannot be pinned, and those keep the old path.
+What decides the gain is how many layers have pinned banks, not which card it is: a layer whose
+bank could not be pinned keeps the old path. On the two 3060s every layer was pinned. On the RTX
+2060 host with Ornith, the WSL page-lock budget left 21 of the 40 layers unpinned, so there the
+prompt as a whole gains at most about half a second, although each pinned layer's share took half
+the time at 256 tokens. The start line `prefill split: ... on N of M MoE layers` gives the count.
 
 A card whose fused kernels do not fit pays for it here more than anywhere else. On the 2060 the
 prefill used to cost 3.2 s per 1k tokens at 4k of prompt and 5.2 s at 20k — the curve rose because

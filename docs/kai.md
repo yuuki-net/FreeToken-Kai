@@ -473,14 +473,18 @@ model that does). Not yet measured on a card.
   rebuild (`ft ctl`) is not available with more than one rank. See [pipeline.md](pipeline.md).
 - On Turing, use `--dtype float16`. A long prefill chunk moves every layer's experts to the GPU:
   ~2 s for Ornith's 40 layers on the 2060 under WSL (9.4 GB/s, measured 2026-09-27; it was ~5 s
-  when this was first written) plus ~1.3 ms per token. A chat turn behind a cached prefix is
-  short, so that movement is most of it. Extends of 64 to 1024 rows split each layer instead:
+  when this was first written) plus ~1.3 ms per token.
+- A short prompt, or a chat turn behind a cached prefix, is where that movement is most of the
+  wait. Extends of 64 to 1024 rows split each layer instead (`FREETOKEN_PREFILL_SPLIT` above):
   the CPU executor computes the experts that few rows use while the GPU receives only the
-  others, at once. Per layer, against what ran before (the production layer at Ornith's
-  geometry with real routing, no model): 64 rows 0.78x, 128 0.63x, 256 0.51x, 512 0.64x.
-  Layers whose banks could not be pinned, and extends under 64 rows, keep the CPU path up to
-  `FREETOKEN_CPU_PREFILL_MAX_TOKENS` (256) rows (a follow-up turn answers in 2-3 s including
-  64 generated tokens, against ~6 s before it).
+  others, at once. On any card this needs the layer's banks pinned; a layer that could not be
+  pinned (`--moe-cpu-layers auto` locks them when the banks exceed the page-lock budget), and
+  an extend under 64 rows, keep the CPU path up to `FREETOKEN_CPU_PREFILL_MAX_TOKENS` (256) rows
+  or the whole-layer stream. So the gain follows the pinned share: per pinned layer, against what
+  ran before (the production layer at Ornith's geometry with real routing, no model), 64 rows
+  took 0.78x the time, 128 0.63x, 256 0.51x, 512 0.64x; a prompt's first token on two RTX 3060s,
+  every layer pinned, 8.4 s -> 3.0 s at 270 tokens; on the 2060 host above, 19 of 40 layers
+  pinned, at most about half a second. The start line `prefill split: ...` gives the count.
 - **safetensors 0.8.0 keeps page-locked host memory when it reads straight onto the GPU.**
   Measured on gpt-oss-20b (13,123 MB in three shards, every handle held open the way the loader
   holds them): the process ends 2,492 MB above the same read staged through host memory, and
