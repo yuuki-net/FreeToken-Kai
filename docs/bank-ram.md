@@ -598,11 +598,16 @@ were worth about a factor of two, and should not have been quoted as if they wer
   its rows its own way, so under `--moe-bank-ram` a short prompt still takes the CPU alone (up to
   256 tokens) or the whole-layer path.
 
-- **Prefill is slower.** Each chunk still streams every expert of every layer, and the quarter
-  that is not registered goes through a pinned bounce buffer. The 2-7x first measured here predates
-  the chunk work in [prefill-chunk.md](prefill-chunk.md): on the two RTX 3060s a 19.9k-token prompt
-  took 68.3 s at 64 GB-equivalent against 56.5 s with the same flag and all of the RAM, and
-  `--prefill-mixer-pieces 2` took those to 52.7 s and 45.0 s.
+- **Prefill is slower, by about an eighth where the RAM is there.** Each chunk still streams every
+  expert of every layer, and the quarter that is not registered goes through a pinned bounce
+  buffer. On the two RTX 3060s with 128 GB, the chunk fixed at 4096 tokens so that both runs
+  prefill the same pieces, a 20k-token prompt ran at 463 tok/s with `--moe-bank-ram 42G` against
+  534 without the flag (-13%), and generation at 15.4 against 18.3 tok/s (-16%: the experts that
+  are not resident are computed on the CPU) (A B A B, 2026-09-27). Where the page cache is short
+  of the rows that are not resident, prefill loses more: at 64 GB-equivalent a 19.9k-token prompt
+  took 68.3 s against 56.5 s with the same flag and all of the RAM, and `--prefill-mixer-pieces 2`
+  took those to 52.7 s and 45.0 s. The "2-7x slower" first written here was measured before the
+  chunk work in [prefill-chunk.md](prefill-chunk.md) and no longer holds.
 
   Where the page cache is smaller than the non-resident rows, the chunk's bank read is most of
   that: reading one layer's rows evicts the previous layer's, so every chunk reads nearly all of
