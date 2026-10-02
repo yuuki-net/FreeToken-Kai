@@ -536,12 +536,20 @@ layers are full attention at 2048 B per token per layer, so 36.9 kB/token, and 1
 want 4.7-5.5 GiB against the 1.62 GiB free after initialisation. Whether it can be made to fit is
 untested.
 
-| | RAM | Decode | Prefill, 4096-token chunk |
+| | RAM | Decode | Prefill, 20k-token prompt |
 |---|---|---|---|
-| Qwen3.8-Flash-Next, banks pinned | 128 GB | 18-20 tok/s | 6 s |
-| Qwen3.8-Flash-Next, `--moe-bank-ram 48G` | 64 GB | 14-15 | 10-45 s |
-| gpt-oss-120b, one GPU, `--moe-bank-ram 48G` | 64 GB | 15.2 | 12-52 s |
-| gpt-oss-120b, one GPU, `--moe-bank-ram 24G` | 32 GB | 4.5 | 12-52 s |
+| Qwen3.8-Flash-Next, banks pinned | 128 GB | 18.3 tok/s | 534 tok/s |
+| Qwen3.8-Flash-Next, `--moe-bank-ram 42G` | 128 GB | 15.4 | 463 |
+| Qwen3.8-Flash-Next, `--moe-bank-ram 48G` | 64 GB-equivalent | 14-15 | 292-378 |
+| gpt-oss-120b, one GPU, `--moe-bank-ram 48G` | 64 GB | 15.2 | not re-measured |
+| gpt-oss-120b, one GPU, `--moe-bank-ram 24G` | 32 GB | 4.5 | not re-measured |
+
+The first two rows were run back to back, A B A B, with the chunk fixed at 4096 tokens,
+`--prefill-mixer-pieces 2` and `--spec-mtp 5` (2026-09-27). The 64 GB-equivalent prefill is
+from an earlier night (2026-09-13) whose chunk the startup check chose, 2560 or 3584 tokens:
+292 tok/s without pieces and 378 with two. The decode figures for that row and for gpt-oss-120b
+are older still. gpt-oss-120b took 12-52 s per 4096-token chunk before the chunk work in
+[prefill-chunk.md](prefill-chunk.md), and has not been run since.
 
 **Measure over thousands of tokens.** The same Flash-Next configuration reads 11.5 tok/s over
 110 tokens and 15.0 over 2360. The non-resident rows a session keeps routing to accumulate in

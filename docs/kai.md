@@ -77,7 +77,8 @@ Experimental: `--prefix-disk-cache DIR` keeps the prefix cache of a hybrid GDN m
 so a long prompt the in-memory cache has let go of -- or one sent before a restart -- is read back
 instead of prefilled again (an 8k-token prompt on an RTX 2060: 1.2-1.3 s from disk, 13-14 s to
 prefill). It is aimed at
-`--moe-bank-ram` machines, where a 4096-token prefill chunk of Flash-Next takes 10-45 s. See
+`--moe-bank-ram` machines, where a 20k-token prompt of Flash-Next still takes 43-68 s to
+prefill on two RTX 3060s. See
 [prefix-reuse.md](prefix-reuse.md#keeping-prefixes-on-disk---prefix-disk-cache).
 
 Everything else is upstream FreeToken. The feature sets are independent: image input, the MTP

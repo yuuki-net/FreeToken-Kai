@@ -162,6 +162,18 @@ with what the desktop is doing, the order does not.
 | `--prefill-mixer-pieces 2 --max-prefill-length 8192` | 195.7 | 4352 | 5 | **36.5 s** | **546 tok/s** |
 | `--prefill-mixer-pieces 4 --max-prefill-length 16384` | 195.7 | 4352 | 5 | 36.6 s | 544 tok/s |
 
+The same two cards with `--moe-bank-ram 48G` and a 19,911-token prompt (2026-09-13), where the
+startup check chose narrower chunks:
+
+| | RAM | chunk | chunks | first token | prefill |
+|---|---|---|---|---|---|
+| default | 64 GB-equivalent | 2560 | 8 | 68.3 s | 292 tok/s |
+| `--prefill-mixer-pieces 2` | 64 GB-equivalent | 3584 | 6 | **52.7 s** | **378 tok/s** |
+| default | 128 GB | 2560 | 8 | 56.5 s | 352 tok/s |
+| `--prefill-mixer-pieces 2` | 128 GB | 3584 | 6 | **45.0 s** | **442 tok/s** |
+
+Two pieces gain as much where the RAM is short of the bank (+29%) as where it is not (+26%).
+
 **On Flash-Next, 2 is the setting; 4 adds nothing.** Measured by part, at two pieces the peak is
 no longer a mixer: it is PLE on the first pipeline rank (170.5 KiB per token of its own) and the
 routed experts on the second (98.7). Running those over the pieces as well was tried. It worked
