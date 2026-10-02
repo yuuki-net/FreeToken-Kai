@@ -74,7 +74,7 @@ def test_the_engine_config_hands_the_resolved_dtype_to_the_tower(monkeypatch):
     monkeypatch.setattr(cfg_mod, "get_model_spec", lambda arch: spec)
     monkeypatch.setattr(cfg_mod, "_load_attr", lambda module, name: (
         lambda h: replace(_parsed_qwen4(), vision_config=_vc()) if getattr(h, "vision_config", None) else _parsed_qwen4()))
-    monkeypatch.setattr(cfg_mod, "cached_load_hf_config", lambda path: hf)
+    monkeypatch.setattr(cfg_mod, "cached_load_hf_config", lambda path, overrides: hf)
     monkeypatch.setattr(cfg_mod, "checkpoint_quant_config", lambda *a, **k: None)
 
     def make(dtype, **mm):

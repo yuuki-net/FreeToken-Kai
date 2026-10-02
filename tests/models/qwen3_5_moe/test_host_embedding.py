@@ -37,7 +37,7 @@ def test_engine_config_flag_reaches_the_model_config(monkeypatch):
 
     monkeypatch.setattr(cfg_mod, "get_model_spec", lambda arch: SimpleNamespace(module="m", parse_config="p", encoders=()))
     monkeypatch.setattr(cfg_mod, "_load_attr", lambda module, name: (lambda hf: _parsed(4)))
-    monkeypatch.setattr(cfg_mod, "cached_load_hf_config", lambda path: _toy_hf_config(4))
+    monkeypatch.setattr(cfg_mod, "cached_load_hf_config", lambda path, overrides: _toy_hf_config(4))
     monkeypatch.setattr(cfg_mod, "checkpoint_quant_config", lambda *a, **k: None)
     kw = dict(model_path="x", dtype=torch.bfloat16, tp_info=DistributedInfo(0, 1))
     assert EngineConfig(**kw).model_config.embed_host is False

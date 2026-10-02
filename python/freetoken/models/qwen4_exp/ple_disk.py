@@ -167,9 +167,18 @@ class DiskRowTable:
         self._graph_dev = torch.empty(
             max_graph_rows * self._token_bytes, dtype=torch.uint8, device=self._device
         )
+        # completes once the last graph launch that read ``_graph_pinned`` has run (recorded by the
+        # dispatch context after the step's fill: a record inside the capture would not be observable)
+        self._graph_consumed = torch.cuda.Event()
         eager_bytes = max_extend_tokens * self._token_bytes
-        self._eager_pinned = alloc_pinned_tensor(eager_bytes, dtype=torch.uint8)
-        self._eager_pinned.zero_()  # the warmup prefill stages nothing and reads whatever sits here
+        # the overlap scheduler fills batch k+1 while batch k's lookup copy may still be queued: the
+        # eager staging alternates two pinned buffers, and each is rewritten only once the H2D copy
+        # that last read it has run (``_eager_read[i]``, recorded right after that copy)
+        self._eager_pinned = [alloc_pinned_tensor(eager_bytes, dtype=torch.uint8) for _ in range(2)]
+        for buf in self._eager_pinned:
+            buf.zero_()  # the warmup prefill stages nothing and reads whatever sits here
+        self._eager_read = [torch.cuda.Event(), torch.cuda.Event()]
+        self._eager_slot = 0
         self._eager_dev = torch.empty(eager_bytes, dtype=torch.uint8, device=self._device)
         # probe picks flag-sync (graph WAITs at the consume, host fills then signals) or launch-gating
         from freetoken.kernel.row_store import probe_wait_sync
@@ -191,8 +200,15 @@ class DiskRowTable:
 
     def fill(self, runs: Sequence[torch.Tensor], *, graph: bool) -> None:
         """Stage per-request token runs (two context ids, then the new tokens) in batch order."""
+        if graph:
+            self._graph_consumed.synchronize()
+            pinned = self._graph_pinned
+        else:
+            self._eager_slot ^= 1
+            self._eager_read[self._eager_slot].synchronize()
+            pinned = self._eager_pinned[self._eager_slot]
+        # after the waits above, so the profile keeps measuring the staging and not the GPU's lag
         started = time.perf_counter() if self._profile_every else 0.0
-        pinned = self._graph_pinned if graph else self._eager_pinned
         offset = 0
         prof = _prefill_profile()
         with prof.ple_fill() if prof is not None else nullcontext():
@@ -293,21 +309,27 @@ class DiskRowTable:
         # no try/finally: a failed launch leaves no WAIT pending, so the fill must not run
         if deferred is not None:
             deferred()
+        if use_graph:
+            # only after this step's fill: the next fill waits on this launch, not the fill on it
+            self._graph_consumed.record(torch.cuda.current_stream(self._device))
 
     # ---------------- device side (PLETableBackend protocol) ----------------
 
     def lookup(self, row_ids: torch.Tensor, out: torch.Tensor | None = None) -> torch.Tensor:
         rows = row_ids.shape[0]
+        stream = torch.cuda.current_stream(self._device)
         capturing = torch.cuda.is_current_stream_capturing()
         if capturing and self._wait_sync:
             from freetoken.kernel.row_store import wait_reset
 
-            wait_reset(torch.cuda.current_stream(self._device), self._flag)
+            wait_reset(stream, self._flag)
         pinned, dev = (
-            (self._graph_pinned, self._graph_dev) if capturing else (self._eager_pinned, self._eager_dev)
+            (self._graph_pinned, self._graph_dev) if capturing else (self._eager_pinned[self._eager_slot], self._eager_dev)
         )
         nbytes = rows * self._token_bytes
         dev[:nbytes].copy_(pinned[:nbytes], non_blocking=True)
+        if not capturing:
+            self._eager_read[self._eager_slot].record(stream)
         values = dev[:nbytes].view(torch.float8_e4m3fn).to(self.dtype)
         if self.scale != 1.0:
             values = values * self.scale

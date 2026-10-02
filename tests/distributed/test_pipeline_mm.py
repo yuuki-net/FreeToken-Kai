@@ -33,7 +33,7 @@ def _engine_config(monkeypatch, **kw):
     hf.vision_config = SimpleNamespace(depth=2)
     monkeypatch.setattr(cfg_mod, "get_model_spec", lambda arch: spec)
     monkeypatch.setattr(cfg_mod, "_load_attr", lambda module, name: parse)
-    monkeypatch.setattr(cfg_mod, "cached_load_hf_config", lambda path: hf)
+    monkeypatch.setattr(cfg_mod, "cached_load_hf_config", lambda path, overrides: hf)
     monkeypatch.setattr(cfg_mod, "checkpoint_quant_config", lambda *a, **k: None)
     return lambda **more: EngineConfig(model_path="x", dtype=torch.bfloat16, **{**kw, **more})
 

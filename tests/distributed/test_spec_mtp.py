@@ -224,7 +224,7 @@ def test_engine_config_spec_mtp_adds_head_layer_on_last_rank(monkeypatch):
 
     monkeypatch.setattr(cfg_mod, "get_model_spec", lambda arch: SimpleNamespace(module="m", parse_config="p", encoders=()))
     monkeypatch.setattr(cfg_mod, "_load_attr", lambda module, name: (lambda hf: _parsed_qwen4()))
-    monkeypatch.setattr(cfg_mod, "cached_load_hf_config", lambda path: _qwen4_hf_config())
+    monkeypatch.setattr(cfg_mod, "cached_load_hf_config", lambda path, overrides: _qwen4_hf_config())
     monkeypatch.setattr(cfg_mod, "checkpoint_quant_config", lambda *a, **k: None)
     kw = dict(model_path="x", dtype=torch.bfloat16)
     last = EngineConfig(tp_info=DistributedInfo(1, 2), parallel="pp", spec_mtp=3, **kw)
