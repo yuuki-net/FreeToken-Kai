@@ -9,7 +9,7 @@ how they trade against each other on your card. Now a benchmark in the browser m
 with the model, tries the settings one at a time, and hands you the fastest as a launch profile.
 
 > An unofficial fork of [FlashML-org/FreeToken](https://github.com/FlashML-org/FreeToken), merged
-> with upstream `main` at `0d652e7` (2026-09-26). Not affiliated with, endorsed by, or supported by
+> with upstream `main` at `d3512b4` (2026-10-02). Not affiliated with, endorsed by, or supported by
 > FlashML. The license is unchanged (Apache-2.0).
 >
 > **Please keep questions and bug reports about this fork in this repository.** The FreeToken
