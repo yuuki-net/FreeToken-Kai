@@ -98,19 +98,33 @@ def dtype_of(name: str):
 # ---------------------------------------------------------------------------------------
 # geometry
 # ---------------------------------------------------------------------------------------
-class MappedBankLayout:
-    """Where every (bank, layer) block sits. Immutable for the life of the file."""
+def _norm_banks(banks) -> list[tuple[str, tuple[int, ...], str, int]]:
+    return [(str(n), tuple(int(x) for x in s), str(d), int(b)) for n, s, d, b in banks]
 
-    def __init__(self, num_experts: int, layers, banks, meta: dict | None = None):
+
+class MappedBankLayout:
+    """Where every (bank, layer) block sits. Immutable for the life of the file.
+
+    ``banks`` is the geometry of every layer; ``layer_banks`` overrides it for the layers whose rows
+    differ (Kai: a GGUF keeps each layer's own ggml types, so a GSQ-RCO build has three row sizes).
+    A file without overrides is the version-2 file as it always was."""
+
+    def __init__(self, num_experts: int, layers, banks, meta: dict | None = None, layer_banks: dict | None = None):
         self.num_experts = int(num_experts)
         self.layers = [int(x) for x in layers]
         if sorted(set(self.layers)) != self.layers:
             raise ValueError(f"bank layers must be strictly increasing, got {self.layers[:8]}...")
         # [(name, row shape, dtype name, bytes per row)]
-        self.banks = [(str(n), tuple(int(x) for x in s), str(d), int(b)) for n, s, d, b in banks]
+        self.banks = _norm_banks(banks)
+        self.layer_banks = {
+            int(layer): _norm_banks(b) for layer, b in (layer_banks or {}).items() if _norm_banks(b) != self.banks
+        }
+        if any(layer not in self.layers for layer in self.layer_banks):
+            raise ValueError(f"per-layer bank geometry for layers outside {self.layers[:8]}...")
         self.meta = json.loads(_dumps(meta or {}))  # normalized: what a read gives back
         self._block = {
-            name: _align_up(self.num_experts * row_bytes) for name, _, _, row_bytes in self.banks
+            (name, layer): _align_up(self.num_experts * row_bytes)
+            for layer in self.layers for name, _, _, row_bytes in self.banks_of(layer)
         }
         head = _PREAMBLE.size + len(self._header_json())
         self.slot_offset = _align_up(head)
@@ -119,19 +133,26 @@ class MappedBankLayout:
         self._offsets: dict[tuple[str, int], int] = {}
         pos = self.data_offset
         for layer in self.layers:
-            for name, _, _, _ in self.banks:
+            for name, _, _, _ in self.banks_of(layer):
                 self._offsets[(name, layer)] = pos
-                pos += self._block[name]
+                pos += self._block[(name, layer)]
         self._total = pos
 
+    def banks_of(self, layer: int) -> list[tuple[str, tuple[int, ...], str, int]]:
+        """One layer's geometry: its own where it has one, else the file's."""
+        return self.layer_banks.get(int(layer), self.banks)
+
     def _header_json(self) -> bytes:
-        return _dumps({
+        header = {
             "version": VERSION,
             "num_experts": self.num_experts,
             "layers": self.layers,
             "banks": [[n, list(s), d, b] for n, s, d, b in self.banks],
             "meta": self.meta,
-        })
+        }
+        if self.layer_banks:
+            header["layer_banks"] = {str(l): [[n, list(s), d, b] for n, s, d, b in banks] for l, banks in self.layer_banks.items()}
+        return _dumps(header)
 
     def _largest_manifest(self) -> int:
         order = list(range(self.num_experts))
@@ -139,19 +160,22 @@ class MappedBankLayout:
         full = {"layers": {str(layer): {"order": order, "digest": digest} for layer in self.layers}}
         return len(_dumps(full))
 
-    def block_bytes(self, name: str) -> int:
-        """Bytes reserved for one (bank, layer) block, alignment padding included."""
-        return self._block[name]
+    def block_bytes(self, name: str, layer: int | None = None) -> int:
+        """Bytes reserved for one (bank, layer) block, alignment padding included (``layer`` None:
+        the file's own geometry)."""
+        if layer is None:
+            return _align_up(self.num_experts * self.row_bytes(name))
+        return self._block[(name, int(layer))]
 
-    def row_bytes(self, name: str) -> int:
-        for bank_name, _, _, rb in self.banks:
+    def row_bytes(self, name: str, layer: int | None = None) -> int:
+        for bank_name, _, _, rb in (self.banks if layer is None else self.banks_of(layer)):
             if bank_name == name:
                 return rb
         raise KeyError(name)
 
-    def span_bytes(self, name: str) -> int:
+    def span_bytes(self, name: str, layer: int | None = None) -> int:
         """Bytes of one block that hold rows: ``num_experts * row_bytes``."""
-        return self.num_experts * self.row_bytes(name)
+        return self.num_experts * self.row_bytes(name, layer)
 
     def offset_of(self, name: str, layer: int) -> int:
         return self._offsets[(name, int(layer))]
@@ -162,14 +186,24 @@ class MappedBankLayout:
     def range_of(self, layers) -> tuple[int, int]:
         """``(start, end)`` file offsets covering every block of ``layers`` (contiguous when they are)."""
         layers = [int(x) for x in layers]
-        first, last = self.banks[0][0], self.banks[-1][0]
-        start = min(self.offset_of(first, layer) for layer in layers)
-        end = max(self.offset_of(last, layer) + self._block[last] for layer in layers)
+        start = min(self.offset_of(self.banks_of(layer)[0][0], layer) for layer in layers)
+        end = max(
+            self.offset_of(self.banks_of(layer)[-1][0], layer) + self._block[(self.banks_of(layer)[-1][0], layer)]
+            for layer in layers
+        )
         return start, end
 
-    def layer_bytes(self) -> int:
-        """Bytes of rows one layer holds across every bank."""
-        return sum(self.span_bytes(name) for name, _, _, _ in self.banks)
+    def layer_bytes(self, layer: int | None = None) -> int:
+        """Bytes of rows one layer holds across every bank (``layer`` None: the largest layer)."""
+        if layer is None:
+            return max(self.layer_bytes(l) for l in self.layers) if self.layer_banks else sum(
+                self.span_bytes(name) for name, _, _, _ in self.banks
+            )
+        return sum(self.span_bytes(name, layer) for name, _, _, _ in self.banks_of(layer))
+
+    def layers_bytes(self, layers) -> int:
+        """Bytes of rows ``layers`` hold together."""
+        return sum(self.layer_bytes(l) for l in layers)
 
     def header_blob(self) -> bytes:
         body = self._header_json()
@@ -194,6 +228,9 @@ class MappedBankLayout:
 
             differ = [n for n in dict.fromkeys([*mine, *theirs]) if mine.get(n) != theirs.get(n)]
             return "banks " + ", ".join(f"{n} {fmt(mine.get(n))} against {fmt(theirs.get(n))}" for n in differ)
+        if self.layer_banks != other.layer_banks:
+            differ = sorted(l for l in set(self.layer_banks) | set(other.layer_banks) if self.banks_of(l) != other.banks_of(l))
+            return f"the per-layer bank geometry of layers {differ[:8]}"
         for key in sorted(set(self.meta) | set(other.meta)):
             if key not in ignore and self.meta.get(key) != other.meta.get(key):
                 return f"{key} {self.meta.get(key)!r} against {other.meta.get(key)!r}"
@@ -205,6 +242,7 @@ class MappedBankLayout:
             d["num_experts"], d["layers"],
             [(n, tuple(s), t, b) for n, s, t, b in d["banks"]],
             d.get("meta") or {},
+            layer_banks={int(l): [(n, tuple(s), t, b) for n, s, t, b in banks] for l, banks in (d.get("layer_banks") or {}).items()},
         )
 
     @classmethod
@@ -251,6 +289,25 @@ def layout_from_sample(sample, layers, num_experts: int, meta: dict | None = Non
         row = t[0]
         banks.append((name, tuple(row.shape), _dtype_name(t.dtype), row.numel() * t.element_size()))
     return MappedBankLayout(num_experts, layers, banks, meta)
+
+
+def layout_from_layer_specs(per_layer: dict, layers, num_experts: int, meta: dict | None = None) -> MappedBankLayout:
+    """Geometry from each layer's own ``{name: (row shape, dtype)}`` (Kai: GGUF experts, one ggml type
+    per layer): the most common geometry is the file's, the others are per-layer overrides."""
+    import math
+    from collections import Counter
+
+    import torch
+
+    def banks(spec):
+        return tuple(
+            (name, tuple(shape), _dtype_name(dtype), math.prod(shape) * torch.empty((), dtype=dtype).element_size())
+            for name, (shape, dtype) in spec.items()
+        )
+
+    geometry = {int(layer): banks(spec) for layer, spec in per_layer.items()}
+    common = Counter(geometry.values()).most_common(1)[0][0]
+    return MappedBankLayout(num_experts, layers, list(common), meta, layer_banks={l: list(g) for l, g in geometry.items() if g != common})
 
 
 # ---------------------------------------------------------------------------------------
@@ -473,15 +530,15 @@ class BankFile:
         """One block's rows as a fresh uint8 tensor ``[num_experts * row_bytes]`` (physical order)."""
         import torch
 
-        n = self.layout.span_bytes(name)
+        n = self.layout.span_bytes(name, layer)
         out = torch.empty(n, dtype=torch.uint8)
         _pread_into(self._fd, out.numpy(), self.layout.offset_of(name, layer))
         return out
 
     def drop_cache(self, layer: int) -> None:
         """Hand the page cache for one layer's blocks back (large sequential passes)."""
-        for name, _, _, _ in self.layout.banks:
-            _drop_cache(self._fd, self.layout.offset_of(name, layer), self.layout.block_bytes(name))
+        for name, _, _, _ in self.layout.banks_of(layer):
+            _drop_cache(self._fd, self.layout.offset_of(name, layer), self.layout.block_bytes(name, layer))
 
     def check_digest(self, layer: int, blocks: dict | None = None) -> dict:
         """Recompute a committed layer's block hashes; raises when one disagrees.
@@ -493,7 +550,7 @@ class BankFile:
             raise BankFileError(f"{self.path}: layer {layer} is not in the file")
         _, digest = state
         blocks = dict(blocks or {})
-        for name, _, _, _ in self.layout.banks:
+        for name, _, _, _ in self.layout.banks_of(layer):
             if name not in blocks:
                 blocks[name] = self.read_block(name, layer)
             got = hashlib.sha256(memoryview(blocks[name].numpy())).hexdigest()
@@ -527,7 +584,7 @@ class BankFile:
             self._forget_layer(layer)
         idx = torch.as_tensor(order, dtype=torch.long)
         digest = {}
-        for name, row_shape, dtype_name, _ in self.layout.banks:
+        for name, row_shape, dtype_name, _ in self.layout.banks_of(layer):
             src = getattr(banks[name], "tensor", banks[name])
             if tuple(src.shape) != (self.layout.num_experts, *row_shape) or _dtype_name(src.dtype) != dtype_name:
                 raise ValueError(
@@ -575,12 +632,12 @@ class BankFile:
             position[logical] = physical
         idx = torch.as_tensor([position[x] for x in new_order], dtype=torch.long)
         new_blocks, new_digest = {}, {}
-        for name, _, _, row_bytes in self.layout.banks:
+        for name, _, _, row_bytes in self.layout.banks_of(layer):
             rows = blocks[name].view(self.layout.num_experts, row_bytes)
             new_blocks[name] = rows.index_select(0, idx).contiguous().flatten()
             new_digest[name] = hashlib.sha256(memoryview(new_blocks[name].numpy())).hexdigest()
         self._write_journal(layer, old_order, new_order, old_digest, new_digest, blocks)
-        for name, _, _, _ in self.layout.banks:
+        for name, _, _, _ in self.layout.banks_of(layer):
             _pwrite_all(self._fd, new_blocks[name].numpy(), self.layout.offset_of(name, layer))
         os.fdatasync(self._fd)
         self._commit_layer(layer, new_order, new_digest)
@@ -592,7 +649,7 @@ class BankFile:
         header = _dumps({
             "layer": layer, "old_order": old_order, "new_order": new_order,
             "old_digest": old_digest, "new_digest": new_digest,
-            "blocks": [[name, self.layout.span_bytes(name)] for name, _, _, _ in self.layout.banks],
+            "blocks": [[name, self.layout.span_bytes(name, layer)] for name, _, _, _ in self.layout.banks_of(layer)],
         })
         path = self.journal_path(layer)
         h = hashlib.sha256()
@@ -600,7 +657,7 @@ class BankFile:
             head = _JOURNAL_HEAD.pack(_JOURNAL_MAGIC, 1, len(header)) + header
             f.write(head)
             h.update(head)
-            for name, _, _, _ in self.layout.banks:
+            for name, _, _, _ in self.layout.banks_of(layer):
                 data = memoryview(blocks[name].numpy())
                 f.write(data)
                 h.update(data)

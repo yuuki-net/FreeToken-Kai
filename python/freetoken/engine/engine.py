@@ -1766,10 +1766,24 @@ class Engine:
                 from freetoken.moe.expert_banks import ExpertBanks
                 from freetoken.moe.legacy_format import legacy_format_for
 
-                banks = ExpertBanks(
-                    legacy_format_for(method.kind, method.kernel.name), {}, streamed=True,
-                    kind=method.kind, kernel=method.kernel.name, layout=method.layout(),
-                )
+                if method.kind is QuantKind.GGUF:
+                    # Kai: one ggml type per layer -- the slot pools key on the tags, MMQ on the tails.
+                    # This rank's layers, by global block number (the same offset as the loader, PR #11)
+                    from freetoken.models.gguf.experts import gguf_bank_geometry
+                    from freetoken.moe.expert_banks import _gguf_first_layer
+
+                    geometry = gguf_bank_geometry(
+                        config.model_path, num_moe_layers, first_layer=_gguf_first_layer(config.model_config),
+                    )
+                    banks = ExpertBanks(
+                        geometry.quant_format, {}, streamed=True, kind=method.kind, kernel=method.kernel.name,
+                        layout=None, layer_tags=geometry.tags, row_tail_bytes=geometry.tails,
+                    )
+                else:
+                    banks = ExpertBanks(
+                        legacy_format_for(method.kind, method.kernel.name), {}, streamed=True,
+                        kind=method.kind, kernel=method.kernel.name, layout=method.layout(),
+                    )
             else:
                 with _weight_load_context():
                     banks = load_expert_banks(

@@ -488,7 +488,9 @@ def load_expert_banks(
     if auto:
         from freetoken.models.weight import experts_scattered
 
-        parallel = _PARALLEL_READER_SUPPORTED and not dummy and experts_scattered(model_path)
+        # a GGUF has no parallel reader and no safetensors index for experts_scattered to look for
+        gguf = method is not None and method.kind is QuantKind.GGUF
+        parallel = _PARALLEL_READER_SUPPORTED and not dummy and not gguf and experts_scattered(model_path)
         # Low-RAM fallback: the parallel reader holds whole-shard ANONYMOUS buffers
         # (non-reclaimable) on top of the ~bank-sized resident set, so on a memory-tight box
         # it OOMs where the serial path (reclaimable file mmap) survives. Drop to serial when
@@ -514,7 +516,10 @@ def load_expert_banks(
             from freetoken.models.gguf.experts import load_gguf_expert_banks
 
             # each layer keeps its own ggml types, so the banks come from the file, not from one method's layout
-            return load_gguf_expert_banks(model_path, model_config.num_moe_layers, first_layer=_gguf_first_layer(model_config), dummy=dummy, device=device if resident else None)
+            return load_gguf_expert_banks(
+                model_path, model_config.num_moe_layers, first_layer=_gguf_first_layer(model_config), dummy=dummy,
+                device=device if resident else None, layer_sink=layer_sink,
+            )
         if method is None:
             return _legacy_expert_banks(model_path, model_config, device, dtype, dummy, par, workers, chunk, decode_target, layer_sink)
         return _method_expert_banks(model_path, model_config, method, device, dummy, par, workers, chunk, layer_sink, resident)

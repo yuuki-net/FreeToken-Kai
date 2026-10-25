@@ -228,6 +228,15 @@ def widest_row_block_bytes_from_config(model_config) -> int | None:
     return _per_expert_from_config(model_config, _WIDEST_ROW_BLOCK_BYTES)
 
 
+def cell_bytes_of_specs(spec: dict) -> int:
+    """Bytes one expert occupies across its host banks, from ``{role: (row shape, dtype)}`` (exact)."""
+    import math
+
+    import torch
+
+    return sum(math.prod(shape) * torch.empty((), dtype=dtype).element_size() for shape, dtype in spec.values())
+
+
 def cell_bytes_of_layout(specs) -> int:
     """Bytes one expert occupies across its host banks, from a kernel layout (exact)."""
     import math

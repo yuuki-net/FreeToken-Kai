@@ -2,17 +2,23 @@
 
 Each layer keeps its own ggml types, so each layer gets its own bank shapes: ``gate_up`` [E, 2I, row_bytes] (expert e's gate rows, then its up rows) and ``down`` [E, H, row_bytes]; float experts keep their dtype ([E, 2I, H] and [E, H, I]).
 A GGUF that stores ``ffn_gate_up_exps`` (gemma4) already holds the gate_up rows in that order.
-When NVFP4 experts carry per-expert ``.scale`` tensors, every layer also gets ``global`` [E, 4] fp32: the (gate, up, down, 1) weight_scale_2, 1 where a tensor has none."""
+When NVFP4 experts carry per-expert ``.scale`` tensors, every layer also gets ``global`` [E, 4] fp32: the (gate, up, down, 1) weight_scale_2, 1 where a tensor has none.
+
+Kai: the shapes, quant tags and MMQ tails are also read off the tensor table alone (``gguf_bank_geometry``),
+so ``--moe-bank-ram`` can lay out its bank file before a byte of the experts is read and a run whose layers
+are all in that file never opens them; with a ``layer_sink`` each layer streams into the file instead of
+being pinned (a DeepSeek-V4.1 GSQ-RCO build is 123 GiB of experts, more than the host's RAM)."""
 
 from __future__ import annotations
 
 import contextlib
 import os
+from dataclasses import dataclass
 
 import torch
 
 from freetoken.layers.quantization import QuantKind
-from freetoken.layers.quantization.ggml_types import float_dtype, has_expert_scales, mmq_tail_bytes, pad_rows, type_name
+from freetoken.layers.quantization.ggml_types import float_dtype, has_expert_scales, mmq_tail_bytes, pad_rows, row_bytes, type_name
 from freetoken.utils import init_logger
 
 from .reader import GgufTensorInfo, gguf_tensor_index
@@ -62,39 +68,107 @@ def _expert_scales(gate_up: list[GgufTensorInfo], down: GgufTensorInfo, experts:
     return out
 
 
-def load_gguf_expert_banks(model_path: str, num_layers: int, *, first_layer: int = 0, dummy: bool = False, device: torch.device | None = None):
-    """``ExpertBanks`` with one bank per (layer, role): pinned host banks for the offload cache, filled from the file and pinned while later layers load, or resident banks on ``device``."""
+def _layer_tensors(index: dict, blk: str) -> tuple[list[GgufTensorInfo], GgufTensorInfo]:
+    """``([gate, up] or [gate_up], down)`` of one layer."""
+    down = index[f"{blk}.ffn_down_exps.weight"]
+    if f"{blk}.ffn_gate_up_exps.weight" in index:
+        return [index[f"{blk}.ffn_gate_up_exps.weight"]], down
+    gate, up = index[f"{blk}.ffn_gate_exps.weight"], index[f"{blk}.ffn_up_exps.weight"]
+    if gate.ggml_type != up.ggml_type:
+        raise NotImplementedError(f"{blk}: gate and up experts have different ggml types")
+    return [gate, up], down
+
+
+def _row_spec(info: GgufTensorInfo, rows: int) -> tuple[tuple[int, int], torch.dtype]:
+    """One expert's ``(rows, row)`` and dtype in a bank of ``info``'s ggml type."""
+    k = info.ne[0]
+    dtype = float_dtype(info.ggml_type)
+    return ((rows, k), dtype) if dtype is not None else ((rows, row_bytes(info.ggml_type, k)), torch.uint8)
+
+
+@dataclass(frozen=True)
+class GgufBankGeometry:
+    """What the banks of a GGUF's MoE layers will look like, from its tensor table alone."""
+
+    specs: list[dict]  # per layer {role: ((rows, row), dtype)} of one expert
+    tags: list[tuple]  # per layer ("ggml", gate_up type, down type)
+    tails: dict[str, list[int]]  # per role, per layer: MMQ bytes past the last row
+    scaled: bool  # NVFP4 per-expert scales: every layer has a "global" bank
+
+    @property
+    def quant_format(self) -> str:
+        return "gguf_scaled" if self.scaled else "gguf"
+
+
+def gguf_bank_geometry(model_path: str, num_layers: int, *, first_layer: int = 0) -> GgufBankGeometry:
+    index = gguf_tensor_index(model_path)
+    scaled = has_expert_scales({name: info.ggml_type for name, info in index.items()})
+    roles = ("gate_up", "down", "global") if scaled else ("gate_up", "down")
+    specs, tags, tails = [], [], {role: [] for role in roles}
+    for layer in range(num_layers):
+        parts, down = _layer_tensors(index, f"blk.{first_layer + layer}")
+        gate = parts[0]
+        spec = {"gate_up": _row_spec(gate, sum(p.ne[1] for p in parts)), "down": _row_spec(down, down.ne[1])}
+        tails["gate_up"].append(mmq_tail_bytes(gate.ggml_type, gate.ne[0]))
+        tails["down"].append(mmq_tail_bytes(down.ggml_type, down.ne[0]))
+        if scaled:
+            spec["global"] = ((4,), torch.float32)
+            tails["global"].append(0)
+        specs.append(spec)
+        tags.append(("ggml", type_name(gate.ggml_type), type_name(down.ggml_type)))
+    return GgufBankGeometry(specs, tags, tails, scaled)
+
+
+def gguf_expert_identity(model_path: str) -> tuple[str, str]:
+    """``(fingerprint, stamp)`` of a GGUF's routed experts for a ``--moe-bank-ram`` file: the names, types
+    and shapes of the expert tensors, and the size and mtime of every split that holds them (a file
+    downloaded again is read again)."""
+    import hashlib
+
+    from .reader import gguf_split_paths
+
+    index = gguf_tensor_index(model_path)
+    names = sorted(n for n in index if "_exps." in n)
+    fp = hashlib.sha256()
+    for name in names:
+        info = index[name]
+        fp.update(f"{name}:{info.ggml_type}:{','.join(map(str, info.ne))};".encode())
+    stamp = hashlib.sha256()
+    for path in sorted({index[n].path for n in names} or set(gguf_split_paths(model_path))):
+        st = os.stat(path)
+        stamp.update(f"{os.path.basename(path)}:{st.st_size}:{st.st_mtime_ns};".encode())
+    return fp.hexdigest(), stamp.hexdigest()
+
+
+def load_gguf_expert_banks(
+    model_path: str, num_layers: int, *, first_layer: int = 0, dummy: bool = False, device: torch.device | None = None, layer_sink=None,
+):
+    """``ExpertBanks`` with one bank per (layer, role): pinned host banks for the offload cache, filled from the file and pinned while later layers load, or resident banks on ``device``.
+
+    ``layer_sink`` (``--moe-bank-ram``'s ``MappedTier.sink``): each layer's banks go to it as plain host
+    tensors instead, one layer at a time, and the returned banks hold no rows (the tier's mapping replaces them)."""
     from freetoken.moe.expert_banks import ExpertBanks
     from freetoken.moe.host_banks import HostBank, PinPipeline
 
     index = gguf_tensor_index(model_path)
-    scaled = has_expert_scales({name: info.ggml_type for name, info in index.items()})
-    roles = ("gate_up", "down", "global") if scaled else ("gate_up", "down")
-    sources: dict[str, list[torch.Tensor]] = {role: [] for role in roles}
-    tails: dict[str, list[int]] = {role: [] for role in roles}
-    tags = []
-    with PinPipeline() if device is None else contextlib.nullcontext() as pins:
+    geometry = gguf_bank_geometry(model_path, num_layers, first_layer=first_layer)
+    scaled = geometry.scaled
+    sources: dict[str, list[torch.Tensor]] = {role: [] for role in geometry.tails}
+    streamed = layer_sink is not None and not dummy
+    with PinPipeline() if device is None and not streamed else contextlib.nullcontext() as pins:
         for layer in range(num_layers):
-            blk = f"blk.{first_layer + layer}"
-            down = index[f"{blk}.ffn_down_exps.weight"]
-            if f"{blk}.ffn_gate_up_exps.weight" in index:
-                gate = index[f"{blk}.ffn_gate_up_exps.weight"]
-                parts = [gate]
-            else:
-                gate, up = index[f"{blk}.ffn_gate_exps.weight"], index[f"{blk}.ffn_up_exps.weight"]
-                if gate.ggml_type != up.ggml_type:
-                    raise NotImplementedError(f"{blk}: gate and up experts have different ggml types")
-                parts = [gate, up]
-            tags.append(("ggml", type_name(gate.ggml_type), type_name(down.ggml_type)))
-            tails["gate_up"].append(mmq_tail_bytes(gate.ggml_type, gate.ne[0]))
-            tails["down"].append(mmq_tail_bytes(down.ggml_type, down.ne[0]))
-            if scaled:
-                tails["global"].append(0)
+            parts, down = _layer_tensors(index, f"blk.{first_layer + layer}")
+            gate = parts[0]
             rows = [_expert_rows(info) for info in parts]
             d = _expert_rows(down)
             gate_up_shape = (rows[0].shape[0], sum(r.shape[1] for r in rows), rows[0].shape[2])
             experts = rows[0].shape[0]
-            if device is None:
+            host = None
+            if streamed:
+                banks = {"gate_up": torch.empty(gate_up_shape, dtype=rows[0].dtype), "down": torch.empty(tuple(d.shape), dtype=d.dtype)}
+                if scaled:
+                    banks["global"] = torch.empty(experts, 4, dtype=torch.float32)
+            elif device is None:
                 host = {"gate_up": HostBank(gate_up_shape, rows[0].dtype), "down": HostBank(tuple(d.shape), d.dtype)}
                 if scaled:
                     host["global"] = HostBank((experts, 4), torch.float32)
@@ -119,13 +193,23 @@ def load_gguf_expert_banks(model_path: str, num_layers: int, *, first_layer: int
                 banks["down"].copy_(d)
                 for info in (*parts, down):
                     _drop_page_cache(info)
+            if streamed:
+                layer_sink(layer, banks)
+                del banks  # one layer of copies at a time
+                continue
             if device is None:
                 pins(layer, host)
             for role, bank in banks.items():
                 sources[role].append(bank)
-    total = sum(t.numel() * t.element_size() for ts in sources.values() for t in ts)
-    logger.info_rank0(f"GGUF expert banks: {num_layers} layers, {total / 2**30:.1f} GiB {'on ' + str(device) if device is not None else 'in host RAM'}")
-    return ExpertBanks("gguf_scaled" if scaled else "gguf", sources, kind=QuantKind.GGUF, kernel="ggml", layout=None, layer_tags=tags, row_tail_bytes=tails)
+    if streamed:
+        logger.info_rank0(f"GGUF expert banks: {num_layers} layers streamed to the bank file")
+    else:
+        total = sum(t.numel() * t.element_size() for ts in sources.values() for t in ts)
+        logger.info_rank0(f"GGUF expert banks: {num_layers} layers, {total / 2**30:.1f} GiB {'on ' + str(device) if device is not None else 'in host RAM'}")
+    return ExpertBanks(
+        geometry.quant_format, sources, kind=QuantKind.GGUF, kernel="ggml", layout=None, layer_tags=geometry.tags,
+        row_tail_bytes=geometry.tails, streamed=streamed,
+    )
 
 
-__all__ = ["load_gguf_expert_banks"]
+__all__ = ["GgufBankGeometry", "gguf_bank_geometry", "gguf_expert_identity", "load_gguf_expert_banks"]

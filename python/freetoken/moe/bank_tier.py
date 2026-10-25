@@ -10,7 +10,7 @@ from __future__ import annotations
 import os
 
 from . import bank_disk
-from .bank_file import layout_from_specs
+from .bank_file import layout_from_layer_specs, layout_from_specs
 from .bank_pack import bank_path_for, checkpoint_identity, method_meta, read_pack_manifest
 from .mapped_bank import MappedTier, _ranges
 
@@ -82,16 +82,28 @@ def build_tier(config, method, *, pp=None, log=print, warn=None, register_budget
     total = bank_disk.parse_size(config.moe_bank_ram)
     budget = total // ranks
     resident_specs = method is not None and any(s.resident for s in method.layout().values())
-    cell_bytes = (
-        bank_disk.cell_bytes_of_layout(method.layout()) if method is not None
-        else bank_disk.cell_bytes_from_config(mc)
-    )
+    # Kai: GGUF experts keep one ggml type per layer, so one method's layout is one layer's geometry;
+    # the file's comes from the tensor table and the resident count from the mean expert of this rank
+    from freetoken.layers.quantization import QuantKind
+
+    gguf = None
+    if getattr(method, "kind", None) is QuantKind.GGUF:
+        from freetoken.models.gguf.experts import gguf_bank_geometry
+
+        gguf = gguf_bank_geometry(config.model_path, total_layers, first_layer=fkd)
+        per_layer = [bank_disk.cell_bytes_of_specs(spec) for spec in gguf.specs]
+        cell_bytes = -(-sum(per_layer[l] for l in layers) // max(1, len(layers)))
+    else:
+        cell_bytes = (
+            bank_disk.cell_bytes_of_layout(method.layout()) if method is not None
+            else bank_disk.cell_bytes_from_config(mc)
+        )
     if not cell_bytes:
         if packed is not None:
             raise ValueError(f"--moe-bank-ram: the expert size of {config.model_path} is unknown")
         log(f"--moe-bank-ram {config.moe_bank_ram}: the per-expert size of this format is unknown; no split")
         return None
-    bank_gib = cell_bytes * len(layers) * num_experts / 2**30
+    bank_gib = (sum(per_layer[l] for l in layers) if gguf is not None else cell_bytes * len(layers)) * num_experts / 2**30
     hot = bank_disk.hot_per_layer_for_budget(len(layers), num_experts, cell_bytes, budget)
     if hot >= num_experts and packed is None:
         log(
@@ -99,17 +111,6 @@ def build_tier(config, method, *, pp=None, log=print, warn=None, register_budget
             f"({ranks} ranks) covers this rank's {bank_gib:.1f} GiB of banks; no split"
         )
         return None
-    from freetoken.layers.quantization import QuantKind
-
-    if method is not None and method.kind is QuantKind.GGUF:
-        # FreeToken-Kai#5: a whole-GGUF checkpoint's experts (each layer in its own ggml types) are
-        # read by models/gguf/experts.py straight into pinned host banks and never through the
-        # tier's layer sink, so the start used to plan the tier, create the bank file, read every
-        # expert and only then fail with "never reached the sink". Refused here, before any of it.
-        raise ValueError(
-            f"--moe-bank-ram does not serve a GGUF checkpoint's experts yet ({config.model_path}): "
-            f"they load into host RAM whole ({bank_gib:.1f} GiB on this rank). Drop --moe-bank-ram"
-        )
     hot = min(hot, num_experts)
     if hot == 0:
         raise ValueError(
@@ -146,6 +147,10 @@ def build_tier(config, method, *, pp=None, log=print, warn=None, register_budget
         meta = method_meta(method)
         if packed is not None:
             meta["fingerprint"] = packed["fingerprint"]
+        elif gguf is not None:
+            from freetoken.models.gguf.experts import gguf_expert_identity
+
+            meta["fingerprint"], meta["source_stamp"] = gguf_expert_identity(config.model_path)
         else:
             try:
                 meta["fingerprint"], meta["source_stamp"] = checkpoint_identity(config.model_path, full, method.kind)
@@ -155,7 +160,10 @@ def build_tier(config, method, *, pp=None, log=print, warn=None, register_budget
                 # and `ft bank pack` will refuse it.
                 log(f"--moe-bank-ram: no expert fingerprint for this checkpoint ({exc})")
                 meta["fingerprint"] = None
-        layout = layout_from_specs(method.layout(), range(total_layers), num_experts, meta)
+        if gguf is not None:
+            layout = layout_from_layer_specs(dict(enumerate(gguf.specs)), range(total_layers), num_experts, meta)
+        else:
+            layout = layout_from_specs(method.layout(), range(total_layers), num_experts, meta)
     elif resident_specs:
         log(
             f"--moe-bank-ram: {method.kind} / {method.kernel.name} keeps per-expert values on the GPU "

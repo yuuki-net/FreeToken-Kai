@@ -230,6 +230,9 @@ def _kernel_of_meta(layout: MappedBankLayout):
             f"the bank file does not record the expert kernel it was written for (a loader without an "
             f"expert method wrote it); it cannot be checked against a checkpoint"
         )
+    if layout.layer_banks:
+        # a GGUF's bank (one ggml type per layer): the GGUF stays the checkpoint, it is never packed
+        raise PackError("the bank file holds layers of several geometries (GGUF experts); a GGUF is served as it is, not packed")
     cls = method_class(QuantKind(meta["kind"]), LayerKind.MOE)
     kernels = {k.name: k for k in cls.candidates}
     if meta["kernel"] not in kernels:

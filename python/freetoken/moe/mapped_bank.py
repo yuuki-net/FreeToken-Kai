@@ -177,7 +177,7 @@ class MappedBanks:
             self.layout.num_experts if hot_per_layer is None
             else max(0, min(int(hot_per_layer), self.layout.num_experts))
         )
-        self.mapped_bytes = len(self.layers) * self.layout.layer_bytes()
+        self.mapped_bytes = self.layout.layers_bytes(self.layers)
         self._fd = os.open(path, os.O_RDONLY | getattr(os, "O_BINARY", 0))
         self._libc = ctypes.CDLL("libc.so.6", use_errno=True) if os.name == "posix" else None
         self._buf = None
@@ -298,11 +298,12 @@ class MappedBanks:
         # single layer could be fetched from (FreeToken-Kai#2). The file is laid out layer-first
         # too (bank_file.py), so this also reads it in file order.
         views: dict[str, list] = {name: [] for name, *_ in self.layout.banks}
-        layer_register_bytes = sum(
-            self._lock_rows(self.layout.num_experts * rb) * rb
-            for _name, _shape, _dtype, rb in self.layout.banks
-        )
         for pos, layer in enumerate(self.layers):
+            # per layer: a GGUF's layers keep their own row sizes (MappedBankLayout.banks_of)
+            layer_register_bytes = sum(
+                self._lock_rows(self.layout.num_experts * rb) * rb
+                for _name, _shape, _dtype, rb in self.layout.banks_of(layer)
+            )
             registering = register and not self._register_stopped
             if registering and self.register_budget is not None and layer_register_bytes:
                 if self.registered_bytes + layer_register_bytes > self.register_budget:
@@ -312,7 +313,7 @@ class MappedBanks:
                     self._register_stopped = True
             before, blocks = self.registered_blocks, 0
             self._pos = pos
-            for name, row_shape, dtype_name, row_bytes in self.layout.banks:
+            for name, row_shape, dtype_name, row_bytes in self.layout.banks_of(layer):
                 dtype = _dtype_of(dtype_name)
                 off = self.layout.offset_of(name, layer)
                 rel = off - self._map_offset  # the mapping starts at this rank's first block
@@ -820,14 +821,14 @@ class MappedTier:
         self._file.recover_journals(self.layers, log=self.log)
         manifest = self._file.manifest()
         missing = self._plan(manifest)
-        gib = self.layout.layer_bytes() / 2**30
+        gib = self.layout.layer_bytes() / 2**30  # the largest layer: one layer's journal
         if missing:
             if not self.can_write or self._file.canonical_for(manifest):
                 raise BankFileError(
                     f"--moe-bank-ram: {self.path} has no layers {_ranges(missing)} of this rank's "
                     f"{_ranges(self.layers)}, and {'this checkpoint has no expert tensors to write them from' if not self.can_write else 'it is the only copy of a packed checkpoint and is never written from one'}"
                 )
-            need = len(missing) * gib * 2**30
+            need = self.layout.layers_bytes(missing)
             free = free_bytes(self.path)
             if free is not None and need > free:
                 raise BankFileError(
@@ -840,12 +841,12 @@ class MappedTier:
                 from freetoken.moe import disk_probe
 
                 absent = [l for l in self.all_layers if self._file.layer_state(l, manifest) is None]
-                line = disk_probe.host_space_warning(self.path, len(absent) * gib * 2**30)
+                line = disk_probe.host_space_warning(self.path, self.layout.layers_bytes(absent))
                 if line:
                     self.warn(line)
             self.log(
                 f"--moe-bank-ram: {self.path} lacks layers {_ranges(missing)}; reading the checkpoint's "
-                f"experts for layers {_ranges(self.layers)} and writing {len(missing) * gib:.1f} GiB "
+                f"experts for layers {_ranges(self.layers)} and writing {need / 2**30:.1f} GiB "
                 f"({self.hot_per_layer}/{self.num_experts} experts resident per layer)"
             )
             return False
@@ -859,7 +860,7 @@ class MappedTier:
                 )
             self.log(
                 f"--moe-bank-ram: placement changed for layers {_ranges(todo)}; reordering "
-                f"{len(todo) * gib:.1f} GiB in place (one layer journaled at a time)"
+                f"{self.layout.layers_bytes(todo) / 2**30:.1f} GiB in place (one layer journaled at a time)"
             )
             started = time.perf_counter()
             for layer in todo:
@@ -1009,7 +1010,7 @@ class MappedTier:
         if ra is None or layout is None or not layout.banks:
             return
         kb, where = ra
-        widest = max(rb for _, _, _, rb in layout.banks)
+        widest = max(rb for layer in layout.layers for _, _, _, rb in layout.banks_of(layer))
         widest_kb = widest // 1024
         rec = disk_probe.recommend_readahead_kb(widest)
         mode = self.readahead
