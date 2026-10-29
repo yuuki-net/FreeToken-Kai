@@ -160,8 +160,9 @@ def c_nvfp4_dense(dev, T, dt):
 
 
 def c_moe_check(dev, T, dt):
-    """Correctness: the prefill MoE kernel with LUT dequant and with arithmetic dequant, both
-    against a torch reference built on dequant_nvfp4 (E=32, T=256 to keep the reference cheap)."""
+    """Correctness: the prefill MoE kernel (in-kernel dequant GEMM, and LUT vs arithmetic dequant
+    where the build still has both) and the scratch path, against a torch reference built on
+    dequant_nvfp4 (E=32, T=256 to keep the reference cheap)."""
     import torch
     import torch.nn.functional as F
     from freetoken.kernel.triton.nvfp4_dequant import dequant_nvfp4
@@ -182,10 +183,14 @@ def c_moe_check(dev, T, dt):
     w = (w / w.sum(-1, keepdim=True)).float().contiguous()
     ids = ids.to(torch.int32).contiguous()
     outs = {}
-    for mode in ("0", "1", "scratch"):
+    # upstream (merged 2026-10-18) kept only the arithmetic e2m1 decode: no _arith_dequant, no knob
+    has_arith = hasattr(fm, "_arith_dequant")
+    modes = ("0", "1", "scratch") if has_arith else ("0", "scratch")
+    for mode in modes:
         os.environ["FREETOKEN_NVFP4_MOE_ARITH"] = "1" if mode == "1" else "0"
         os.environ["FREETOKEN_NVFP4_MOE_SCRATCH"] = "1" if mode == "scratch" else "0"
-        fm._arith_dequant.cache_clear()
+        if has_arith:
+            fm._arith_dequant.cache_clear()
         if hasattr(fm, "_scratch_moe_preferred"):
             fm._scratch_moe_preferred.cache_clear()
         outs[mode] = fm.fused_experts_nvfp4(x, *gu, *dn, w, ids.clone(), Es).float()
@@ -202,10 +207,12 @@ def c_moe_check(dev, T, dt):
         act = F.silu(h[:, :I]) * h[:, I:]
         ref.index_add_(0, t_idx, (act @ Wd[e].t()) * w[t_idx, k_idx][:, None])
     scale_ref = ref.abs().max().item() + 1e-6
-    for mode, label in (("0", "LUT dequant"), ("1", "arithmetic dequant"), ("scratch", "dequant + cuBLAS")):
+    labels = {"0": "LUT dequant" if has_arith else "in-kernel dequant GEMM", "1": "arithmetic dequant", "scratch": "dequant + cuBLAS"}
+    for mode in modes:
         rel = (outs[mode] - ref).abs().max().item() / scale_ref
-        print(f"{'OK  ' if rel < 5e-2 else 'FAIL'} MoE prefill {label} vs torch reference: rel={rel:.3g}")
-    print(f"      LUT vs arithmetic max|diff| = {(outs['0'] - outs['1']).abs().max().item():.3g} (expected ~0)")
+        print(f"{'OK  ' if rel < 5e-2 else 'FAIL'} MoE prefill {labels[mode]} vs torch reference: rel={rel:.3g}")
+    if has_arith:
+        print(f"      LUT vs arithmetic max|diff| = {(outs['0'] - outs['1']).abs().max().item():.3g} (expected ~0)")
 
 
 def c_moe_sweep(dev, T, dt):

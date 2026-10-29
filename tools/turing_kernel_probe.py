@@ -114,6 +114,24 @@ def _nvfp4_weight(dev, N, K):
     return packed, scale, gscale
 
 
+def _nvfp4_dequant_ref(packed, scale, gscale):
+    """Plain-torch dequant of one NVFP4 weight: e2m1 LUT x per-block e4m3 scale x per-row global, fp32 [N, K]."""
+    import torch
+
+    N, K = packed.shape[0], packed.shape[1] * 2
+    lut = torch.tensor([0, .5, 1, 1.5, 2, 3, 4, 6, -0, -.5, -1, -1.5, -2, -3, -4, -6], device=packed.device)
+    lo = lut[(packed & 15).long()]
+    hi = lut[(packed >> 4).long()]
+    codes = torch.stack([lo, hi], -1).reshape(N, K)
+    return codes * scale.float().repeat_interleave(16, dim=1) * gscale.float()[:, None]
+
+
+def _nvfp4_ref(x, packed, scale, gscale, dtype):
+    """Plain-torch W4A16 linear reference: fp32 matmul over the dequantised weight. nvfp4_linear
+    exported this as ``_ref`` until the upstream merge of 2026-10-18 removed it."""
+    return (x.float() @ _nvfp4_dequant_ref(packed, scale, gscale).t()).to(dtype)
+
+
 def t_nvfp4_dequant(dev):
     import torch
     from freetoken.kernel.triton.nvfp4_dequant import dequant_nvfp4
@@ -122,24 +140,18 @@ def t_nvfp4_dequant(dev):
     packed, scale, gscale = _nvfp4_weight(dev, N, K)
     slots = torch.zeros(1, dtype=torch.int32, device=dev)
     w = dequant_nvfp4(packed.unsqueeze(0), scale.unsqueeze(0), gscale.unsqueeze(0), slots)[0]
-    lut = torch.tensor([0, .5, 1, 1.5, 2, 3, 4, 6, -0, -.5, -1, -1.5, -2, -3, -4, -6], device=dev)
-    lo = lut[(packed & 15).long()]
-    hi = lut[(packed >> 4).long()]
-    codes = torch.stack([lo, hi], -1).reshape(N, K)
-    ref = codes * scale.float().repeat_interleave(16, dim=1) * gscale.float()[:, None]
+    ref = _nvfp4_dequant_ref(packed, scale, gscale)
     torch.cuda.synchronize()
     return _report("nvfp4 dequant (cache -> bf16)", w, ref)
 
 
 def _nvfp4_case(dev, M, N, K, transposed):
     import torch
-    from freetoken.kernel.triton.nvfp4_linear import (
-        _ref, nvfp4_dense_linear, nvfp4_dense_linear_t, nvfp4_transpose_resident,
-    )
+    from freetoken.kernel.triton.nvfp4_linear import nvfp4_dense_linear, nvfp4_dense_linear_t, nvfp4_transpose_resident
 
     packed, scale, gscale = _nvfp4_weight(dev, N, K)
     x = torch.randn(M, K, device=dev, dtype=torch.bfloat16)
-    ref = _ref(x, packed, scale, gscale, torch.bfloat16)
+    ref = _nvfp4_ref(x, packed, scale, gscale, torch.bfloat16)
     if transposed:
         wt, st = nvfp4_transpose_resident(packed, scale)
         out = nvfp4_dense_linear_t(x, wt, st, gscale)
@@ -414,7 +426,7 @@ def t_shared_expert_chain(dev):
     """The exact shared-expert chain of the decode step through the layer classes:
     Nvfp4DenseColMerged(gate|up) -> silu_and_mul -> Nvfp4DenseLinear(down), at bs=1."""
     import torch
-    from freetoken.kernel.triton.nvfp4_linear import _ref, nvfp4_dense_linear_t, nvfp4_transpose_resident
+    from freetoken.kernel.triton.nvfp4_linear import nvfp4_dense_linear_t, nvfp4_transpose_resident
     from freetoken.layers.activation import silu_and_mul
 
     inter = 512
@@ -427,9 +439,9 @@ def t_shared_expert_chain(dev):
     a = silu_and_mul(h)
     y = nvfp4_dense_linear_t(a, wt2, st2, g2)
     torch.cuda.synchronize()
-    ref_h = _ref(x, p1, s1, g1, torch.bfloat16)
+    ref_h = _nvfp4_ref(x, p1, s1, g1, torch.bfloat16)
     ref_a = _silu(ref_h[:, :inter].float()) * ref_h[:, inter:].float()
-    ref_y = _ref(ref_a.to(torch.bfloat16), p2, s2, g2, torch.bfloat16)
+    ref_y = _nvfp4_ref(ref_a.to(torch.bfloat16), p2, s2, g2, torch.bfloat16)
     return _report("shared expert chain gate_up -> silu_and_mul -> down (M=1)", y, ref_y, tol=5e-2)
 
 
