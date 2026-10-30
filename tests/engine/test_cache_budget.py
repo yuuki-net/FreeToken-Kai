@@ -637,6 +637,20 @@ def test_moe_slot_pool_split(tmp_path):
     with pytest.raises(ValueError, match="needs"):
         load_profile(path, 4, 32)
 
+    # FreeToken-Kai#7: the file --moe-stats-out writes is read as it is (decode_freq), with the
+    # --spec-mtp draft head's appended row dropped; anything else of the wrong shape still fails
+    stats = tmp_path / "moe-stats.json"
+    stats.write_text(json.dumps({"rank": 0, "num_layers": 4, "num_experts": 16, "decode_freq": counts}))
+    assert torch.equal(load_profile(stats, 4, 16), load_profile(path, 4, 16))
+    stats.write_text(json.dumps({"rank": 0, "num_layers": 5, "num_experts": 16, "decode_freq": counts + [[9] * 16]}))
+    assert torch.equal(load_profile(stats, 4, 16), load_profile(path, 4, 16))
+    stats.write_text(json.dumps({"rank": 0, "decode_freq": counts + [[9] * 16] * 2}))
+    with pytest.raises(ValueError, match="needs"):
+        load_profile(stats, 4, 16)
+    stats.write_text(json.dumps({"rank": 0, "decode_freq": None}))
+    with pytest.raises(ValueError, match="--moe-stats-out"):
+        load_profile(stats, 4, 16)
+
 
 
 def test_moe_pool_flags_and_decode_batch_clamp():

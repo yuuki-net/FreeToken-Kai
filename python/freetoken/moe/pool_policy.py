@@ -130,13 +130,33 @@ def load_profile(path: str | Path, num_layers: int, num_experts: int, model_path
     model = str(data.get("model", ""))
     if model and model_path and not any(n.lower().startswith(model.lower()) for n in _model_names(model_path)):
         logger.warning_rank0(f"MoE pool profile {path} was taken on {model!r}, not on {model_path}")
-    counts = torch.tensor(data["expert_counts"], dtype=torch.float64)
+    if "expert_counts" in data:
+        counts = torch.tensor(data["expert_counts"], dtype=torch.float64)
+    else:
+        counts = _counts_from_moe_stats(data, path, num_layers)
     if tuple(counts.shape) != (num_layers, num_experts):
         raise ValueError(
             f"profile {path} has {tuple(counts.shape)} expert counts; this model needs ({num_layers}, {num_experts})"
         )
     # every layer decodes the same tokens, so equal row sums keep the layers comparable
     return counts / counts.sum(dim=1, keepdim=True).clamp(min=1e-12)
+
+
+def _counts_from_moe_stats(data: dict, path: str | Path, num_layers: int) -> torch.Tensor:
+    """Kai: the ``decode_freq`` table of a ``--moe-stats-out`` file (FreeToken-Kai#7), which is
+    the per-layer expert use this profile asks for under another name. A run with --spec-mtp
+    counted the draft head's layer too, appended after the model's layers; that row is dropped
+    (the engine gives the draft head the mean of the others)."""
+    rows = data.get("decode_freq")
+    if not rows:
+        raise ValueError(
+            f"profile {path} has neither expert_counts nor decode_freq; collect one with --moe-stats-out "
+            "(without --no-moe-collect-stats)"
+        )
+    counts = torch.tensor(rows, dtype=torch.float64)
+    if counts.dim() == 2 and counts.shape[0] == num_layers + 1:
+        counts = counts[:num_layers]
+    return counts
 
 
 def _model_names(model_path: str) -> list[str]:
