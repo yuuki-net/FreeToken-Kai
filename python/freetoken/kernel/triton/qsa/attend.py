@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import os
 import torch
 import triton
 import triton.language as tl
@@ -35,18 +36,36 @@ _ACCEPTED: dict[tuple, tuple[int, int, int, int]] = {}
 _REFUSED: set[tuple] = set()
 
 
-def _profile_ladder(key, block_n: int, target_splits: int, partial_warps: int):
+def _forced_prefill_profile():
+    """``FT_QSA_PREFILL_PROFILE=block_n,splits,warps,stages``: one tile profile for the prefill
+    shapes (more than 512 programs), tried first and alone, for tuning on devices far from
+    the GB300 the built-in profiles were chosen on (a 64 KiB-shared-memory Turing part lands
+    on BLOCK_N=32 by the ladder, which may not be the best tile it can run)."""
+    v = os.environ.get("FT_QSA_PREFILL_PROFILE")
+    if not v:
+        return None
+    n, splits, warps, stages = (int(x) for x in v.split(","))
+    return n, splits, warps, stages
+
+
+def _profile_ladder(key, block_n: int, target_splits: int, partial_warps: int, forced=None):
     """The tuned profile first, then progressively cheaper ones."""
     if key in _ACCEPTED:
         yield _ACCEPTED[key]
         return
+    if forced is not None:
+        yield forced
     seen = set()
-    for width in (block_n, block_n // 2, 16):
-        if width < 16 or width in seen:
+    # A refused tuned tile goes to the narrow decode-tuned tile (16 columns, four warps) first,
+    # then to the half tile with four warps as well: on a 64 KiB-shared-memory part (Turing,
+    # where BLOCK_N=64 never fits) the old order accepted (32, 2 stages, 2 warps), and (16, 2
+    # stages, 4 warps) prefills 41 % faster there; (32, 4 warps) is 31 % faster than the same
+    # tile with 2 warps. Parts where the tuned tile fits never reach the step-downs.
+    for width in (block_n, 16, block_n // 2):
+        if width < 16 or (width != block_n and width >= block_n) or width in seen:
             continue
         seen.add(width)
-        # the narrow tile is the tuned decode profile, which pairs 16 with four warps
-        warps = partial_warps if width == block_n else (4 if width == 16 else partial_warps)
+        warps = partial_warps if width == block_n else 4
         for stages in (2, 1):
             yield width, target_splits, warps, stages
 
@@ -448,8 +467,9 @@ def qsa_sparse_paged_attention(
         block_n,
         target_splits,
     )
+    forced = _forced_prefill_profile() if base_programs > 512 else None
     for block_n, target_splits, partial_warps, num_stages in _profile_ladder(
-        key, block_n, target_splits, partial_warps
+        key, block_n, target_splits, partial_warps, forced
     ):
         num_tiles = triton.cdiv(logical_indices.shape[1], block_n)
         # Avoid empty splits when the selection width is smaller than the profile.
