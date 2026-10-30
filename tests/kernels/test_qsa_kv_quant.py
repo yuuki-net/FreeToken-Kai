@@ -154,8 +154,8 @@ def test_the_ladder_offers_the_tuned_profile_first_then_gives_up_pipelining():
     rungs = list(_profile_ladder(("cold",), 64, 1, 2))
 
     assert rungs[0] == (64, 1, 2, 2), "the tuned profile is tried unchanged"
-    assert [(n, s) for n, _, _, s in rungs] == [
-        (64, 2), (64, 1), (32, 2), (32, 1), (16, 2), (16, 1)
+    # the narrow 4-warp tile comes before the half tile: on a 64 KiB part it prefills faster
+    # (tests/kernels/test_qsa_profile_ladder.py has the numbers)
+    assert [(n, w, s) for n, _, w, s in rungs] == [
+        (64, 2, 2), (64, 2, 1), (16, 4, 2), (16, 4, 1), (32, 4, 2), (32, 4, 1), (32, 2, 2), (32, 2, 1)
     ]
-    # the narrow tile is the tuned decode profile, which pairs 16 with four warps
-    assert [w for n, _, w, _ in rungs if n == 16] == [4, 4]

@@ -27,24 +27,42 @@ except ImportError:  # pragma: no cover - older triton raises a plain error
 # Shared memory per block, by what the profile asks for. Wider tiles and deeper pipelining
 # read more of the KV slab at once, so both are ways down. Order matters: BLOCK_N is worth
 # more than num_stages (it is what the profile was chosen for), so give up the pipelining
-# first and only then halve the tile.
-_LADDER_DESC = "BLOCK_N/num_stages: (n,2) -> (n,1) -> (n/2,2) -> (n/2,1) -> (16,2) -> (16,1)"
+# first and only then narrow the tile (see _profile_ladder for why 16 comes before n/2).
+_LADDER_DESC = (
+    "BLOCK_N/num_warps/num_stages: (n,w,2) -> (n,w,1) -> (16,4,2) -> (16,4,1) -> (n/2,4,2) -> (n/2,4,1)"
+    " -> (n/2,w,2) -> (n/2,w,1)"
+)
 
 # key -> the profile that was accepted, so the exception is paid once per shape and not once
 # per layer per token.
 _ACCEPTED: dict[tuple, tuple[int, int, int, int]] = {}
 _REFUSED: set[tuple] = set()
+_BAD_FORCED: set[str] = set()
 
 
 def _forced_prefill_profile():
     """``FT_QSA_PREFILL_PROFILE=block_n,splits,warps,stages``: one tile profile for the prefill
     shapes (more than 512 programs), tried first and alone, for tuning on devices far from
     the GB300 the built-in profiles were chosen on (a 64 KiB-shared-memory Turing part lands
-    on BLOCK_N=32 by the ladder, which may not be the best tile it can run)."""
+    on BLOCK_N=32 by the ladder, which may not be the best tile it can run).
+
+    A malformed value is ignored with one warning: this runs inside the first prefill, and an
+    exception there would fail a request rather than the start."""
     v = os.environ.get("FT_QSA_PREFILL_PROFILE")
     if not v:
         return None
-    n, splits, warps, stages = (int(x) for x in v.split(","))
+    try:
+        n, splits, warps, stages = (int(x) for x in v.split(","))
+        if n < 16 or n & (n - 1) or splits < 1 or warps not in (1, 2, 4, 8, 16) or stages < 1:
+            raise ValueError(v)
+    except ValueError:
+        if v not in _BAD_FORCED:
+            _BAD_FORCED.add(v)
+            logger.warning_rank0(
+                f"FT_QSA_PREFILL_PROFILE={v!r} ignored: expected block_n,splits,warps,stages "
+                "(block_n a power of two >= 16, warps a power of two <= 16)"
+            )
+        return None
     return n, splits, warps, stages
 
 
@@ -55,28 +73,30 @@ def _profile_ladder(key, block_n: int, target_splits: int, partial_warps: int, f
         return
     if forced is not None:
         yield forced
-    seen = set()
     # A refused tuned tile goes to the narrow decode-tuned tile (16 columns, four warps) first,
     # then to the half tile with four warps as well: on a 64 KiB-shared-memory part (Turing,
     # where BLOCK_N=64 never fits) the old order accepted (32, 2 stages, 2 warps), and (16, 2
     # stages, 4 warps) prefills 41 % faster there; (32, 4 warps) is 31 % faster than the same
-    # tile with 2 warps. Parts where the tuned tile fits never reach the step-downs.
-    for width in (block_n, 16, block_n // 2):
-        if width < 16 or (width != block_n and width >= block_n) or width in seen:
+    # tile with 2 warps. The half tile with the tuned warp count stays as the last resort, so
+    # no profile the old order could accept is lost. Parts where the tuned tile fits never
+    # reach the step-downs.
+    steps = ((block_n, partial_warps), (16, 4), (block_n // 2, 4), (block_n // 2, partial_warps))
+    seen = set()
+    for width, warps in steps:
+        if width < 16 or width > block_n or (width, warps) in seen:
             continue
-        seen.add(width)
-        warps = partial_warps if width == block_n else 4
+        seen.add((width, warps))
         for stages in (2, 1):
             yield width, target_splits, warps, stages
 
 
 def _note_refusal(key, block_n, target_splits, warps, stages, exc) -> None:
-    seen = (key, block_n, stages)
+    seen = (key, block_n, warps, stages)
     if seen in _REFUSED:
         return
     _REFUSED.add(seen)
     logger.warning_rank0(
-        f"qsa_sparse: BLOCK_N={block_n} num_stages={stages} does not fit this device's "
+        f"qsa_sparse: BLOCK_N={block_n} num_warps={warps} num_stages={stages} does not fit this device's "
         f"shared memory ({exc}); stepping the tile down"
     )
 

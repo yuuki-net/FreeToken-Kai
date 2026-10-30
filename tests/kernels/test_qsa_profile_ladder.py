@@ -28,7 +28,9 @@ def test_tuned_tile_first_then_narrow_four_warp_tile():
     assert steps[:2] == [(64, 1, 2, 2), (64, 1, 2, 1)], "the tuned tile is still tried first"
     assert steps[2] == (16, 1, 4, 2), "a refused tuned tile steps to 16 columns / 4 warps first"
     assert (32, 1, 4, 2) in steps and steps.index((32, 1, 4, 2)) > steps.index((16, 1, 4, 1))
-    assert all(w == 4 for n, _, w, _ in steps if n != 64), "every step-down runs four warps"
+    # the half tile with the tuned two warps is still on offer, but only after every 4-warp step
+    assert steps[-2:] == [(32, 1, 2, 2), (32, 1, 2, 1)], "the old 2-warp half tile is the last resort"
+    assert all(w == 4 for n, _, w, _ in steps[2:-2]), "the step-downs before the last resort run four warps"
 
 
 def test_decode_profile_has_no_step_down_below_sixteen():
@@ -54,4 +56,12 @@ def test_forced_prefill_profile_is_tried_first_and_only_for_prefill_shapes(monke
 
 def test_forced_profile_unset_is_none(monkeypatch):
     monkeypatch.delenv("FT_QSA_PREFILL_PROFILE", raising=False)
+    assert attend._forced_prefill_profile() is None
+
+
+@pytest.mark.parametrize("value", ["32,1,4", "32,1,4,x", "24,1,4,2", "8,1,4,2", "32,0,4,2", "32,1,3,2", "32,1,4,0"])
+def test_malformed_forced_profile_is_ignored_not_raised(monkeypatch, value):
+    # read inside the first prefill: raising there would fail a request, not the start
+    monkeypatch.setattr(attend, "_BAD_FORCED", set())
+    monkeypatch.setenv("FT_QSA_PREFILL_PROFILE", value)
     assert attend._forced_prefill_profile() is None
