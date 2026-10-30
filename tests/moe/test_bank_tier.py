@@ -292,6 +292,22 @@ def test_a_packed_checkpoint_needs_the_flag_and_keeps_every_row_when_it_fits(tmp
         build_tier(_config(tmp_path, moe_bank_ram="1G"), _Method(resident=True), log=lambda _m: None)
 
 
+def test_a_gguf_checkpoint_is_refused_before_the_bank_file_exists(tmp_path):
+    # FreeToken-Kai#5: the GGUF loader never feeds the tier's sink, so a split used to fail only
+    # after the bank file was created and every expert read
+    from freetoken.layers.quantization import QuantKind
+    from freetoken.moe.bank_tier import build_tier
+
+    os.makedirs(tmp_path / "model")
+    gguf = _Method()
+    gguf.kind = QuantKind.GGUF
+    with pytest.raises(ValueError, match="does not serve a GGUF checkpoint"):
+        build_tier(_config(tmp_path), gguf, log=lambda _m: None)
+    assert not os.path.exists(tmp_path / "bankmap")
+    # a cap that holds every expert needs no tier, so it is not refused
+    assert build_tier(_config(tmp_path, moe_bank_ram="1G"), gguf, log=lambda _m: None) is None
+
+
 def test_old_per_rank_files_are_pointed_out(tmp_path):
     from freetoken.moe.bank_tier import build_tier
 

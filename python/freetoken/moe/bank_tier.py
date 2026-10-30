@@ -99,6 +99,17 @@ def build_tier(config, method, *, pp=None, log=print, warn=None, register_budget
             f"({ranks} ranks) covers this rank's {bank_gib:.1f} GiB of banks; no split"
         )
         return None
+    from freetoken.layers.quantization import QuantKind
+
+    if method is not None and method.kind is QuantKind.GGUF:
+        # FreeToken-Kai#5: a whole-GGUF checkpoint's experts (each layer in its own ggml types) are
+        # read by models/gguf/experts.py straight into pinned host banks and never through the
+        # tier's layer sink, so the start used to plan the tier, create the bank file, read every
+        # expert and only then fail with "never reached the sink". Refused here, before any of it.
+        raise ValueError(
+            f"--moe-bank-ram does not serve a GGUF checkpoint's experts yet ({config.model_path}): "
+            f"they load into host RAM whole ({bank_gib:.1f} GiB on this rank). Drop --moe-bank-ram"
+        )
     hot = min(hot, num_experts)
     if hot == 0:
         raise ValueError(
