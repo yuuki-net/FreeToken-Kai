@@ -5,6 +5,10 @@ top kernels by time. Kernels launched from a replayed CUDA graph are recorded li
 so the window graph and the draft-head graphs are covered; the profiled step itself is slower
 (the first one by a lot: CUPTI warms up), so it is a breakdown, not a timing. Stops after
 ``FT_KERNEL_PROFILE_COUNT`` samples (default 3). Each pipeline rank logs its own step.
+``FT_KERNEL_PROFILE_PREFILL=1`` also samples prefill chunks (every N-th forward of at least
+``FT_KERNEL_PROFILE_MIN_ROWS`` rows, default 0), for a breakdown of where a slow prefill goes;
+``FT_KERNEL_PROFILE_PREFILL=only`` samples nothing but those chunks (decode steps would
+otherwise use up the sample count before the first long prompt arrives).
 
 The buckets are by kernel name, so a kernel shared by two roles lands in one bucket: the fp8
 dense GEMM also serves the lm_head (on the rank that owns it); ``dense`` therefore includes
@@ -33,9 +37,11 @@ _BUCKETS = (
 
 
 class KernelProfiler:
-    def __init__(self, every: int, limit: int, log, rank: int = 0) -> None:
+    def __init__(self, every: int, limit: int, log, rank: int = 0, prefill: str = "0", min_rows: int = 0) -> None:
         self.every = max(int(every), 1)
         self.limit = int(limit)
+        self.prefill = str(prefill)  # "0" (decode only), "1" (both), "only" (prefill chunks only)
+        self.min_rows = int(min_rows)
         self.log = log
         self.rank = rank
         self.steps = 0
@@ -46,7 +52,18 @@ class KernelProfiler:
         every = int(os.environ.get("FT_KERNEL_PROFILE", "0") or 0)
         if every <= 0:
             return None
-        return cls(every, int(os.environ.get("FT_KERNEL_PROFILE_COUNT", "3") or 3), log, rank)
+        return cls(
+            every, int(os.environ.get("FT_KERNEL_PROFILE_COUNT", "3") or 3), log, rank,
+            prefill=os.environ.get("FT_KERNEL_PROFILE_PREFILL", "0") or "0",
+            min_rows=int(os.environ.get("FT_KERNEL_PROFILE_MIN_ROWS", "0") or 0),
+        )
+
+    def wants(self, is_prefill: bool, spec_verify: bool, rows: int) -> bool:
+        """Whether this forward is a candidate: decode steps and verify windows always, prefill chunks only
+        with FT_KERNEL_PROFILE_PREFILL=1 and at least FT_KERNEL_PROFILE_MIN_ROWS rows."""
+        if spec_verify or not is_prefill:
+            return self.prefill != "only"
+        return self.prefill in ("1", "only") and rows >= self.min_rows
 
     def due(self) -> bool:
         self.steps += 1

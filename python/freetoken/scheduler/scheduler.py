@@ -1307,8 +1307,9 @@ class Scheduler(SchedulerIOMixin):
         if batch.phase == "verify":
             return self.spec.verify_step(batch, sample_args)
         kp = getattr(self, "_kernel_profiler", None)
-        if kp is not None and (batch.spec_verify or not batch.is_prefill) and kp.due():
-            label = f"{'verify window' if batch.spec_verify else 'decode step'}, {batch.input_ids.numel()} rows"
+        if kp is not None and kp.wants(batch.is_prefill, batch.spec_verify, batch.input_ids.numel()) and kp.due():
+            kind = "verify window" if batch.spec_verify else ("prefill chunk" if batch.is_prefill else "decode step")
+            label = f"{kind}, {batch.input_ids.numel()} rows"
             with kp.profile(label):
                 forward_output = self.engine.forward_batch(batch, sample_args)
         else:
