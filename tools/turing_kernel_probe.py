@@ -211,7 +211,7 @@ def t_conv_varlen(dev):
 def _gdn_ref(q, k, v, g, beta, state):
     """q/k [T, KH, D] -> expanded to VH (kernel: i_h = i_hv // (HV // H)); returns out
     [T, VH, D], new state [VH, D, D]."""
-    from freetoken.models.qwen3_5_moe.gdn_reference import recurrent_gated_delta_rule
+    from freetoken.layers.linear_attn.gdn_reference import recurrent_gated_delta_rule
 
     rep = v.shape[1] // q.shape[1]
     qe = q.repeat_interleave(rep, dim=1)[None]
@@ -311,7 +311,7 @@ def t_gdn_recurrent_t8(dev):
 
 def _gdn_prefill_case(dev, T):
     import torch
-    from freetoken.models.qwen3_5_moe.gdn_kernels import gdn_prefill_chunk_fla
+    from freetoken.layers.linear_attn.gdn import _chunk_prefill
 
     slots = 2
     q = torch.randn(1, T, KH, D, device=dev, dtype=torch.bfloat16)
@@ -321,8 +321,8 @@ def _gdn_prefill_case(dev, T):
     beta = torch.rand(1, T, VH, device=dev)
     state = torch.zeros(slots, VH, D, D, device=dev)
     ref_out, ref_state = _gdn_ref(q[0], k[0], v[0], g[0], beta[0], torch.zeros(VH, D, D, device=dev))
-    out = gdn_prefill_chunk_fla(
-        q, k, v, g, beta, state_source=state, indices=torch.tensor([1], dtype=torch.int32, device=dev),
+    out, _ = _chunk_prefill(
+        q, k, v, g, beta, state=state, indices=torch.tensor([1], dtype=torch.int32, device=dev),
         cu_seqlens=torch.tensor([0, T], dtype=torch.int64, device=dev), scale=D ** -0.5,
     )
     torch.cuda.synchronize()

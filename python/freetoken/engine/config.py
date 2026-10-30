@@ -192,6 +192,11 @@ class EngineConfig:
     # rows in place); ~1 GB of VRAM back for KV pages on a 250k-vocabulary model. Applies to
     # the rank that owns the embedding (rank 0 under the pipeline engine).
     host_embedding: bool = False
+    # upstream's speculative decoding (verify batches; no proposer is registered upstream yet).
+    # Separate from --spec-mtp above, which runs its windows as extend batches.
+    speculative_algorithm: str | None = None
+    speculative_num_steps: int = 0
+    speculative_draft_model_path: str | None = None
     max_seq_len_override: int | None = None
     num_page_override: int | None = None  # if not None, will override the number of pages
     # KV capacity in tokens; resolved into num_page_override by _adjust_config once page_size
@@ -358,6 +363,11 @@ class EngineConfig:
     @property
     def max_forward_len(self) -> int:
         return self.max_seq_len
+
+    @property
+    def decode_rows_per_req(self) -> int:
+        """Query rows each running request takes per decode step; every per-request decode allowance derives from it."""
+        return self.speculative_num_steps + 1 if self.speculative_algorithm is not None else 1
 
     @property
     def distributed_addr(self) -> str:

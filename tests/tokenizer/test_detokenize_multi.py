@@ -16,7 +16,7 @@ class WordTokenizer:
 
 
 def _msg(uid, tok, finished=False):
-    return DetokenizeMsg(uid=uid, next_token=tok, finished=finished)
+    return DetokenizeMsg(uid=uid, next_tokens=[tok], finished=finished)
 
 
 def _run(batches):

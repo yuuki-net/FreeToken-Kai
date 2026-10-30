@@ -591,12 +591,18 @@ def decode_paged_attention(
     # a grid that fits in one wave runs about one program per SM, which then needs wider tiles to keep enough loads in flight
     block_n = 64 if grid[0] * grid[1] * grid[2] <= _num_sms(q.device.index) else _MIN_BLOCK_KV
     num_stages = 3
-    # stage 1 keeps one K tile and one V tile in shared memory, in the dot's dtype: a quantized slab
-    # (--kv-cache-dtype, 1-byte codes) is dequantized to q's dtype before the dot, so its element
-    # size says nothing about the tiles
+    # stage 1 keeps the Q tile and one K and one V tile in shared memory, in the dot's dtype: a
+    # quantized slab (--kv-cache-dtype, 1-byte codes) is dequantized to q's dtype before the dot,
+    # so its element size says nothing about the tiles
+    smem = _optin_smem_bytes(q.device.index)
+    elem = q.element_size()
     tile_key = (q.device.index, 0 if kv_quant is None else kv_quant.bits, head_dim, q.dtype)
-    if 2 * block_n * block_d * q.element_size() > 0.8 * _optin_smem_bytes(q.device.index) or tile_key in _WIDE_TILE_REFUSED:
+    if 2 * block_n * block_d * elem > 0.8 * smem or tile_key in _WIDE_TILE_REFUSED:
         block_n = _MIN_BLOCK_KV
+    # 64 KiB parts (sm_75) cannot fit a head_dim 512 Q tile next to 32-row K/V tiles:
+    # halve the KV tile down to tl.dot's 16-row minimum until the three tiles fit.
+    while smem and block_n > 16 and (block_h * block_d + 2 * block_n * block_d) * elem > smem:
+        block_n //= 2
     if sliding_window:
         split_len = triton.cdiv(triton.cdiv(sliding_window, max_kv_splits), _MIN_BLOCK_KV) * _MIN_BLOCK_KV
         if split_len <= block_n:

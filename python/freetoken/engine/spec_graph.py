@@ -113,7 +113,6 @@ class SpecVerifyGraph:
         batch.out_loc = self.out_loc
         self.fla_slot.fill_(slot)
         batch.fla_metadata = self._fla()
-        batch.linear_table_idx = self.fla_slot
         attn = self.engine.attn_backend
         if getattr(batch, "attn_metadata", None) is None:
             attn.prepare_metadata(batch)

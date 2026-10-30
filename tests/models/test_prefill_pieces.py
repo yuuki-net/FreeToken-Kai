@@ -103,18 +103,15 @@ class _Pool:
 
 
 @needs_cuda
-def test_only_the_last_piece_tracks_with_the_slot_the_scheduler_chose(monkeypatch):
+def test_only_the_last_piece_tracks_with_the_slot_the_scheduler_chose():
     from freetoken.attention import linear
 
-    monkeypatch.setattr(
-        "freetoken.core.get_global_ctx", lambda: SimpleNamespace(linear_state_pool=_Pool())
-    )
     b, req = _batch(extend=1024, cached=0)
     req.mamba_ping_pong = (11, 12)
     req.linear_slot_idx = 5
     dev = torch.device("cuda")
     # the scheduler's build: picks ping_pong[0] and advances the index to 1
-    b.fla_metadata = linear.build_fla_metadata(b, dev)
+    b.fla_metadata = linear.build_fla_metadata(b, dev, _Pool())
     assert int(b.fla_metadata.track_dst[0]) == 11
     assert req.mamba_next_track_idx == 1
     boundary = req.mamba_last_track_seqlen

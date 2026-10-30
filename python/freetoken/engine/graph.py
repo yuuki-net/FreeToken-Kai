@@ -5,7 +5,7 @@ import functools
 import gc
 import sys
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Dict, List
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Literal
 
 import torch
 from freetoken.core import Batch, Req, get_global_ctx
@@ -17,7 +17,7 @@ from tqdm import tqdm
 
 if TYPE_CHECKING:
     from freetoken.attention import BaseAttnBackend
-    from freetoken.models import BaseLLMModel
+    from freetoken.attention.linear import LinearAttnBackend
     from freetoken.moe.offload_cache import OffloadMoeCache
 
 logger = init_logger(__name__)
@@ -28,14 +28,9 @@ class GraphCaptureBuffer:
     input_ids: torch.Tensor
     out_loc: torch.Tensor
     positions: torch.Tensor
-    # [3, bs] t/h/w rope positions; allocated only for mrope models (else None).
+    # [3, bs * rows_per_req] t/h/w rope positions; allocated only for mrope models (else None).
     mrope_positions: torch.Tensor | None
-    table_idx: torch.Tensor  # per-request slot id for GatedDeltaNet state gather/scatter
-    # Decode GDN query indptr = arange(bs+1); a constant per captured bs, filled once.
-    fla_cu_seqlens: torch.Tensor
-    # Static forward output: [max_bs, vocab] fp32 logits, or the residual stream a non-last
-    # pipeline rank hands on. Shaped from the first eager forward (ensure_out).
-    out: torch.Tensor | None = None
+    rows_per_req: int = 1
     # Pipeline engine, non-first ranks: the static residual-stream input the captured graphs
     # read; the engine copies each step's received rows into it before replay.
     pp_in: torch.Tensor | None = None
@@ -44,62 +39,44 @@ class GraphCaptureBuffer:
     def init(
         cls,
         bs: int,
-        vocab_size: int,
         device: torch.device,
-        pp_hidden: tuple[int, torch.dtype] | None = None,
         mrope: bool = False,
+        rows_per_req: int = 1,
+        pp_hidden: tuple[int, torch.dtype] | None = None,
     ) -> GraphCaptureBuffer:
-        del vocab_size  # the output buffer is shaped from the model's own output (ensure_out)
+        n = bs * rows_per_req
         pp_in = None
         if pp_hidden is not None:
             width, dtype = pp_hidden
-            pp_in = torch.zeros(bs, width, dtype=dtype, device=device)
+            pp_in = torch.zeros(n, width, dtype=dtype, device=device)
         return GraphCaptureBuffer(
-            input_ids=torch.zeros(bs, dtype=torch.int32, device=device),
-            out_loc=torch.zeros(bs, dtype=torch.int32, device=device),
-            positions=torch.zeros(bs, dtype=torch.int32, device=device),
+            input_ids=torch.zeros(n, dtype=torch.int32, device=device),
+            out_loc=torch.zeros(n, dtype=torch.int32, device=device),
+            positions=torch.zeros(n, dtype=torch.int32, device=device),
             mrope_positions=(
-                torch.zeros(3, bs, dtype=torch.int32, device=device) if mrope else None
+                torch.zeros(3, n, dtype=torch.int32, device=device) if mrope else None
             ),
-            table_idx=torch.zeros(bs, dtype=torch.int32, device=device),
-            fla_cu_seqlens=torch.arange(bs + 1, dtype=torch.int32, device=device),
+            rows_per_req=rows_per_req,
             pp_in=pp_in,
         )
 
-    def ensure_out(self, sample: torch.Tensor) -> torch.Tensor:
-        if self.out is None:
-            self.out = torch.empty(
-                (self.input_ids.numel(), *sample.shape[1:]), dtype=sample.dtype, device=sample.device
-            )
-        return self.out
-
     def set_batch(self, batch: Batch) -> None:
-        from freetoken.attention.linear import FLAMetadata
-
-        _slice = slice(batch.padded_size)
         bs = batch.padded_size
-        batch.input_ids = self.input_ids[_slice]
-        batch.out_loc = self.out_loc[_slice]
-        batch.positions = self.positions[_slice]
+        _rows = slice(bs * self.rows_per_req)
+        batch.input_ids = self.input_ids[_rows]
+        batch.out_loc = self.out_loc[_rows]
+        batch.positions = self.positions[_rows]
         if self.mrope_positions is not None:
-            batch.mrope_positions = self.mrope_positions[:, _slice]
-        batch.linear_table_idx = self.table_idx[_slice]
-        # Decode GDN metadata reads the persistent cu_seqlens (constant arange) and the
-        # persistent table_idx slot map, so the captured kernels see stable addresses.
-        batch.fla_metadata = FLAMetadata(
-            cu_seqlens=self.fla_cu_seqlens[: bs + 1], cache_indices=self.table_idx[_slice]
-        )
+            batch.mrope_positions = self.mrope_positions[:, _rows]
 
     def copy_from(self, batch: Batch) -> None:
-        _slice = slice(batch.padded_size)
-        self.input_ids[_slice] = batch.input_ids
+        _rows = slice(batch.padded_size * self.rows_per_req)
+        self.input_ids[_rows] = batch.input_ids
         if batch.out_loc is not None:
-            self.out_loc[_slice] = batch.out_loc
-        self.positions[_slice] = batch.positions
+            self.out_loc[_rows] = batch.out_loc
+        self.positions[_rows] = batch.positions
         if self.mrope_positions is not None:
-            self.mrope_positions[:, _slice] = batch.mrope_positions
-        if batch.linear_table_idx is not None:
-            self.table_idx[_slice] = batch.linear_table_idx
+            self.mrope_positions[:, _rows] = batch.mrope_positions
 
 
 def _determine_cuda_graph_bs(
@@ -153,21 +130,30 @@ def _upload_graph(graph: torch.cuda.CUDAGraph, stream: torch.cuda.Stream) -> Non
 
 
 class GraphRunner:
+    """CUDA graphs of ``forward`` over padded batches of ``rows_per_req`` rows per request, one graph per batch size; ``replay`` returns the real requests' rows of each output."""
+
     def __init__(
         self,
         stream: torch.cuda.Stream,
         device: torch.device,
-        model: BaseLLMModel,
+        forward: Callable[[], Any],
         attn_backend: BaseAttnBackend,
         cuda_graph_bs: List[int] | None,
         cuda_graph_max_bs: int | None,
         free_memory: int,
         max_seq_len: int,
-        vocab_size: int,
         dummy_req: Req,
         moe_offload_cache: OffloadMoeCache | None = None,
         pp_hidden: tuple[int, torch.dtype] | None = None,
         mrope: bool = False,
+        *,
+        rows_per_req: int = 1,
+        phase: Literal["decode", "verify"] = "decode",
+        ctx_override: Dict[str, Any] | None = None,
+        batch_hook: Callable[[Batch], None] | None = None,
+        pool: Any = None,
+        out_dtype: torch.dtype | None = None,
+        linear_backend: LinearAttnBackend | None = None,
     ) -> None:
         # (width, dtype) of the residual stream a non-first pipeline rank receives; None else
         self.pp_hidden = pp_hidden
@@ -176,7 +162,11 @@ class GraphRunner:
             cuda_graph_max_bs=cuda_graph_max_bs,
             free_memory=free_memory,
         )
+        # the padded rows replay the dummy request, so it must carry rows_per_req rows
+        assert rows_per_req == 1 or dummy_req.extend_len == rows_per_req, (rows_per_req, dummy_req.extend_len)
+        self.forward = forward
         self.attn_backend = attn_backend
+        self.linear_backend = linear_backend
         self.max_graph_bs = max(cuda_graph_bs) if cuda_graph_bs else 0
         self.graph_bs_list = sorted(cuda_graph_bs)
         self.dummy_req = dummy_req
@@ -184,13 +174,33 @@ class GraphRunner:
         self.mrope = mrope
         self.stream = stream
         self.device = device
-        self._capture_graphs(max_seq_len, vocab_size, model)
+        self.rows_per_req = rows_per_req
+        self.phase = phase
+        self.ctx_override = ctx_override or {}
+        self.batch_hook = batch_hook
+        self.graph_pool = pool
+        self.out_dtype = out_dtype
+        self._out: List[torch.Tensor] | None = None
+        self._out_is_tuple = False
+        self._out_rows: Dict[int, tuple[int, ...]] = {}
+        self._capture_graphs(max_seq_len)
 
     def _reset_moe_offload_cache(self) -> None:
         if self.moe_offload_cache is not None:
             self.moe_offload_cache.reset()
 
-    def _capture_graphs(self, max_seq_len: int, vocab_size: int, model: BaseLLMModel):
+    def _store_output(self, bs: int, out: Any) -> None:
+        self._out_is_tuple = isinstance(out, tuple)
+        outs = out if self._out_is_tuple else (out,)
+        if self._out is None:
+            # the largest batch is captured first, so its outputs size the buffers
+            assert self.out_dtype is None or len(outs) == 1, "out_dtype applies to a single output"
+            self._out = [torch.empty_like(o, dtype=self.out_dtype or o.dtype) for o in outs]
+        for buf, o in zip(self._out, outs, strict=True):
+            buf[: o.shape[0]] = o
+        self._out_rows[bs] = tuple(o.shape[0] for o in outs)
+
+    def _capture_graphs(self, max_seq_len: int):
         # Mark the post-weights "warmup" phase for /health: this stretch (graph capture — or the
         # remaining readiness work when graphs are disabled) moves no bytes, so without this the
         # loader would sit at 100% (last byte bar) until the ready ack. total=0 ⇒ the desktop
@@ -204,7 +214,9 @@ class GraphRunner:
         if self.max_graph_bs == 0:
             return logger.info_rank0("CUDA graph is disabled.")
 
-        self.attn_backend.init_capture_graph(max_seq_len=max_seq_len, bs_list=self.graph_bs_list)
+        self.attn_backend.init_capture_graph(max_seq_len=max_seq_len, bs_list=self.graph_bs_list, rows_per_req=self.rows_per_req)
+        if self.linear_backend is not None:
+            self.linear_backend.init_capture_graph(max_seq_len=max_seq_len, bs_list=self.graph_bs_list, rows_per_req=self.rows_per_req)
 
         torch.cuda.synchronize(self.device)
         torch.cuda.empty_cache()
@@ -215,7 +227,7 @@ class GraphRunner:
         logger.info_rank0(f"Free GPU memory before capturing CUDA graphs: {mem_GB(free_memory)}")
 
         self.buffer = GraphCaptureBuffer.init(
-            self.max_graph_bs, vocab_size, self.device, pp_hidden=self.pp_hidden, mrope=self.mrope
+            self.max_graph_bs, self.device, mrope=self.mrope, rows_per_req=self.rows_per_req, pp_hidden=self.pp_hidden
         )
         self._reset_moe_offload_cache()
 
@@ -226,36 +238,31 @@ class GraphRunner:
             unit="batch",
             disable=world is not None and not world.is_primary(),  # disable for non-primary ranks
         )
-        pool = None
+        pool = self.graph_pool
         ctx = get_global_ctx()
         for bs in pbar:
             free_memory = get_free_memory(self.device)
             pbar.desc = f"Capturing graphs: bs = {bs:<3} | avail_mem = {mem_GB(free_memory)}"
             pbar.refresh()
             graph = torch.cuda.CUDAGraph()
-            batch = Batch(reqs=[self.dummy_req] * bs, phase="decode")
+            batch = Batch(reqs=[self.dummy_req] * bs, phase=self.phase, rows_per_req=self.rows_per_req)
             batch.padded_reqs = batch.reqs
+            if self.batch_hook is not None:
+                self.batch_hook(batch)
             self.attn_backend.prepare_for_capture(batch)
             self.buffer.set_batch(batch)
-            # capture on the dummy linear-state slot so GatedDeltaNet gather/scatter
-            # touches scratch (real slot indices are written by copy_from on replay). Hybrid-
-            # radix decouples the GDN slot from table_idx -> use the GDN padding slot.
-            dummy_slot = (self.dummy_req.linear_slot_idx
-                          if self.dummy_req.linear_slot_idx is not None
-                          else self.dummy_req.table_idx)
-            self.buffer.table_idx[:bs].fill_(dummy_slot)
+            if self.linear_backend is not None:
+                self.linear_backend.prepare_for_capture(batch)
             # the captured graph must read the static residual-stream buffer, not a fresh tensor
             if self.buffer.pp_in is not None:
-                ctx.pp_hidden_in = self.buffer.pp_in[:bs]
+                ctx.pp_hidden_in = self.buffer.pp_in[: bs * self.rows_per_req]
             try:
-                with ctx.forward_batch(batch):
-                    warm = model.forward()  # one eager warm run, as before; it also shapes the static output
-                    out = self.buffer.ensure_out(warm)
-                    out[:bs] = warm
+                with ctx.forward_batch(batch, **self.ctx_override):
+                    self._store_output(bs, self.forward())
                     # Keep the offload cache warmed for capture. Resetting here forces
                     # CUDA graph capture to replay cold-cache expert copies.
                     with torch.cuda.graph(graph, pool=pool, stream=self.stream):
-                        out[:bs] = model.forward()
+                        self._store_output(bs, self.forward())
                     _upload_graph(graph, self.stream)
                     if decode_sample.TIMELINE is not None:
                         # a plan the first capture left on the batch would be skipped here and
@@ -263,7 +270,7 @@ class GraphRunner:
                         self.attn_backend.reset_forward_plan(batch)
                         timed = torch.cuda.CUDAGraph()
                         with torch.cuda.graph(timed, pool=graph.pool(), stream=self.stream):
-                            out[:bs] = decode_sample.run_forward(model.forward)
+                            self._store_output(bs, decode_sample.run_forward(self.forward))
                         _upload_graph(timed, self.stream)
                         self.timed_map[bs] = timed
                     self._reset_moe_offload_cache()
@@ -272,25 +279,35 @@ class GraphRunner:
             if pool is None:
                 pool = graph.pool()  # reuse cuda graph handle to reduce memory
             self.graph_map[bs] = graph
+        self.graph_pool = pool
 
         self._reset_moe_offload_cache()
         free_memory = get_free_memory(self.device)
         logger.info_rank0(f"Free GPU memory after capturing CUDA graphs: {mem_GB(free_memory)}")
 
     def can_use_cuda_graph(self, batch: Batch) -> bool:
-        return batch.is_decode and batch.size <= self.max_graph_bs
+        return (
+            batch.phase == self.phase
+            and batch.rows_per_req == self.rows_per_req
+            and batch.size <= self.max_graph_bs
+        )
 
     def has_timed(self, batch: Batch) -> bool:
         return batch.padded_size in self.timed_map
 
-    def replay(self, batch: Batch, timed: bool = False) -> torch.Tensor:
-        assert self.can_use_cuda_graph(batch)
+    def replay(self, batch: Batch, timed: bool = False) -> Any:
+        assert self.can_use_cuda_graph(batch) and self._out is not None
         self.buffer.copy_from(batch)
-        g = (self.timed_map if timed else self.graph_map)[batch.padded_size]
+        padded = batch.padded_size
+        g = (self.timed_map if timed else self.graph_map)[padded]
         self.attn_backend.prepare_for_replay(batch)
+        if self.linear_backend is not None:
+            self.linear_backend.prepare_for_replay(batch)
         g.replay()
-        assert self.buffer.out is not None
-        return self.buffer.out[: batch.size]
+        outs = tuple(
+            buf[: rows // padded * batch.size] for buf, rows in zip(self._out, self._out_rows[padded], strict=True)
+        )
+        return outs if self._out_is_tuple else outs[0]
 
     def pad_batch(self, batch: Batch) -> None:
         padded_size = (  # choose the first available batch size
@@ -303,11 +320,12 @@ class GraphRunner:
     # NOTE: This must be called before freeing NCCL resources to prevent program hang
     def destroy_cuda_graphs(self) -> None:
         # Drop the CUDAGraph objects (and the shared mempool they hold) AND the static
-        # GraphCaptureBuffer tensors ([max_bs, vocab] logits + input/out_loc/positions/...).
+        # GraphCaptureBuffer tensors (input/out_loc/positions/...) and the output buffers (_out).
         # Dropping the references is the load-bearing step; without it a runtime rebuild's
         # free-before-alloc cannot reclaim this GPU memory. empty_cache() is left to the
         # caller / next capture (GraphRunner._capture_graphs already runs it).
         self.graph_map = {}
         self.timed_map = {}
         self.buffer = None
+        self._out = None
         gc.collect()

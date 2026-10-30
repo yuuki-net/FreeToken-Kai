@@ -262,7 +262,7 @@ def test_channels_first_copy_never_aliases_the_conv_input():
     """A [dim, 1] transposed view counts as contiguous, so transpose().contiguous() returned the
     same storage and the in-place conv kernel overwrote the raw inputs the rollback needs."""
     import torch
-    from freetoken.models.qwen4_exp.gdn import channels_first_copy
+    from freetoken.layers.linear_attn.gdn import channels_first_copy
 
     for total in (1, 4):
         conv_in = torch.arange(total * 6, dtype=torch.float32).reshape(total, 6)

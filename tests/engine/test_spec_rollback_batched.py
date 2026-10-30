@@ -12,7 +12,7 @@ import torch
 
 from freetoken.engine import spec as spec_mod
 from freetoken.engine.spec import ngram_context_after, restore_gdn_stashes
-from freetoken.models.qwen4_exp.gdn import SpecGdnStash
+from freetoken.layers.linear_attn.gdn import SpecGdnStash
 
 
 @pytest.fixture(autouse=True)

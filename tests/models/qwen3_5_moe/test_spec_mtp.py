@@ -238,7 +238,7 @@ def test_spec_mtp_cli_flag():
 
 
 def test_channels_first_copy_never_aliases_the_conv_input():
-    gdn = pytest.importorskip("freetoken.models.qwen3_5_moe.gdn")
+    gdn = pytest.importorskip("freetoken.layers.linear_attn.gdn")
 
     for total in (1, 4):
         conv_in = torch.arange(total * 6, dtype=torch.float32).reshape(total, 6)

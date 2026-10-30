@@ -69,7 +69,7 @@ def plan_prefill_pieces(batch, n: int, attn_backend, device, linear_state_pool=N
             # Built now, on the real request, so the snapshot choice and its ping-pong advance
             # happen exactly once whoever builds first (the probe leaves it to the first GDN
             # layer; the scheduler builds it before the forward).
-            batch.fla_metadata = build_fla_metadata(batch, device)
+            batch.fla_metadata = build_fla_metadata(batch, device, linear_state_pool)
         tracked = batch.fla_metadata.track_dst is not None
 
     bounds = [(i * step, (i + 1) * step) for i in range(n - 1)] + [((n - 1) * step, total)]
@@ -104,7 +104,7 @@ def plan_prefill_pieces(batch, n: int, attn_backend, device, linear_state_pool=N
         piece.out_loc = batch.out_loc[start:end]
         piece.fla_metadata = None
         if linear_state_pool is not None:
-            piece.fla_metadata = build_fla_metadata(piece, device)
+            piece.fla_metadata = build_fla_metadata(piece, device, linear_state_pool)
         attn_backend.prepare_metadata(piece)
         pieces.append((start, end, piece))
     # A second pass over the same rows in the same step -- the MTP draft head fills its own KV

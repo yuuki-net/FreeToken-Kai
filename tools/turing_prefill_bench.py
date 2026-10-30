@@ -128,7 +128,7 @@ def c_attn_extend(dev, T, dt):
 
 def c_gdn_prefill(dev, T, dt):
     import torch
-    from freetoken.models.qwen3_5_moe.gdn_kernels import gdn_prefill_chunk_fla
+    from freetoken.layers.linear_attn.gdn import _chunk_prefill
 
     q = torch.randn(1, T, KH, D, device=dev, dtype=dt)
     k = torch.randn(1, T, KH, D, device=dev, dtype=dt)
@@ -138,8 +138,8 @@ def c_gdn_prefill(dev, T, dt):
     state = torch.zeros(2, VH, D, D, device=dev)
     idx = torch.tensor([1], dtype=torch.int32, device=dev)
     cu = torch.tensor([0, T], dtype=torch.int64, device=dev)
-    fn = lambda: gdn_prefill_chunk_fla(  # noqa: E731
-        q, k, v, g, beta, state_source=state, indices=idx, cu_seqlens=cu, scale=D ** -0.5)
+    fn = lambda: _chunk_prefill(  # noqa: E731
+        q, k, v, g, beta, state=state, indices=idx, cu_seqlens=cu, scale=D ** -0.5)
     ms = _time(fn)
     flops = 2 * 4 * T * VH * D * D  # rough: four [T,D]x[D,D]-class products per head
     _report(f"GDN chunk prefill ({dt}) T={T}", ms, flops)

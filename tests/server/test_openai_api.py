@@ -357,6 +357,24 @@ def test_completion_rejects_token_id_prompts():
     assert "token-id prompt" in body["error"]["message"]
 
 
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("n", [0, 2])
+def test_completion_refuses_n_other_than_one(n, stream):
+    state = FakeState([UserReply(uid=42, incremental_output="hello", finished=True)])
+    response = run(
+        handle_completion(
+            CompletionRequest(model="client-model", prompt="say hi", n=n, stream=stream),
+            request=None,
+            state=state,
+            model_sampling={},
+        )
+    )
+
+    assert response.status_code == 400
+    assert json.loads(response.body)["error"]["param"] == "n"
+    assert state.sent is None
+
+
 def test_completion_accepts_text_prompt():
     state = FakeState(
         [UserReply(uid=42, incremental_output="hello", finished=True, prompt_tokens_delta=2, completion_tokens_delta=1)]

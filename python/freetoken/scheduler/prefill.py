@@ -60,6 +60,8 @@ class PrefillAdder:
     # Why the last try_add_one returned None: a short tuple, kind first (see describe_refusal).
     # Set only on the refusal path, from numbers the check already had in hand.
     refusal: tuple | None = None
+    # slots a decode step may hold past a request's own length; reserved with it
+    token_headroom: int = 0
 
     def __post_init__(self) -> None:
         if not self.pass_budget:
@@ -85,7 +87,7 @@ class PrefillAdder:
         # TODO: better estimate policy
         extend_len = req.input_len - cached_len
         estimated_size = self._kv_reservation_size(
-            req.input_len + req.output_len, cached_len
+            req.input_len + req.output_len + self.token_headroom, cached_len
         )
 
         available = self.cache_manager.available_size
@@ -217,7 +219,7 @@ class PrefillAdder:
         # page span here; charging raw tokens can admit several short requests against one page
         # even though allocate_paged() needs a separate page for each request.
         self.reserved_size += self._kv_reservation_size(
-            pending_req.input_len + pending_req.output_len, cached_len
+            pending_req.input_len + pending_req.output_len + self.token_headroom, cached_len
         )
         # NOTE: update the tokens ids only; new pages will be allocated in the scheduler
         _slice = slice(cached_len, cached_len + chunk_size)
@@ -419,6 +421,7 @@ class PrefillManager:
     decode_manager: DecodeManager
     encoder_cache: EncoderCache | None = None
     keep_images_whole: bool = False
+    token_headroom: int = 0
     pending_list: List[PendingReq] = field(default_factory=list)
     stall: AdmissionStall = field(
         default_factory=lambda: AdmissionStall(ENV.ADMISSION_WARN_SECONDS.value)
@@ -450,6 +453,7 @@ class PrefillManager:
             table_manager=self.table_manager,
             encoder_cache=self.encoder_cache,
             keep_images_whole=self.keep_images_whole,
+            token_headroom=self.token_headroom,
         )
         reqs: List[Req] = []
         chunked_list: List[PendingReq] = []
