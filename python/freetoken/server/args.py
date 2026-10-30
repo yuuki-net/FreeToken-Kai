@@ -1445,6 +1445,17 @@ def parse_args(
             parser.error("--mmproj needs a .gguf model file")
         os.environ[MMPROJ_ENV] = os.path.abspath(os.path.expanduser(mmproj))
 
+    # FreeToken-Kai#6: no GGUF reader yields an MTP head (the Flash-Next GGUFs ship it as a separate
+    # file), so the load used to die on an unexpected include_mtp keyword after the config was read
+    if kwargs.get("spec_mtp", 0) > 0:
+        from freetoken.models.gguf.reader import is_gguf_path
+
+        if is_gguf_path(kwargs["model_path"]):
+            parser.error(
+                "--spec-mtp needs the draft head in the checkpoint, and GGUF checkpoints are read without "
+                "one (a separate MTP .gguf cannot be loaded yet); serve the safetensors/FTW model, or drop --spec-mtp"
+            )
+
     # a bad media root is a deployment mistake; fail at startup, not per request
     if kwargs["allowed_local_media_path"]:
         media_root = os.path.realpath(os.path.expanduser(kwargs["allowed_local_media_path"]))
