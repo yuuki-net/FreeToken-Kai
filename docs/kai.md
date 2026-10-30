@@ -1,7 +1,7 @@
 # FreeToken Kai (改)
 
 An unofficial fork of [FlashML-org/FreeToken](https://github.com/FlashML-org/FreeToken),
-merged with upstream `main` at commit `0bf7dbb` (2026-10-24). It is not affiliated with, endorsed
+merged with upstream `main` at commit `ee43b2a` (2026-10-30). It is not affiliated with, endorsed
 by, or supported by FlashML. The license is unchanged (Apache-2.0).
 
 The fork adds eleven things upstream does not have:
@@ -493,9 +493,15 @@ leaves the context length where it is.
 
 ## Speculative decoding with the checkpoint's MTP head (`--spec-mtp K`)
 
-Upstream FreeToken has no speculative decoding. This fork adds it for the Qwen3.5-MoE family
+Upstream FreeToken ships no working speculative decoder. This fork adds one for the Qwen3.5-MoE family
 using the MTP (multi-token prediction) head the checkpoints ship under `mtp.*` (one
 full-attention decoder layer plus `fc` / norms; Ornith-1.5-35B-A3B-NVFP4 carries it in bf16).
+
+Upstream has since added the target side of its own framework (`--speculative-algorithm`,
+multi-row "verify" decode steps, #833/#836), with no draft method registered yet. The two are
+separate code paths here: `--spec-mtp` runs its window as an extend batch and keeps working on
+`--pp-size`, and the server refuses `--speculative-algorithm` together with `--spec-mtp` or
+`--pp-size`.
 
 ```bash
 ft serve ... --max-running-req 1 --spec-mtp 3
