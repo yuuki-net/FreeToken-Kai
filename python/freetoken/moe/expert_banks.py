@@ -281,6 +281,24 @@ def _mixed_expert_banks(model_path, model_config, layer_methods, device, dummy, 
     return merge_expert_banks(parts, layer_methods, model_config.num_experts)
 
 
+def _gguf_first_layer(model_config, pp=None) -> int:
+    """The decoder-layer index of this rank's first MoE bank in a GGUF (``blk.<n>``).
+
+    ``num_moe_layers`` is already rank-local under --pp-size (models/config.py's pipeline
+    view), but the banks are read by *global* block number, so a rank that is not the first
+    must start at its own first layer: before this, rank 1 of a 2-way split loaded blk.0..23's
+    banks for layers 24..47 and the first MoE call failed on a bank/ggml-type mismatch (or,
+    with uniform types, would have run the wrong experts silently)."""
+    from freetoken.distributed import try_get_pp_info
+
+    first_k_dense = int(getattr(model_config, "first_k_dense_replace", 0) or 0)
+    pp = try_get_pp_info() if pp is None else pp
+    if pp is None:
+        return first_k_dense
+    lo, _hi = pp.bank_window(first_k_dense)
+    return first_k_dense + lo
+
+
 def _local_pieces(model_config, pieces):
     """Under --pp-size a rank's banks hold its own MoE layers only, indexed from zero, so the
     piece stream is filtered and renumbered here rather than in every family's reader."""
@@ -496,7 +514,7 @@ def load_expert_banks(
             from freetoken.models.gguf.experts import load_gguf_expert_banks
 
             # each layer keeps its own ggml types, so the banks come from the file, not from one method's layout
-            return load_gguf_expert_banks(model_path, model_config.num_moe_layers, first_layer=model_config.first_k_dense_replace, dummy=dummy, device=device if resident else None)
+            return load_gguf_expert_banks(model_path, model_config.num_moe_layers, first_layer=_gguf_first_layer(model_config), dummy=dummy, device=device if resident else None)
         if method is None:
             return _legacy_expert_banks(model_path, model_config, device, dtype, dummy, par, workers, chunk, decode_target, layer_sink)
         return _method_expert_banks(model_path, model_config, method, device, dummy, par, workers, chunk, layer_sink, resident)
