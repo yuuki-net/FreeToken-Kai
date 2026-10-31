@@ -652,6 +652,28 @@ model that does). Not yet measured on a card.
 | `FREETOKEN_PREMAP_VRAM` | off | Pre-map the remaining VRAM into the allocator cache at startup; an experiment that did not help on the 2060 (per-stream pools), left as a knob |
 | `FREETOKEN_PIN_CAP_FILE` | `~/.cache/freetoken/pin_cap.json` | Where this host's measured page-lock cap is recorded (`ft doctor pin`, or a start that was refused mid-load). Keyed by kernel build and guest RAM, so a new `.wslconfig` `memory=` is measured again rather than reusing the old figure |
 | `FREETOKEN_SAFETENSORS_CPU_LOAD` | auto | Read the checkpoint through host memory and copy each tensor to the GPU, instead of `safe_open(device="cuda")`. `auto` turns it on only where this host's pin budget is under a quarter of the checkpoint; `1` / `0` force it. See [Known limitations](#known-limitations) |
+| `FT_KERNEL_PROFILE` / `FT_KERNEL_PROFILE_COUNT` | off / `3` | Every n-th decode step (and `--spec-mtp` verify window) runs under the torch profiler and its kernels are logged by bucket (experts, GDN, attention, dense, copies); stops after the count. The profiled step is slower, so it is a breakdown, not a timing |
+| `FT_KERNEL_PROFILE_PREFILL` / `FT_KERNEL_PROFILE_MIN_ROWS` | off / `0` | `1` samples prefill chunks too, `only` samples nothing but them (so the count is not spent on the short requests before the first long prompt); chunks under the row count are skipped (FreeToken-Kai#10) |
+| `FT_QSA_PREFILL_PROFILE` | unset | `block_n,splits,warps,stages`: the QSA sparse-attention tile tried first for prefill shapes (more than 512 programs), for tuning a card whose shared memory refuses the built-in tile. A refused or malformed value falls back to the ladder (FreeToken-Kai#9) |
+
+## Where compiled kernels are cached
+
+The first start on a new card or a new build compiles kernels for it (18 minutes was reported on a
+Quadro RTX 8000; restarts 2-5 minutes once the caches are kept). Each library keeps its own cache, and
+each has its own variable to move it -- useful for a container, where they should sit on a volume
+that survives the container:
+
+| What | Default | Moved by |
+|---|---|---|
+| tvm-ffi JIT modules (FreeToken's own CUDA kernels, the vendored ggml) | `~/.cache/tvm-ffi` | `TVM_FFI_CACHE_DIR` |
+| flashinfer JIT kernels | `~/.cache/flashinfer` | `FLASHINFER_WORKSPACE_BASE` (the cache is `<base>/.cache/flashinfer`) |
+| Triton kernels | `~/.triton/cache` | `TRITON_CACHE_DIR` |
+| torch C++ extensions | `~/.cache/torch_extensions` | `TORCH_EXTENSIONS_DIR` |
+| FreeToken's own state (bank files, `ft bench bw` profiles, the pin cap) | `~/.cache/freetoken` | `XDG_CACHE_HOME` |
+
+`FREETOKEN_KERNEL_CACHE_DIR` is not one of these: it points at a prebuilt kernel cache (upstream's
+`freetoken-kernel-cache` wheel) that is read instead of compiling, and nothing is written there
+(FreeToken-Kai#4).
 
 ## Known limitations
 
