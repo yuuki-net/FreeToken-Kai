@@ -46,6 +46,8 @@ _BAD_FORCED: set[str] = set()
 # (24 q heads, 2 kv heads, 256 dim, top-k 2048), tile (16, 4 warps): 1024 rows over 4k context
 # 422 -> 98 ms, 4096 over 16k 1693 -> 393 ms; the dequant itself 0.35-1.2 ms; output identical
 # to the bit. A Quadro RTX 8000 saw the same in serving: q8_0 170 tok/s against 415 with fp16.
+# RTX 3060 (Ampere) is worse still, the q8_0 tile does not fit at 2 stages: 1024 rows over 4k
+# 318 -> 11.7 ms (fp16 KV 11.2), 4096 over 16k 1253 -> 43.7 ms (fp16 KV 42.3).
 _DEQUANT_ENV = "FREETOKEN_QSA_DEQUANT"
 _DEQUANT_MB_ENV = "FREETOKEN_QSA_DEQUANT_MB"
 # The scratch is this chunk's whole context, both K and V, 16-bit: 2 KiB a token for
@@ -54,14 +56,14 @@ _DEQUANT_MB = 256
 
 
 def _dequant_prefill_on() -> bool:
-    """On by default below Ampere, where the in-loop unpack was measured to dominate;
-    ``FREETOKEN_QSA_DEQUANT=1`` / ``0`` forces it on or off anywhere."""
+    """On by default except on Hopper and datacenter Blackwell, whose in-kernel unpack is the
+    tuned path and was not measured here; ``FREETOKEN_QSA_DEQUANT=1`` / ``0`` forces it on or off."""
     env = os.environ.get(_DEQUANT_ENV)
     if env is not None:
         return env == "1"
-    from freetoken.utils.arch import is_pre_ampere
+    from freetoken.utils.arch import is_sm90_family, is_sm100_family
 
-    return is_pre_ampere()
+    return not (is_sm90_family() or is_sm100_family())
 
 
 def _dequantized_pages(k_cache, v_cache, k_scales, v_scales, logical_indices, block_table, kv_quant, dtype, head_dim):
@@ -452,7 +454,7 @@ def qsa_sparse_paged_attention(
 
     With ``kv_quant`` (``--kv-cache-dtype``) the caches hold block-quantized codes and
     ``k_scales``/``v_scales`` their fp16 block scales; the tiles are dequantized inside the
-    kernel, except for prefill shapes below Ampere, whose pages are dequantized into a 16-bit
+    kernel, except for prefill shapes (off Hopper and datacenter Blackwell), whose pages are dequantized into a 16-bit
     copy first (``_dequantized_pages``). Only the paged K/V is quantized -- the compressed index slab, the pending ring
     and the scratch rows stay 16-bit, because they decide *which* blocks get read and an
     error there changes the selection rather than blurring a value.

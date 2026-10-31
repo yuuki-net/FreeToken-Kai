@@ -165,10 +165,12 @@ def test_the_ladder_offers_the_tuned_profile_first_then_gives_up_pipelining():
 
 @pytest.mark.parametrize("spec", [Q8_0, Q4_0], ids=lambda s: s.name)
 def test_a_prefill_through_the_16bit_copy_matches_the_in_kernel_dequant(spec, monkeypatch):
-    """FreeToken-Kai#8: below Ampere a prefill over a quantized K/V dequantizes the pages it reads
-    into a 16-bit copy and runs the 16-bit kernel (4.3x faster on an RTX 2060 at Flash-Next's
-    shape). The copy holds exactly what the in-kernel unpack computes, so the answer is the same
-    to the bit -- also through a page table that is not the identity, which the copy renumbers."""
+    """FreeToken-Kai#8: a prefill over a quantized K/V dequantizes the pages it reads into a
+    16-bit copy and runs the 16-bit kernel (4.3x faster on an RTX 2060, 27-29x on an RTX 3060 at
+    Flash-Next's shape). The copy holds exactly the dequantized values, so the answer is the
+    16-bit kernel's over the dequantized cache to the bit -- also through a page table that is
+    not the identity, which the copy renumbers. Against the in-kernel unpack it is only close:
+    where the quantized tile does not fit (3060: 2 stages -> 1) the two run different tiles."""
     from freetoken.kernel.triton.qsa import attend
 
     torch.manual_seed(8)
@@ -191,12 +193,12 @@ def test_a_prefill_through_the_16bit_copy_matches_the_in_kernel_dequant(spec, mo
 
     in_kernel, copied = run("0"), run("1")
     assert torch.isfinite(copied).all()
-    assert torch.equal(copied, in_kernel)
-    # and both still match the identity-table oracle
+    # the 16-bit kernel over the dequantized cache, identity table
     want = attend.qsa_sparse_paged_attention(
         c["q"], c["oracle"][0], c["oracle"][1], c["indices"], c["block_table"], c["token_to_req"]
     )
-    torch.testing.assert_close(copied, want, atol=3e-3, rtol=3e-3)
+    assert torch.equal(copied, want)
+    torch.testing.assert_close(in_kernel, want, atol=3e-3, rtol=3e-3)
 
 
 def test_the_16bit_copy_steps_aside_past_its_budget_and_for_nothing_selected(monkeypatch):
