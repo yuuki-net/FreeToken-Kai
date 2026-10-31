@@ -760,10 +760,13 @@ class Scheduler(SchedulerIOMixin):
                             uid=msg.uid,
                             # "prompt is too long: N tokens > M" is the phrasing Claude Code and
                             # OpenClaw match on; the Anthropic wire has no error code to read.
+                            # Kai (FreeToken-Kai#4): name the flags; the operator who reads this
+                            # rarely saw the boot's "context limit" warning that explains it
                             error=(
                                 f"prompt is too long: {input_len} tokens > {max_seq_len} maximum "
-                                f"(prompt + generation); shorten the prompt or increase the KV "
-                                f"cache budget"
+                                f"(prompt + generation); shorten the prompt or raise the server's KV "
+                                f"pool (--kv-reserve-tokens with --moe-cache-auto, else --num-tokens "
+                                f"or --memory-ratio; the server's start log has a \"context limit\" line)"
                             ),
                             # OpenAI's standard class for this, for clients that read a code.
                             code="context_length_exceeded",
