@@ -39,6 +39,60 @@ _ACCEPTED: dict[tuple, tuple[int, int, int, int]] = {}
 _REFUSED: set[tuple] = set()
 _BAD_FORCED: set[str] = set()
 
+# Kai (FreeToken-Kai#8): a prefill over a quantized K/V dequantizes the pages it reads into a
+# 16-bit scratch first and runs the 16-bit kernel. Dequantizing inside the loop is the decode
+# design (a few rows, each tile read once); a prefill chunk walks every selected tile once per
+# query row, so the unpack is paid thousands of times per page. RTX 2060, Flash-Next's shape
+# (24 q heads, 2 kv heads, 256 dim, top-k 2048), tile (16, 4 warps): 1024 rows over 4k context
+# 422 -> 98 ms, 4096 over 16k 1693 -> 393 ms; the dequant itself 0.35-1.2 ms; output identical
+# to the bit. A Quadro RTX 8000 saw the same in serving: q8_0 170 tok/s against 415 with fp16.
+_DEQUANT_ENV = "FREETOKEN_QSA_DEQUANT"
+_DEQUANT_MB_ENV = "FREETOKEN_QSA_DEQUANT_MB"
+# The scratch is this chunk's whole context, both K and V, 16-bit: 2 KiB a token for
+# Flash-Next, so 256 MiB covers 128k. Past it the in-kernel dequant keeps its tile footprint.
+_DEQUANT_MB = 256
+
+
+def _dequant_prefill_on() -> bool:
+    """On by default below Ampere, where the in-loop unpack was measured to dominate;
+    ``FREETOKEN_QSA_DEQUANT=1`` / ``0`` forces it on or off anywhere."""
+    env = os.environ.get(_DEQUANT_ENV)
+    if env is not None:
+        return env == "1"
+    from freetoken.utils.arch import is_pre_ampere
+
+    return is_pre_ampere()
+
+
+def _dequantized_pages(k_cache, v_cache, k_scales, v_scales, logical_indices, block_table, kv_quant, dtype, head_dim):
+    """``(k, v, block_table)`` over a 16-bit copy of the pages this batch can read, or None to
+    keep the quantized path (graph capture, nothing selected, or past the scratch budget).
+
+    The table's first ``n`` columns cover every selected logical token; their pages are
+    gathered in table order and the table is renumbered onto the copy, so the kernel reads the
+    same rows by the same logical index."""
+    from freetoken.kvcache.kv_quant import dequantize_rows
+
+    if torch.cuda.is_current_stream_capturing():
+        return None
+    page_size = k_cache.shape[1]
+    last = int(logical_indices.max().item())  # one sync per layer of a prefill chunk
+    if last < 0:
+        return None
+    width = min(last // page_size + 1, block_table.shape[1])
+    table = block_table[:, :width]
+    scratch = 2 * table.numel() * page_size * k_cache.shape[2] * head_dim * torch.empty((), dtype=dtype).element_size()
+    budget = max(1, int(os.environ.get(_DEQUANT_MB_ENV) or _DEQUANT_MB)) << 20
+    if scratch > budget:
+        return None
+    # rows of the table past a request's own pages hold whatever the pool left there: clamp, the
+    # kernel never reads them
+    pages = table.reshape(-1).to(torch.int64).clamp_(0, k_cache.shape[0] - 1)
+    k = dequantize_rows(k_cache.index_select(0, pages), k_scales.index_select(0, pages), kv_quant, dtype)
+    v = dequantize_rows(v_cache.index_select(0, pages), v_scales.index_select(0, pages), kv_quant, dtype)
+    renumbered = torch.arange(pages.numel(), device=block_table.device, dtype=block_table.dtype).view(table.shape)
+    return k.contiguous(), v.contiguous(), renumbered.contiguous()
+
 
 def _forced_prefill_profile():
     """``FT_QSA_PREFILL_PROFILE=block_n,splits,warps,stages``: one tile profile for the prefill
@@ -398,7 +452,8 @@ def qsa_sparse_paged_attention(
 
     With ``kv_quant`` (``--kv-cache-dtype``) the caches hold block-quantized codes and
     ``k_scales``/``v_scales`` their fp16 block scales; the tiles are dequantized inside the
-    kernel. Only the paged K/V is quantized -- the compressed index slab, the pending ring
+    kernel, except for prefill shapes below Ampere, whose pages are dequantized into a 16-bit
+    copy first (``_dequantized_pages``). Only the paged K/V is quantized -- the compressed index slab, the pending ring
     and the scratch rows stay 16-bit, because they decide *which* blocks get read and an
     error there changes the selection rather than blurring a value.
     """
@@ -434,6 +489,14 @@ def qsa_sparse_paged_attention(
     assert out.shape == q.shape and out.dtype == q.dtype and out.stride(2) == 1
     if not q.shape[0]:
         return out
+
+    if kv_quant is not None and q.shape[0] * k_cache.shape[2] > 512 and _dequant_prefill_on():
+        dense = _dequantized_pages(
+            k_cache, v_cache, k_scales, v_scales, logical_indices, block_table, kv_quant, q.dtype, head_dim
+        )
+        if dense is not None:
+            k_cache, v_cache, block_table = dense
+            k_scales = v_scales = kv_quant = None
 
     group_size = q.shape[1] // k_cache.shape[2]
     block_m = triton.next_power_of_2(group_size)

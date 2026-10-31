@@ -110,7 +110,7 @@ def test_the_unquantized_path_still_works():
 
 
 @pytest.mark.parametrize("spec", [Q8_0, Q4_0], ids=lambda s: s.name)
-def test_the_prefill_profile_falls_back_when_it_does_not_fit(spec):
+def test_the_prefill_profile_falls_back_when_it_does_not_fit(spec, monkeypatch):
     """The wide tile is tuned on a GB300 (227 KiB of shared memory per block).
 
     A 3060 has 99 KiB and a 2060 has 64, and Triton refuses the launch outright --
@@ -124,6 +124,8 @@ def test_the_prefill_profile_falls_back_when_it_does_not_fit(spec):
     """
     from freetoken.kernel.triton.qsa import attend
 
+    # the in-kernel dequant's own tile (below Ampere a prefill would take the 16-bit copy instead)
+    monkeypatch.setenv("FREETOKEN_QSA_DEQUANT", "0")
     torch.manual_seed(5)
     attend._ACCEPTED.clear()
     attend._REFUSED.clear()
@@ -159,3 +161,60 @@ def test_the_ladder_offers_the_tuned_profile_first_then_gives_up_pipelining():
     assert [(n, w, s) for n, _, w, s in rungs] == [
         (64, 2, 2), (64, 2, 1), (16, 4, 2), (16, 4, 1), (32, 4, 2), (32, 4, 1), (32, 2, 2), (32, 2, 1)
     ]
+
+
+@pytest.mark.parametrize("spec", [Q8_0, Q4_0], ids=lambda s: s.name)
+def test_a_prefill_through_the_16bit_copy_matches_the_in_kernel_dequant(spec, monkeypatch):
+    """FreeToken-Kai#8: below Ampere a prefill over a quantized K/V dequantizes the pages it reads
+    into a 16-bit copy and runs the 16-bit kernel (4.3x faster on an RTX 2060 at Flash-Next's
+    shape). The copy holds exactly what the in-kernel unpack computes, so the answer is the same
+    to the bit -- also through a page table that is not the identity, which the copy renumbers."""
+    from freetoken.kernel.triton.qsa import attend
+
+    torch.manual_seed(8)
+    c = _case(spec, torch.float16, head_dim=256, kv_heads=2, q_heads=24, pages=16,
+              page_size=64, topk=256, n_rows=300)
+    # physical pages in another order: logical page j lives at perm[j]
+    perm = torch.randperm(16, device="cuda")
+    inverse = torch.empty_like(perm)
+    inverse[perm] = torch.arange(16, device="cuda")
+    codes = tuple(t[inverse].contiguous() for t in c["codes"])
+    scales = tuple(t[inverse].contiguous() for t in c["scales"])
+    table = perm.to(torch.int32).view(1, -1).contiguous()
+
+    def run(mode):
+        monkeypatch.setenv("FREETOKEN_QSA_DEQUANT", mode)
+        return attend.qsa_sparse_paged_attention(
+            c["q"], codes[0], codes[1], c["indices"], table, c["token_to_req"], None,
+            k_scales=scales[0], v_scales=scales[1], kv_quant=spec,
+        )
+
+    in_kernel, copied = run("0"), run("1")
+    assert torch.isfinite(copied).all()
+    assert torch.equal(copied, in_kernel)
+    # and both still match the identity-table oracle
+    want = attend.qsa_sparse_paged_attention(
+        c["q"], c["oracle"][0], c["oracle"][1], c["indices"], c["block_table"], c["token_to_req"]
+    )
+    torch.testing.assert_close(copied, want, atol=3e-3, rtol=3e-3)
+
+
+def test_the_16bit_copy_steps_aside_past_its_budget_and_for_nothing_selected(monkeypatch):
+    from freetoken.kernel.triton.qsa.attend import _dequantized_pages
+
+    c = _case(Q8_0, torch.float16, head_dim=256, kv_heads=2, q_heads=24, pages=16,
+              page_size=64, topk=256, n_rows=300)
+    args = (c["codes"][0], c["codes"][1], c["scales"][0], c["scales"][1])
+    # 4 pages x 64 tokens x 2 heads x 256 x 2 bytes x (K, V) = 512 KiB
+    monkeypatch.setenv("FREETOKEN_QSA_DEQUANT_MB", "1")
+    k, v, table = _dequantized_pages(*args, c["indices"], c["block_table"], Q8_0, torch.float16, 256)
+    assert k.shape == (4, 64, 2, 256) and table.tolist() == [[0, 1, 2, 3]]
+    monkeypatch.setenv("FREETOKEN_QSA_DEQUANT_MB", "0")  # floors at 1 MiB, still fits
+    assert _dequantized_pages(*args, c["indices"], c["block_table"], Q8_0, torch.float16, 256) is not None
+    wide = c["block_table"][:, :16]
+    every = torch.arange(16 * 64, device="cuda", dtype=torch.int32).repeat(300, 1)[:, -256:].contiguous()
+    monkeypatch.setenv("FREETOKEN_QSA_DEQUANT_MB", "1")
+    # the last 256 logical tokens: 16 pages = 2 MiB > 1 MiB
+    assert _dequantized_pages(*args, every, wide, Q8_0, torch.float16, 256) is None
+    nothing = torch.full_like(c["indices"], -1)
+    assert _dequantized_pages(*args, nothing, c["block_table"], Q8_0, torch.float16, 256) is None
