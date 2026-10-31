@@ -55,6 +55,18 @@ def draft_head_config(config, *, dense_from_model: bool):
 
     if config.quant is None:
         return config
+    mtp_gguf = getattr(config, "mtp_gguf", None)
+    from freetoken.layers.quantization import GGUFConfig
+
+    if mtp_gguf and isinstance(config.quant, GGUFConfig):
+        # Kai (FreeToken-Kai#6): a GGUF model's head comes from a separate MTP GGUF. Its experts join the
+        # bank as that file's ggml rows, so the head's MoE layer takes the file's types, not the model's
+        # first layer's; its projections are read dequantized (iter_gguf_mtp_weights), so they stay bf16
+        from freetoken.models.gguf.reader import gguf_tensor_index
+
+        types = {name: info.ggml_type for name, info in gguf_tensor_index(mtp_gguf).items()}
+        experts = GGUFConfig(types, config.quant.to_gguf, name_map=config.quant.name_map)
+        return replace(config, quant=DraftHeadQuantConfig(experts, "mtp.layers.0.mlp.experts", dense=None))
     first_moe = int(getattr(config, "first_k_dense_replace", 0) or 0)
     return replace(
         config,

@@ -533,6 +533,36 @@ refused where it is read. Verified on modelopt MIXED_PRECISION (Ornith / Qwen3.6
 and on the Flash-Next NVFP4 export. The `Spec decode` line in the decode status shows the mean
 accepted length.
 
+### The head from a separate MTP GGUF (`--spec-mtp-gguf`)
+
+The Qwen3.8-Flash-Next GGUFs carry no MTP layer (`block_count = 48`, no `nextn_predict_layers`);
+Unsloth ships the head as separate files in `MTP/` of `unsloth/Qwen3.8-Flash-Next-GGUF`
+(FreeToken-Kai#6). Point the server at one of them:
+
+```bash
+ft serve --model .../Qwen3.8-Flash-Next-UD-IQ4_XS-00001-of-00003.gguf --max-running-req 1 \
+  --spec-mtp 3 --spec-mtp-gguf .../MTP/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf
+```
+
+The file stores the head as block 48 with llama.cpp's NextN tensors (`nextn.eh_proj` is
+`fc_embedding | fc_hidden` side by side, embedding half first; `nextn.enorm` / `hnorm` the two
+pre-fc norms; `nextn.hc_head_*` the head's stream mixer) and the decoder layer under the decoder's
+own names. The reader dequantizes the projections to bf16 and names them as the checkpoint names
+`mtp.*`, so the head is built and loaded the same way. Held against Qwen's own bf16 head
+(`Qwen/Qwen3.8-Flash-Next`) with the `shared-Q8_0` file: every matrix within Q8_0's 0.6-1.2 %,
+every norm exact. The routed experts:
+
+- on a GGUF model they keep the file's ggml rows (Q8_0 in the recommended file, 2.5 GiB of pinned
+  host memory) as one more bank layer with its own type tag, so the head's MoE layer runs them with
+  the file's types and the cache gives them a slot pool of their own;
+- on any other model (an NVFP4 checkpoint, an FTW) they are dequantized to bf16 and quantized into
+  the model's bank format, as a checkpoint's head is.
+
+The `shared-` files borrow the token embedding and the lm_head from the model, which this head
+always does, so the smaller `shared-` file is the one to use; a self-contained file works too (its
+own copies are not read, except the embedding on a pipeline rank that has none). Other quants of the
+head (`Q4_K_M`, `BF16`) are read the same way: ggml's own CUDA kernels dequantize every ggml type.
+
 A request's `presence_penalty` / `frequency_penalty` hold inside a verify window too: each row is
 penalized by the output so far plus the drafts before it, which is what a plain decode would have
 counted by that token, and only the tokens the window commits are added to the counts. The draft

@@ -67,3 +67,25 @@ def test_per_layer_pools_give_the_head_its_own():
     groups = group_layers("per-layer", bank_layouts(banks.sources, banks.layer_tags), layer_slot_bytes(banks.sources))
     owner = pool_of_layer(make_pools(groups, E, min_num_slots=E, slot_limit=None), L + 1)
     assert sorted(owner) == [0, 1, 2, 3] and len(set(owner)) == L + 1
+
+
+def test_an_mtp_ggufs_experts_join_a_gguf_bank_in_their_own_types():
+    """--spec-mtp-gguf on a GGUF model (FreeToken-Kai#6): the MTP file's Q8_0 rows are wider than the
+    model's IQ3_S ones; they keep their tag and MMQ tails, so the cache gives them a pool of their own."""
+    from freetoken.layers.quantization import QuantKind
+
+    iq3 = ("ggml", "IQ3_S", "IQ4_NL")
+    banks = SimpleNamespace(
+        quant_format="gguf", kind=QuantKind.GGUF, sources=_rows(L),
+        layer_residency=[HostResidency.PINNED.value] * L, layer_tags=[iq3] * L,
+        row_tail_bytes={"gate_up": [0] * L, "down": [0] * L},
+    )
+    head = {"gate_up": torch.zeros(E, 8, 34, dtype=torch.uint8), "down": torch.zeros(E, 4, 34, dtype=torch.uint8)}
+    q8 = ("ggml", "Q8_0", "Q8_0")
+    engine = SimpleNamespace(_mtp_bank_host=head, _mtp_bank_tag=q8, _mtp_bank_tails={"gate_up": 64, "down": 32})
+    assert Engine._append_mtp_bank(engine, banks) == 1
+    assert banks.layer_tags == [iq3] * L + [q8]
+    assert banks.row_tail_bytes == {"gate_up": [0] * L + [64], "down": [0] * L + [32]}
+    assert [t.shape[-1] for t in banks.sources["gate_up"]] == [18] * L + [34]
+    groups = group_layers("unified", bank_layouts(banks.sources, banks.layer_tags), layer_slot_bytes(banks.sources))
+    assert sorted(groups) == [[0, 1, 2], [3]]

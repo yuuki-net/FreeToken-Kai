@@ -184,6 +184,9 @@ class EngineConfig:
     # single-GPU) as one extra full-attention layer (id = num_layers) with its own KV slab and
     # one extra expert-bank layer. Single request.
     spec_mtp: int = 0
+    # --spec-mtp-gguf (Kai): the draft head from a separate MTP GGUF instead of the checkpoint (the
+    # Qwen3.8-Flash-Next GGUFs ship it as MTP/mtp-*.gguf). None = the checkpoint's mtp.* block
+    spec_mtp_gguf: str | None = None
     # --spec-draft-head-quant: the MTP drafts score through this copy of the lm_head (none/q4_0/q8_0)
     spec_draft_head_quant: str = "none"
     # --spec-min-p: a draft whose head probability is below this ends the window (0 = fixed K)
@@ -342,6 +345,8 @@ class EngineConfig:
 
             start, end = self.pp_layer_range or (0, config.num_layers)
             config = window_model_config(config, start, end, extra_full_layer=mtp_layer)
+        if mtp_layer is not None and self.spec_mtp_gguf:
+            config = replace(config, mtp_gguf=self.spec_mtp_gguf)
         if self.host_embedding and self.pp_is_first:
             config = replace(config, embed_host=True)
         if config.vision_config is not None and not self.builds_tower:

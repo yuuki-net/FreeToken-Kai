@@ -4,6 +4,7 @@ import collections
 import contextlib
 import errno
 import gc
+import itertools
 import math
 import os
 import re
@@ -846,6 +847,11 @@ class Engine:
         self._mtp_bank_host: Dict[str, torch.Tensor] | None = None
         self._mtp_bank_bytes = 0
         self._mtp_bank_layers = 0
+        # --spec-mtp-gguf on a GGUF model: the head's experts keep the MTP file's ggml rows, a bank
+        # layer of their own types (its tag and MMQ tails), instead of being quantized to the model's
+        self._mtp_gguf_target = False
+        self._mtp_bank_tag = None
+        self._mtp_bank_tails: Dict[str, int] | None = None
         if self.spec_k > 0:
             from freetoken.kvcache import qsa_pool as _qsa_pool
 
@@ -1456,13 +1462,17 @@ class Engine:
         # models declaring per-tensor dtypes (e.g. DSV4's mixed fp8/fp32/bf16) are preserved;
         # MoE models exclude routed experts (they load as expert banks, not dense weights).
         has_mtp = getattr(self.model, "mtp", None) is not None
+        # Kai (FreeToken-Kai#6): --spec-mtp-gguf reads the head from its own GGUF instead of the checkpoint
+        mtp_gguf = getattr(config, "spec_mtp_gguf", None) if has_mtp else None
         weights = load_weight(
             config.model_path,
             self.device,
             include_moe_experts=not getattr(config.model_config, "is_moe", False),
-            include_mtp=has_mtp,
+            include_mtp=has_mtp and not mtp_gguf,
             include_vision=config.builds_tower,
         )
+        if mtp_gguf:
+            weights = itertools.chain(weights, self._mtp_gguf_weights(config, mtp_gguf, model_state))
         remap = getattr(self.model, "remap_loaded_weight", None)
         if remap is not None:
             # model-declared renames/splits (e.g. the fp8 GDN's in_proj -> qkvz | ba) come
@@ -1480,7 +1490,9 @@ class Engine:
         state = _materialize_loaded_weight_state_dict(
             model_state, weights, device=self.device, host_prefixes=host_prefixes, host_keys=host_keys
         )
-        if has_mtp:
+        if has_mtp and self._mtp_gguf_target:
+            self._load_mtp_gguf_experts(mtp_gguf)
+        elif has_mtp:
             self._quantize_mtp_experts()
         # the pinned tables count against the host pin quota the bank residency planner sees
         self._host_resident_bytes = sum(
@@ -1489,6 +1501,46 @@ class Engine:
         return state
 
     # ------------------------------------------------------------------ MTP expert bank layer
+    def _mtp_gguf_weights(self, config: EngineConfig, path: str, model_state: Dict[str, torch.Tensor]):
+        """--spec-mtp-gguf (Kai, FreeToken-Kai#6): the draft head's tensors from its own GGUF, named as the
+        checkpoint's ``mtp.*``. A GGUF model keeps the file's expert rows as they are (``_load_mtp_gguf_experts``);
+        any other model takes them as bf16 and quantizes them into its bank format, as a checkpoint's head."""
+        mc = config.model_config
+        if getattr(mc, "qwen4_args", None) is None:
+            raise ValueError("--spec-mtp-gguf reads Qwen3.8-Flash-Next's MTP head; this model is another family")
+        from freetoken.models.gguf.reader import gguf_tensor_index, is_gguf_path
+        from freetoken.layers.quantization.ggml_types import is_quantized
+        from freetoken.models.qwen4_exp.gguf import iter_gguf_mtp_weights
+
+        self._mtp_gguf_target = is_gguf_path(config.model_path)
+        embedding_from = None
+        if self._mtp_gguf_target and "mtp.embed_tokens.weight" in model_state:
+            # a rank without the embedding gives the head its own copy; the loader duplicates a bf16
+            # table (remap_loaded_weight), a quantized one is dequantized here
+            if is_quantized(gguf_tensor_index(config.model_path)["token_embd.weight"].ggml_type):
+                embedding_from = config.model_path
+        return iter_gguf_mtp_weights(
+            path, self.device, num_layers=mc.num_layers, hidden=mc.hidden_size, hc_count=mc.qwen4_args.hc_count,
+            experts=not self._mtp_gguf_target, embedding_from=embedding_from,
+        )
+
+    def _load_mtp_gguf_experts(self, path: str) -> None:
+        """The MTP file's routed experts as one more GGUF bank layer, in its own ggml types and pinned, for
+        ``_append_mtp_bank`` -- the head's MoE layer is built for those types (``draft_head_config``)."""
+        from freetoken.models.gguf.experts import load_gguf_expert_banks
+        from freetoken.models.qwen4_exp.gguf import mtp_gguf_block
+
+        banks = load_gguf_expert_banks(path, 1, first_layer=mtp_gguf_block(path))
+        host = {role: tensors[0] for role, tensors in banks.sources.items()}
+        self._mtp_bank_host = host
+        self._mtp_bank_tag = banks.layer_tags[0]
+        self._mtp_bank_tails = {role: tails[0] for role, tails in (banks.row_tail_bytes or {}).items()}
+        self._mtp_bank_bytes = sum(t.numel() * t.element_size() for t in host.values())
+        logger.info(
+            f"MTP draft head: {host['down'].shape[0]}-expert layer from {os.path.basename(path)}, "
+            f"{self._mtp_bank_tag[1]} / {self._mtp_bank_tag[2]} ({self._mtp_bank_bytes / 2**20:.0f} MB pinned)"
+        )
+
     def _capture_mtp_experts(self, weights):
         """Pull the head's stacked bf16 experts (``mtp.layers.0.mlp.experts.{gate_up,down}_proj``)
         out of the weight stream: they become a bank layer, not model buffers."""
@@ -1562,10 +1614,16 @@ class Engine:
             return 0
         from freetoken.moe.host_banks import HostResidency
 
-        assert banks.quant_format in ("nvfp4", "q2_0"), (
-            f"the MTP expert bank is written in the native nvfp4 (or q2_0) layout; this run uses "
-            f"{banks.quant_format!r} (use --moe-strategy hybrid/cpu, or --quant-backend moe.nvfp4=triton)"
-        )
+        own_tag = getattr(self, "_mtp_bank_tag", None)  # --spec-mtp-gguf on a GGUF model: the MTP file's own ggml types
+        if own_tag is None:
+            assert banks.quant_format in ("nvfp4", "q2_0"), (
+                f"the MTP expert bank is written in the native nvfp4 (or q2_0) layout; this run uses "
+                f"{banks.quant_format!r} (use --moe-strategy hybrid/cpu, or --quant-backend moe.nvfp4=triton)"
+            )
+        else:
+            assert banks.kind is QuantKind.GGUF and banks.layer_tags is not None, (
+                f"the MTP file's ggml experts join GGUF banks only; this run's are {banks.quant_format!r}"
+            )
         missing = sorted(set(banks.sources) - set(host))
         assert not missing, (
             f"the MTP expert bank has no {missing} to append; the model's banks carry "
@@ -1573,15 +1631,21 @@ class Engine:
         )
         for name, per_layer in banks.sources.items():
             t = host[name]
-            assert t.shape[1:] == per_layer[0].shape[1:] and t.dtype == per_layer[0].dtype, (
+            # a GGUF layer's rows are as wide as its own ggml type makes them
+            same_rows = own_tag is not None or t.shape[1:] == per_layer[0].shape[1:]
+            assert same_rows and t.dtype == per_layer[0].dtype, (
                 name, t.shape, per_layer[0].shape, t.dtype, per_layer[0].dtype
             )
             per_layer.append(t)
         if banks.layer_residency is not None:
             banks.layer_residency.append(HostResidency.PINNED.value)
         if banks.layer_tags is not None:
-            # the head's experts are quantized to the model's bank layout, so they share its tag (and its slot pool)
-            banks.layer_tags.append(banks.layer_tags[-1])
+            # quantized to the model's bank layout, the head's experts share its tag (and its slot pool);
+            # the MTP file's ggml rows keep their own types, in a pool of that tag
+            banks.layer_tags.append(banks.layer_tags[-1] if own_tag is None else own_tag)
+        if own_tag is not None and banks.row_tail_bytes is not None:
+            for role, tails in banks.row_tail_bytes.items():
+                tails.append(self._mtp_bank_tails.get(role, 0))
         self._mtp_bank_host = None
         logger.info("MTP draft head: its expert layer appended to the offload cache")
         return 1

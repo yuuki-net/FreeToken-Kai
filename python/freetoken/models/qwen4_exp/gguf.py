@@ -5,6 +5,7 @@ The llama.cpp converter (conversion/qwen.py, conversion/qwen4exp.py) stores ever
 
 from __future__ import annotations
 
+import os
 import re
 from dataclasses import replace
 from types import SimpleNamespace
@@ -15,7 +16,7 @@ import torch
 from freetoken.layers.quantization.ggml_types import is_quantized
 from freetoken.models.gguf.mmproj import find_mmproj, log_mmproj
 from freetoken.models.gguf.reader import GgufTensorInfo, gguf_tensor_index
-from freetoken.models.gguf.tensors import check_scales, float_tensor, fused, matrix
+from freetoken.models.gguf.tensors import check_scales, float_tensor, fused, matrix, packed_rows
 from freetoken.models.qwen3_vl.gguf import gguf_mm_config, iter_mmproj_weights
 
 from .config import parse_config
@@ -73,6 +74,18 @@ _TOP_LEAVES: dict[str, tuple[str, ...]] = {
     "model.language_model.hyper_connection_mixer.input_mix_weight_up": ("output_hc_up",),
 }
 _LAYER_RE = re.compile(r"^model\.language_model\.layers\.(\d+)\.(.+)$")
+# Kai (FreeToken-Kai#6): the MTP draft head's decoder layer, stored as the block after the decoder
+_MTP_LAYER_RE = re.compile(r"^mtp\.layers\.0\.(.+)$")
+_NEXTN_RE = re.compile(r"^blk\.(\d+)\.nextn\.eh_proj(\.weight)?$")
+
+
+def _mtp_block(tensors) -> int | None:
+    """The block a GGUF stores its MTP head under (``blk.N.nextn.*``), or None without one."""
+    for name in tensors:
+        m = _NEXTN_RE.match(name)
+        if m is not None:
+            return int(m.group(1))
+    return None
 
 
 def to_gguf(name: str, tensors: dict[str, int]) -> tuple[str, ...]:
@@ -80,9 +93,29 @@ def to_gguf(name: str, tensors: dict[str, int]) -> tuple[str, ...]:
     if name in _TOP_LEAVES:
         return _TOP_LEAVES[name]
     m = _LAYER_RE.match(name)
-    if m is None:
-        return ()
-    return tuple(f"blk.{m.group(1)}.{leaf}" for leaf in _LAYER_LEAVES.get(m.group(2), ()))
+    if m is not None:
+        return tuple(f"blk.{m.group(1)}.{leaf}" for leaf in _LAYER_LEAVES.get(m.group(2), ()))
+    m = _MTP_LAYER_RE.match(name)
+    block = None if m is None else _mtp_block(tensors)
+    if block is None:
+        return ()  # also the head's layer in a model's own table: its projections load dequantized (iter_gguf_mtp_weights)
+    return tuple(f"blk.{block}.{leaf}" for leaf in _LAYER_LEAVES.get(m.group(1), ()))
+
+
+def mtp_gguf_block(path: str) -> int:
+    """The block of a separate MTP GGUF (Unsloth's ``MTP/mtp-Qwen3.8-Flash-Next-*.gguf``) that holds
+    the draft head; ValueError when ``path`` is not one."""
+    from freetoken.models.gguf.reader import load_gguf_metadata
+
+    if not os.path.isfile(path):
+        raise ValueError(f"--spec-mtp-gguf: {path} is not a file")
+    arch = load_gguf_metadata(path).get("general.architecture")
+    if arch != _ARCH:
+        raise ValueError(f"--spec-mtp-gguf: {path} is a {arch!r} GGUF; a separate MTP head is read for {_ARCH} (Qwen3.8-Flash-Next) only")
+    block = _mtp_block(gguf_tensor_index(path))
+    if block is None:
+        raise ValueError(f"--spec-mtp-gguf: {path} holds no MTP head (no blk.N.nextn.eh_proj tensor)")
+    return block
 
 
 def parse_gguf_config(shim: GgufConfigShim) -> ModelConfig:
@@ -278,4 +311,122 @@ def ple_table_info(model_path: str) -> GgufTensorInfo:
     return gguf_tensor_index(model_path)["per_layer_token_embd.weight"]
 
 
-__all__ = ["gguf_mm_config", "iter_gguf_weights", "parse_gguf_config", "ple_table_info", "to_gguf"]
+# ----------------------------------------------------------------------------------------------
+# The MTP draft head from a separate GGUF (Kai, FreeToken-Kai#6)
+# ----------------------------------------------------------------------------------------------
+
+_DEQUANT_ROWS = 1 << 16  # rows per ggml dequant call: 64k rows of 2560 are 335 MB of bf16
+
+
+def _bf16(info: GgufTensorInfo, device: torch.device) -> torch.Tensor:
+    """One tensor in torch order as bf16 on the host, dequantized by ggml's own kernels on a CUDA ``device``
+    (every ggml type), else by the reference dequantizers (Q8_0, Q4_0, Q6_K, Q2_0)."""
+    if not is_quantized(info.ggml_type):
+        return float_tensor(info).to(torch.bfloat16)
+    rows = packed_rows(info)
+    k = int(info.ne[0])
+    if device.type == "cuda":
+        from freetoken.kernel import ggml
+
+        out = torch.empty(rows.shape[0], k, dtype=torch.bfloat16)
+        for r0 in range(0, rows.shape[0], _DEQUANT_ROWS):
+            r1 = min(rows.shape[0], r0 + _DEQUANT_ROWS)
+            out[r0:r1].copy_(ggml.dequantize(rows[r0:r1].to(device), info.ggml_type, k))
+    else:
+        from freetoken.models.gguf.dequant import dequantize
+
+        out = dequantize(rows.reshape(-1), info.ggml_type, torch.bfloat16).view(rows.shape[0], k)
+    return out.view(*reversed([int(n) for n in info.ne]))
+
+
+def iter_gguf_mtp_weights(
+    mtp_path: str,
+    device: torch.device,
+    *,
+    num_layers: int,
+    hidden: int,
+    hc_count: int,
+    experts: bool,
+    embedding_from: str | None = None,
+) -> Iterator[tuple[str, torch.Tensor]]:
+    """Qwen3.8-Flash-Next's MTP draft head from a separate GGUF (Unsloth ships it as ``MTP/mtp-*.gguf``),
+    named and fused as :func:`freetoken.models.qwen4_exp.weight.iter_weights` names the checkpoint's
+    ``mtp.*``, every projection dequantized to bf16 -- the head is built unquantized either way.
+
+    The file stores the head as block ``num_layers`` (the decoder's 48 blocks come first): its decoder layer
+    under the decoder's own tensor names, and llama.cpp's NextN tensors: ``eh_proj`` is ``fc_embedding |
+    fc_hidden`` side by side over the input (the embedding half first), ``enorm`` / ``hnorm`` the two
+    pre-fc norms and ``hc_head_*`` the head's stream mixer. Zero-centred norms carry the converter's +1.
+    A ``shared-`` file borrows the token embedding and the lm_head from the model, as this head always does.
+
+    ``experts``: also yield the routed experts as the checkpoint's stacked bf16 ``gate_up_proj [E, 2I, H]`` /
+    ``down_proj [E, H, I]`` (the engine quantizes them into the target's bank format). A GGUF target takes
+    the file's ggml rows as they are instead (``freetoken.models.gguf.experts``).
+    ``embedding_from``: a GGUF whose ``token_embd`` fills ``mtp.embed_tokens`` (a pipeline rank without the
+    embedding gives the head its own copy) -- the MTP file's own copy when it has one."""
+    index = gguf_tensor_index(mtp_path)
+    block = mtp_gguf_block(mtp_path)
+    if block != num_layers:
+        raise ValueError(f"--spec-mtp-gguf: {mtp_path} stores its head as block {block}, this model has {num_layers} decoder layers")
+    blk, pre = f"blk.{block}", "mtp.layers.0"
+
+    def t(name: str) -> GgufTensorInfo:
+        key = name if name in index else f"{name}.weight"
+        if key not in index:
+            raise ValueError(f"--spec-mtp-gguf: {mtp_path} has no {key}")
+        return index[key]
+
+    def bf(name: str) -> torch.Tensor:
+        return _bf16(t(name), device)
+
+    def norm(name: str) -> torch.Tensor:
+        return float_tensor(t(name)).float() - 1.0
+
+    eh = bf(f"{blk}.nextn.eh_proj")
+    if tuple(eh.shape) != (hidden, 2 * hidden):
+        raise ValueError(f"--spec-mtp-gguf: {mtp_path}'s eh_proj is {tuple(eh.shape)}, this model needs {(hidden, 2 * hidden)}")
+    yield "mtp.fc_embedding.weight", eh[:, :hidden].contiguous()
+    yield "mtp.fc_hidden.weight", eh[:, hidden:].contiguous()
+    del eh
+    yield "mtp.pre_fc_norm_embedding.weight", norm(f"{blk}.nextn.enorm")
+    yield "mtp.pre_fc_norm_hidden.weight", norm(f"{blk}.nextn.hnorm")
+    yield "mtp.hyper_connection_mixer.input_mix_weight_down.weight", bf(f"{blk}.nextn.hc_head_down")
+    yield "mtp.hyper_connection_mixer.input_mix_weight_up.weight", bf(f"{blk}.nextn.hc_head_up")
+    yield "mtp.hyper_connection_mixer.hc_norm.weight", norm(f"{blk}.nextn.hc_head_norm")
+
+    sa = f"{pre}.self_attn"
+    yield f"{sa}.qkv_proj.weight", torch.cat([bf(f"{blk}.attn_{p}") for p in ("q", "k", "v")])
+    yield f"{sa}.o_proj.weight", bf(f"{blk}.attn_output")
+    yield f"{sa}.q_norm.weight", norm(f"{blk}.attn_q_norm")
+    yield f"{sa}.k_norm.weight", norm(f"{blk}.attn_k_norm")
+    yield f"{sa}.indexer.index_qk_proj.weight", torch.cat([bf(f"{blk}.indexer.q_proj"), bf(f"{blk}.indexer.k_proj")])
+    yield f"{sa}.indexer.q_layernorm.weight", norm(f"{blk}.indexer.q_norm")
+    yield f"{sa}.indexer.k_layernorm.weight", norm(f"{blk}.indexer.k_norm")
+
+    mlp = f"{pre}.mlp"
+    yield f"{mlp}.gate.weight", float_tensor(t(f"{blk}.ffn_gate_inp"))
+    yield f"{mlp}.shared_expert.gate_up_proj.weight", torch.cat([bf(f"{blk}.ffn_gate_shexp"), bf(f"{blk}.ffn_up_shexp")])
+    yield f"{mlp}.shared_expert.down_proj.weight", bf(f"{blk}.ffn_down_shexp")
+    yield f"{mlp}.shared_expert_gate.weight", float_tensor(t(f"{blk}.ffn_gate_inp_shexp")).reshape(1, -1)
+    for hc, src in (("attn_hyper_connection", "hc_attn"), ("mlp_hyper_connection", "hc_ffn")):
+        rows = torch.cat([bf(f"{blk}.{src}_down"), bf(f"{blk}.{src}_inject")])
+        pad = -rows.shape[0] % 16  # the reader's zero-padded down|inject GEMM (weight.py _PAD_TO)
+        if pad:
+            rows = torch.cat([rows, rows.new_zeros(pad, rows.shape[1])])
+        if rows.shape[1] != hidden * hc_count:
+            raise ValueError(f"--spec-mtp-gguf: {mtp_path}'s {src}_down reads {rows.shape[1]} values, this model's streams are {hidden * hc_count}")
+        yield f"{pre}.{hc}.input_mix_weight_down_block_inject.weight", rows
+        yield f"{pre}.{hc}.input_mix_weight_up.weight", bf(f"{blk}.{src}_up")
+        yield f"{pre}.{hc}.hc_norm.weight", norm(f"{blk}.{src}_norm")
+
+    if experts:
+        yield f"{mlp}.experts.gate_up_proj", torch.cat([bf(f"{blk}.ffn_gate_exps"), bf(f"{blk}.ffn_up_exps")], dim=1)
+        yield f"{mlp}.experts.down_proj", bf(f"{blk}.ffn_down_exps")
+    if embedding_from is not None:
+        source = index if "token_embd.weight" in index else gguf_tensor_index(embedding_from)
+        yield "mtp.embed_tokens.weight", _bf16(source["token_embd.weight"], device)
+
+
+__all__ = [
+    "gguf_mm_config", "iter_gguf_mtp_weights", "iter_gguf_weights", "mtp_gguf_block", "parse_gguf_config", "ple_table_info", "to_gguf",
+]

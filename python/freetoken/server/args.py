@@ -388,7 +388,21 @@ def parse_args(
             "step (0 = off). Single-request decode (use --max-running-req 1); the draft head "
             "runs on the head-owning rank and adds one full-attention layer and one expert-bank "
             "layer (its bf16 experts are quantized to NVFP4 at load). Qwen3.5-MoE family and "
-            "Qwen3.8-Flash-Next NVFP4 checkpoints."
+            "Qwen3.8-Flash-Next NVFP4 checkpoints, and Qwen3.8-Flash-Next GGUFs with --spec-mtp-gguf."
+        ),
+    )
+
+    parser.add_argument(
+        "--spec-mtp-gguf",
+        type=str,
+        default=None,
+        metavar="FILE",
+        help=(
+            "With --spec-mtp: read the draft head from this separate MTP GGUF instead of the checkpoint. "
+            "The Qwen3.8-Flash-Next GGUFs carry no MTP layer and ship the head on its own "
+            "(unsloth/Qwen3.8-Flash-Next-GGUF: MTP/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf, the recommended one). "
+            "With a GGUF model the head's experts keep the file's ggml types; with any other model they "
+            "are quantized to the model's bank format, as a checkpoint's head is. Qwen3.8-Flash-Next only."
         ),
     )
 
@@ -1446,15 +1460,32 @@ def parse_args(
         os.environ[MMPROJ_ENV] = os.path.abspath(os.path.expanduser(mmproj))
 
     # FreeToken-Kai#6: no GGUF reader yields an MTP head (the Flash-Next GGUFs ship it as a separate
-    # file), so the load used to die on an unexpected include_mtp keyword after the config was read
+    # file, read with --spec-mtp-gguf), so the load used to die on an unexpected include_mtp keyword
+    # after the config was read
+    if kwargs.get("spec_mtp_gguf"):
+        kwargs["spec_mtp_gguf"] = os.path.abspath(os.path.expanduser(kwargs["spec_mtp_gguf"]))
+        if kwargs.get("spec_mtp", 0) <= 0:
+            parser.error("--spec-mtp-gguf names the draft head of --spec-mtp; add --spec-mtp K (e.g. 3)")
+        from freetoken.models.qwen4_exp.gguf import mtp_gguf_block
+
+        try:
+            mtp_gguf_block(kwargs["spec_mtp_gguf"])
+        except ValueError as exc:
+            parser.error(str(exc))
     if kwargs.get("spec_mtp", 0) > 0:
-        from freetoken.models.gguf.reader import is_gguf_path
+        from freetoken.models.gguf.reader import is_gguf_path, load_gguf_metadata
 
         if is_gguf_path(kwargs["model_path"]):
-            parser.error(
-                "--spec-mtp needs the draft head in the checkpoint, and GGUF checkpoints are read without "
-                "one (a separate MTP .gguf cannot be loaded yet); serve the safetensors/FTW model, or drop --spec-mtp"
-            )
+            if not kwargs.get("spec_mtp_gguf"):
+                parser.error(
+                    "--spec-mtp needs a draft head, and GGUF checkpoints are read without one; for "
+                    "Qwen3.8-Flash-Next pass the separate MTP GGUF with --spec-mtp-gguf "
+                    "(unsloth/Qwen3.8-Flash-Next-GGUF: MTP/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf), "
+                    "or serve the safetensors/FTW model, or drop --spec-mtp"
+                )
+            arch = load_gguf_metadata(kwargs["model_path"]).get("general.architecture")
+            if arch != "qwen4exp":
+                parser.error(f"--spec-mtp-gguf reads Qwen3.8-Flash-Next's head; {kwargs['model_path']} is a {arch!r} GGUF")
 
     # a bad media root is a deployment mistake; fail at startup, not per request
     if kwargs["allowed_local_media_path"]:

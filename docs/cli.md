@@ -55,7 +55,8 @@ parsers all resolve automatically from the checkpoint and the GPU.
 | `--decode-log-interval` | 40 | Scheduler status line every N decode steps |
 | `--pp-size` | 1 | Layer-split (pipeline) parallelism across N GPUs, one process per card, the residual stream handed over gloo -- no NCCL and no peer access. List the cards in rank order with `--gpu`. Mutually exclusive with `--tp-size` > 1. See [pipeline.md](pipeline.md) |
 | `--pp-layers` | even split | Layer boundaries of the `--pp-size` split, N-1 comma-separated values: `24` gives rank 0 layers [0,24) and rank 1 [24,48). For cards of different sizes |
-| `--spec-mtp` | 0 | Verify K drafts per step from the checkpoint's own MTP head. Single-request decode (`--max-running-req 1`); Qwen3.5-MoE family and Qwen3.8-Flash-Next NVFP4 checkpoints. See [pipeline.md](pipeline.md) |
+| `--spec-mtp` | 0 | Verify K drafts per step from the checkpoint's own MTP head. Single-request decode (`--max-running-req 1`); Qwen3.5-MoE family and Qwen3.8-Flash-Next NVFP4 checkpoints, and Qwen3.8-Flash-Next GGUFs with `--spec-mtp-gguf`. See [pipeline.md](pipeline.md) |
+| `--spec-mtp-gguf` | none | With `--spec-mtp`: read the draft head from a separate MTP GGUF instead of the checkpoint. The Qwen3.8-Flash-Next GGUFs carry no MTP layer; Unsloth ships the head on its own (`unsloth/Qwen3.8-Flash-Next-GGUF`, `MTP/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf`). Qwen3.8-Flash-Next only. See [kai.md](kai.md#the-head-from-a-separate-mtp-gguf---spec-mtp-gguf) |
 | `--speculative-algorithm`, `--spec-algo` | off | Upstream's speculative-decoding framework; no draft method is registered upstream yet. Refused together with `--spec-mtp` or `--pp-size`. See [kai.md](kai.md) |
 
 ### Choosing a GPU

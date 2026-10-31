@@ -372,6 +372,8 @@ class ModelConfig:
     # it joins the full-attention group for KV / index-slab allocation and the model builds
     # the head. None = no draft head.
     mtp_layer_id: int | None = None
+    # --spec-mtp-gguf (Kai): the separate MTP GGUF the draft head is read from; None = the checkpoint's
+    mtp_gguf: str | None = None
     # --host-embedding: the input embedding table stays in pinned host memory (rows gathered by
     # the GPU in place over PCIe); models that support it build ``HostEmbedding``.
     embed_host: bool = False
