@@ -117,6 +117,34 @@ def test_the_report_over_a_fake_host(tree, tmp_path):  # noqa: F811
     assert "Prediction per RAM cap" in out
 
 
+def test_a_gguf_file_gives_the_shape_from_its_tensor_table(tree, tmp_path, monkeypatch):  # noqa: F811
+    # FreeToken-Kai#4: --model took only a directory, and a GGUF checkpoint is one file whose layers
+    # keep their own ggml types; the expert size is their mean, which --moe-bank-ram solves against
+    from freetoken.layers.quantization.ggml_types import row_bytes
+
+    from ._gguf_writer import UD_IQ4_XS_TYPES, write_experts_gguf
+
+    sys, proc = tree
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+    path = str(tmp_path / "Flash-UD-IQ4_XS-00001-of-00001.gguf")
+    write_experts_gguf(path, first_block=1, metadata={"general.architecture": "qwen4exp", "qwen4exp.expert_used_count": 2})
+    cells = [2 * 256 * row_bytes(int(g), 256) + 256 * row_bytes(int(d), 256) for g, d in UD_IQ4_XS_TYPES]
+
+    shape = dd.Shape()
+    dd.shape_from_model(path, shape)
+    assert shape.name == "Flash-UD-IQ4_XS-00001-of-00001"
+    assert (shape.moe_layers, shape.num_experts, shape.top_k) == (4, 4, 2)
+    assert shape.cell_bytes == -(-sum(cells) // len(cells))
+    assert shape.widest_row_bytes == max(2 * 256 * row_bytes(int(g), 256) for g, _ in UD_IQ4_XS_TYPES)
+    assert dd._largest_file(path) == path
+
+    ns = dd.build_parser("ft doctor disk").parse_args(["--model", path, "--bench-seconds", "0"])
+    out = dd.run(ns, proc, sys)
+    assert "Flash-UD-IQ4_XS-00001-of-00001: 4 MoE layers x 4 experts, top-2" in out
+    assert "from: GGUF tensor table (3 type mixes)" in out
+    assert "is not a local directory" not in out
+
+
 def test_the_report_without_anything_to_go_on(tree, tmp_path, monkeypatch):  # noqa: F811
     sys, proc = tree
     monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "empty"))

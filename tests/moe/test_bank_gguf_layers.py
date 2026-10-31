@@ -10,21 +10,19 @@ its own shape -- the second start without reading the GGUF at all. No GPU needed
 from __future__ import annotations
 
 import os
-import struct
 from types import SimpleNamespace
 
-import numpy as np
 import pytest
 
 torch = pytest.importorskip("torch")
 
 from freetoken.layers.quantization.ggml_types import row_bytes  # noqa: E402
 from freetoken.moe.bank_file import BankFile, MappedBankLayout, layout_from_layer_specs  # noqa: E402
-from freetoken.third_party.gguf import GGMLQuantizationType as QType  # noqa: E402
+
+from ._gguf_writer import UD_IQ4_XS_TYPES as TYPES  # noqa: E402
+from ._gguf_writer import write_experts_gguf  # noqa: E402
 
 E, H, I = 4, 256, 256
-# layers 0 and 3 share the most common geometry (the file's), layers 1 and 2 are per-layer overrides
-TYPES = [(QType.IQ3_S, QType.IQ4_NL), (QType.IQ4_XS, QType.IQ4_XS), (QType.IQ4_XS, QType.IQ4_NL), (QType.IQ3_S, QType.IQ4_NL)]
 L = len(TYPES)
 
 
@@ -33,39 +31,8 @@ def _no_register(monkeypatch):
     monkeypatch.setenv("FREETOKEN_BANK_REGISTER", "none")
 
 
-def _gguf_string(text: str) -> bytes:
-    raw = text.encode("utf-8")
-    return struct.pack("<Q", len(raw)) + raw
-
-
-def _write_gguf(path: str, metadata: dict[str, str], tensors: list[tuple[str, tuple[int, ...], int, bytes]], align: int = 32) -> None:
-    """A GGUF v3 file with string metadata and ``tensors`` as (name, ggml ne, ggml type, packed bytes)."""
-    head = b"GGUF" + struct.pack("<IQQ", 3, len(tensors), len(metadata))
-    for key, value in metadata.items():
-        head += _gguf_string(key) + struct.pack("<I", 8) + _gguf_string(value)
-    offset, blobs = 0, []
-    for name, ne, ggml_type, data in tensors:
-        head += _gguf_string(name) + struct.pack("<I", len(ne)) + b"".join(struct.pack("<Q", n) for n in ne)
-        head += struct.pack("<IQ", ggml_type, offset)
-        pad = (-len(data)) % align
-        blobs.append(data + b"\0" * pad)
-        offset += len(data) + pad
-    head += b"\0" * ((-len(head)) % align)
-    with open(path, "wb") as f:
-        f.write(head)
-        for blob in blobs:
-            f.write(blob)
-
-
 def _write_experts_gguf(path: str, seed: int = 0) -> None:
-    """A GGUF with nothing but routed experts, ``TYPES`` per layer (random bytes: only the layout matters here)."""
-    rng = np.random.default_rng(seed)
-    tensors = []
-    for layer, (gate_up, down) in enumerate(TYPES):
-        for name, qtype, k, rows in (("ffn_gate_exps", gate_up, H, I), ("ffn_up_exps", gate_up, H, I), ("ffn_down_exps", down, I, H)):
-            data = rng.integers(0, 256, E * rows * row_bytes(int(qtype), k), dtype=np.uint8)
-            tensors.append((f"blk.{layer}.{name}.weight", (k, rows, E), int(qtype), data.tobytes()))
-    _write_gguf(path, {"general.architecture": "qwen4exp"}, tensors)
+    write_experts_gguf(path, TYPES, experts=E, hidden=H, inter=I, seed=seed)
 
 
 def _expected(path: str, layer: int) -> dict:

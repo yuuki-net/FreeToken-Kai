@@ -128,9 +128,52 @@ def shape_from_bank(path: str, shape: Shape) -> BankState | None:
     return state
 
 
+def shape_from_gguf(model_path: str, shape: Shape) -> None:
+    """Kai (FreeToken-Kai#4): a GGUF file's expert geometry from its tensor table. Each layer keeps
+    its own ggml types (unsloth's UD-IQ4_XS: IQ3_S / IQ4_NL, IQ4_XS in a few layers), so the expert
+    size is the mean over the MoE layers -- what --moe-bank-ram solves the resident count against."""
+    from freetoken.models.gguf.experts import gguf_bank_geometry
+    from freetoken.models.gguf.reader import gguf_tensor_index
+    from freetoken.moe.bank_disk import cell_bytes_of_specs
+
+    shape.name = os.path.basename(model_path).removesuffix(".gguf")
+    try:
+        index = gguf_tensor_index(model_path)
+        blocks = sorted(int(n.split(".")[1]) for n in index if n.startswith("blk.") and n.endswith(".ffn_down_exps.weight"))
+        if not blocks:
+            shape.sources.append(f"{model_path}: no routed-expert tensors")
+            return
+        geometry = gguf_bank_geometry(model_path, len(blocks), first_layer=blocks[0])
+    except Exception as exc:  # noqa: BLE001 -- an unreadable file is a finding, not a crash
+        shape.sources.append(f"{model_path}: the GGUF tensor table did not read ({type(exc).__name__}: {str(exc)[:120]})")
+        return
+    cells = [cell_bytes_of_specs(spec) for spec in geometry.specs]
+    shape.moe_layers = shape.moe_layers or len(blocks)
+    shape.num_experts = shape.num_experts or int(index[f"blk.{blocks[0]}.ffn_down_exps.weight"].ne[2])
+    shape.cell_bytes = shape.cell_bytes or -(-sum(cells) // len(cells))
+    shape.widest_row_bytes = shape.widest_row_bytes or max(
+        cell_bytes_of_specs({role: s}) for spec in geometry.specs for role, s in spec.items()
+    )
+    shape.sources.append("GGUF tensor table" + (f" ({len({tuple(t[1:]) for t in geometry.tags})} type mixes)" if geometry.tags else ""))
+    try:
+        from freetoken.models.gguf.reader import load_gguf_metadata
+
+        md = load_gguf_metadata(model_path)
+        arch = md.get("general.architecture")
+        top_k = md.get(f"{arch}.expert_used_count") if arch else None
+        shape.top_k = int(top_k) if top_k else None
+    except Exception:  # noqa: BLE001 -- the top-k only sharpens the prediction
+        pass
+
+
 def shape_from_model(model_path: str, shape: Shape) -> None:
     """Fill what the bank headers did not from the checkpoint: the parsed model config where it
     parses, the raw config.json where it does not."""
+    from freetoken.models.gguf.reader import is_gguf_path
+
+    if is_gguf_path(model_path):
+        shape_from_gguf(model_path, shape)
+        return
     shape.name = os.path.basename(os.path.normpath(model_path))
     try:
         from dataclasses import replace
@@ -442,11 +485,11 @@ def run(ns, proc: str = "/proc", sys: str = "/sys", *, gpu_query=None, gpu_rate=
     bank_dir = os.path.dirname(bank_path) if bank_path else None
     shape = Shape(name=os.path.basename(bank_dir) if bank_dir and not ns.moe_bank_dir else None)
     bank = shape_from_bank(bank_path, shape) if bank_path else None
-    if ns.model and os.path.isdir(ns.model):
+    if ns.model and (os.path.isdir(ns.model) or ns.model.endswith(".gguf") and os.path.isfile(ns.model)):
         shape_from_model(ns.model, shape)
     elif ns.model:
         # a hub id would be downloaded by the config loader; this command reads local disks only
-        shape.sources.append(f"--model {ns.model} is not a local directory")
+        shape.sources.append(f"--model {ns.model} is not a local directory or .gguf file")
     # one file holds every layer, whichever ranks serve them: nothing on disk says how many
     ranks = ns.pp_size or 1
     rep.section("Model")
@@ -742,6 +785,8 @@ def _prefill_prediction(rep: Report, rows: list[Row], ranks: int, shape: Shape,
 
 
 def _largest_file(model_path: str | None) -> str | None:
+    if model_path and os.path.isfile(model_path):
+        return model_path  # a GGUF file is its own checkpoint
     if not model_path or not os.path.isdir(model_path):
         return None
     best = None
@@ -764,7 +809,7 @@ def _cap_list(text: str) -> list[int]:
 def build_parser(prog: str) -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog=prog, description=__doc__.split("\n\n")[0],
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--model", help="checkpoint directory (model shape, and the default bank directory)")
+    p.add_argument("--model", help="checkpoint directory or .gguf file, as for ft serve (model shape, and the default bank directory)")
     p.add_argument("--moe-bank-dir", help="bank directory, as for ft serve (default ~/.cache/freetoken/bankmap/<model>)")
     p.add_argument("--pp-size", type=int, default=None, help="ranks sharing the host (default 1)")
     p.add_argument("--moe-bank-stats", nargs="+", default=None,
