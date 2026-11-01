@@ -112,6 +112,17 @@ def build_tier(config, method, *, pp=None, log=print, warn=None, register_budget
         )
         return None
     hot = min(hot, num_experts)
+    if hot < num_experts and getattr(config, "moe_strategy", None) == "offload":
+        # Kai: only rows [0, hot) get a device address (mapped_bank registers the resident prefix);
+        # hybrid sends a miss past them to the CPU (layers/moe.py hybrid_routes), but plain offload
+        # fetches it over PCIe all the same -- "!!!" answers on the 3060s, an illegal memory access
+        # on an RTX 2060. Said before an expert is read.
+        raise ValueError(
+            f"--moe-bank-ram {config.moe_bank_ram} keeps {hot}/{num_experts} experts per layer in RAM, and "
+            f"--moe-strategy offload cannot decode the others (the GPU can only read the resident rows). "
+            f"Serve it with --moe-strategy hybrid, or raise the cap above {bank_gib * ranks:.1f}G so every "
+            f"expert stays resident"
+        )
     if hot == 0:
         raise ValueError(
             f"--moe-bank-ram leaves room for no resident experts "

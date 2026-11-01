@@ -275,6 +275,20 @@ def test_build_tier_steps_aside_when_everything_fits(tmp_path):
     assert build_tier(_config(tmp_path, moe_bank_ram="1G"), _Method(), log=lambda _m: None) is None
 
 
+def test_plain_offload_is_refused_when_some_experts_stay_on_disk(tmp_path):
+    """Only the resident rows get a device address; plain offload would fetch the others over PCIe
+    anyway (the 3060s answered "!!!", an RTX 2060 died with an illegal memory access)."""
+    from freetoken.moe.bank_tier import build_tier
+
+    # 14 B per expert x 6 x 4 layers = 336 B; 120 B keeps 2 per layer resident
+    with pytest.raises(ValueError, match=r"keeps 2/6 experts .* --moe-strategy hybrid, or raise the cap above"):
+        build_tier(_config(tmp_path, moe_strategy="offload"), _Method(), log=lambda _m: None)
+    for strategy in ("hybrid", "cpu"):
+        assert build_tier(_config(tmp_path, moe_strategy=strategy), _Method(), log=lambda _m: None).hot_per_layer == 2
+    # a cap that holds every expert splits nothing, so offload serves it as before
+    assert build_tier(_config(tmp_path, moe_bank_ram="1G", moe_strategy="offload"), _Method(), log=lambda _m: None) is None
+
+
 def test_a_packed_checkpoint_needs_the_flag_and_keeps_every_row_when_it_fits(tmp_path):
     from freetoken.moe.bank_pack import PACK_MANIFEST
     from freetoken.moe.bank_tier import build_tier

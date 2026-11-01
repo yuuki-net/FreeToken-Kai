@@ -101,6 +101,11 @@ illegal access inside the decode graph. Both paths avoid it without touching the
   then bounces the remainder through the pinned staging buffer once the layer's GEMMs are
   enqueued. A plain `cudaMemcpy` reads unregistered host memory; only async DMA cannot.
 
+The decode half is the hybrid path's: plain `--moe-strategy offload` fetches every miss, so it
+cannot serve a cap that leaves experts out of RAM. Without `--moe-strategy`, `--moe-bank-ram`
+picks hybrid (when the CPU executor can compute the model's experts); an explicit offload with
+such a cap stops before any expert is read and says which cap would keep every expert resident.
+
 ### Some hosts will not register a read-only file mapping
 
 Registering one needs `cudaHostRegisterReadOnly`, which needs
@@ -615,6 +620,13 @@ placement's layers and did not. Nothing ties the two together but a comment, and
 invisible until an index runs off the end -- on one rank, in a traceback that names neither flag,
 while the other rank logs that everything mapped and registered. Anything added to the cache's
 banks after `MappedTier` has solved its placement has to grow the permutation list with it.
+
+**The guard against unregistered rows lived in one strategy.** Every run here used
+`--moe-strategy hybrid`, whose decode keeps misses past the resident prefix off the PCIe path. The
+default, `offload`, has no such step: it fetched them anyway. On two RTX 3060s every answer of a
+GGUF checkpoint came out as `!!!` (the bank file wrote and read back identically, so nothing else
+looked wrong); on an RTX 2060 the same configuration of Ornith died in the decode graph capture
+with an illegal memory access. The default now follows the flag.
 
 The estimate that drove the design ("77% resident covers 87.5% of routes, which is fast enough")
 held up. The intermediate numbers along the way — +4 ms here, 31 ms there, "3-4x from madvise" —

@@ -1114,7 +1114,8 @@ def parse_args(
             "a cold bank file on disk, chosen by measured routing frequency. Needs an NVMe: "
             "the cold half is read per token. 'auto' takes MemAvailable at startup less "
             "4.5 GiB per rank for the rest of the server and a page cache margin, and logs "
-            "the arithmetic. 'ft doctor disk' says whether this host suits it."
+            "the arithmetic. 'ft doctor disk' says whether this host suits it. The experts "
+            "past the cap decode on the CPU, so without --moe-strategy it picks hybrid."
         ),
     )
     parser.add_argument(

@@ -505,6 +505,24 @@ def test_adjust_config_defaults_moe_cache_auto_for_auto_resolved_offload_backend
     assert config.moe_cache_size == 0  # still unresolved -- the scheduler sizes it from VRAM
 
 
+@pytest.mark.parametrize("viable", [True, False])
+def test_auto_with_moe_bank_ram_is_hybrid_when_the_cpu_can_decode(monkeypatch, viable):
+    """--moe-bank-ram leaves experts the GPU cannot read, which only hybrid (or cpu) decodes; a model
+    the CPU executor cannot serve stays on offload, where build_tier refuses a split by name."""
+    import freetoken.engine.engine as engine_module
+    from freetoken.engine.engine import _adjust_config
+
+    monkeypatch.setattr(engine_module, "_is_unified_memory_gpu", lambda index=None: False)
+    monkeypatch.setattr(engine_module, "_cpu_moe_executor_viable", lambda model_config: viable)
+    config = _offload_engine_config(moe_bank_ram="32G")
+    _adjust_config(config)
+    assert config.moe_strategy == ("hybrid" if viable else "offload")
+    # without the flag auto keeps offload
+    config = _offload_engine_config()
+    _adjust_config(config)
+    assert config.moe_strategy == "offload"
+
+
 def test_page_table_width_covers_whole_trailing_pages():
     # _write_page_table writes WHOLE trailing pages, so the width must reach the last
     # page's end, not just the next multiple of 32 (DSV4's P=128 exposed the gap).

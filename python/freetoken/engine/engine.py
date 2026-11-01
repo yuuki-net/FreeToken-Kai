@@ -4239,6 +4239,17 @@ def _adjust_config(config: EngineConfig):
                     "(use --moe-strategy offload to keep the offload flags)"
                 )
                 override("moe_cpu_layers", None)
+        elif config.moe_bank_ram and _cpu_moe_executor_viable(model_config):
+            # Kai: --moe-bank-ram registers only the resident rows of the bank file for PCIe, and the
+            # rest decode on the CPU executor -- which plain offload never builds: its decode fetches
+            # every miss, rows the GPU has no address for included. On two RTX 3060s every answer
+            # was "!!!" (Flash-Next UD-IQ4_XS GGUF, FreeToken-Kai#5); an RTX 2060 died in the decode
+            # graph capture with an illegal memory access (Ornith NVFP4, 2026-11-01).
+            default_backend = "hybrid"
+            logger.info_rank0(
+                "--moe-bank-ram: the experts outside the RAM cap decode on the CPU, so the MoE "
+                "strategy is hybrid"
+            )
         override("moe_strategy", default_backend)
         logger.info_rank0(f"Auto-selected MoE strategy: {config.moe_strategy}")
 
