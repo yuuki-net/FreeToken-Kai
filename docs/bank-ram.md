@@ -387,7 +387,12 @@ How much swap costs depends on which pages went out; paging them back removed it
 things are left: the other processes of the server (the frontend and the tokenizer, about 1 GiB
 between them) keep their swap, which a long prompt then waits on; and on the 3060s a short prompt
 after 90 s idle is 1.4 s slower than one sent right away with nothing disturbed at all -- neither
-disk nor swap, not explained yet.
+disk nor swap. Measured again on 2026-11-01 (the usual Q2_0 setup, 5 s idle against the same prompt
+sent right away): +0.41-0.55 s for a prompt of about 25 tokens and +0.44-1.1 s for one of about
+270, the same with or without a bank. It already appears after 3 s of idle, which is how long the
+GPU takes to drop to its lowest power state (P8, 210 MHz); the first request then waits for the
+clocks to come back up. That is the card's power management, not something the server reads or
+can skip.
 
 It is off by default because it reads the disk while nothing is running: 7.7 GiB per rank took
 1-12 s per pass on the Gen4 NVMe above. 5 s is the only delay that was measured. How fast
