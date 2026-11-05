@@ -59,7 +59,12 @@ class GptOssModel(BaseOP):
         win = layer_window(config)
         self._window = win
         self.embed_tokens = (
-            VocabParallelEmbedding(num_embeddings=config.vocab_size, embedding_dim=config.hidden_size)
+            VocabParallelEmbedding(
+                num_embeddings=config.vocab_size,
+                embedding_dim=config.hidden_size,
+                quant_config=config.quant,
+                prefix=f"{prefix}.embed_tokens",
+            )
             if win.first
             else None
         )

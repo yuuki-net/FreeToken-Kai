@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, List, Tuple
 
 import torch
-from freetoken.core import Batch, Req
+from freetoken.core import Batch, Req, ReqStats
 from freetoken.env import ENV
 from freetoken.utils import align_down, div_ceil, init_logger
 
@@ -238,6 +238,9 @@ class PrefillAdder:
         req.mm_items = pending_req.mm_items
         req.mrope_positions_full = pending_req.mrope_positions_full
         req.mrope_delta = pending_req.mrope_delta
+        # one ReqStats across all chunk Reqs of the request: the stamps the scheduler
+        # takes on the final chunk's Req must survive the intermediate ones
+        req.stats = pending_req.stats
         # Hybrid GDN per-request state slots (None for non-hybrid). On a fresh admit these are
         # freshly allocated; on a chunked continuation they are inherited from the prior chunk.
         req.linear_slot_idx = linear_slot_idx
@@ -430,6 +433,7 @@ class PrefillManager:
     prefix_disk: object | None = None
 
     def add_one_req(self, req: UserMsg) -> None:
+        stats = ReqStats(enqueued_at=time.perf_counter())
         self.pending_list.append(
             PendingReq(
                 req.uid,
@@ -438,6 +442,7 @@ class PrefillManager:
                 mm_items=req.mm_items,
                 mrope_positions_full=req.mrope_positions,
                 mrope_delta=req.mrope_delta,
+                stats=stats,
             )
         )
 
@@ -495,6 +500,11 @@ class PrefillManager:
                     prompt_admissions.append(
                         (req.uid, pending_req.input_len, req.cache_handle.cached_len)
                     )
+                    # The first prefill chunk is launching: queue time ends here and the
+                    # prompt span starts (ReqStats carries both to the final chunk's Req).
+                    pending_req.stats.first_chunk_at = time.perf_counter()
+                    pending_req.stats.cache_n = req.cache_handle.cached_len
+                    pending_req.stats.prompt_n = pending_req.input_len - req.cache_handle.cached_len
                     if pending_req.mm_items and self.encoder_cache is not None:
                         # claim the rows every chunk of this request will gather; the entry outlives the chunks
                         for item in pending_req.mm_items:

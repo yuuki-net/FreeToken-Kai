@@ -143,11 +143,11 @@ def test_nvfp4_quantizer_roundtrip_and_layout():
 
 
 def test_stack_mtp_experts_layout():
-    from freetoken.models.qwen3_5_moe.weight import _MTP_EXPERT_RE, _stack_mtp_experts
+    from freetoken.models.qwen3_5_moe.weight import _SPEC_MTP_EXPERT_RE, _stack_mtp_experts
 
-    m = _MTP_EXPERT_RE.match("mtp.layers.0.mlp.experts.17.up_proj.weight")
+    m = _SPEC_MTP_EXPERT_RE.match("mtp.layers.0.mlp.experts.17.up_proj.weight")
     assert m is not None and (m.group("expert"), m.group("proj")) == ("17", "up_proj")
-    assert _MTP_EXPERT_RE.match("model.language_model.layers.3.mlp.experts.17.up_proj.weight") is None
+    assert _SPEC_MTP_EXPERT_RE.match("model.language_model.layers.3.mlp.experts.17.up_proj.weight") is None
     inter, hidden = 4, 6
     parts = {
         e: {

@@ -648,7 +648,10 @@ def test_kernel_selection_is_reported_once_per_outcome(caplog):
     class _Other(_Picked):
         name = "other"
 
-    method_mod._reported.clear()
+    from freetoken.utils import logger as logger_mod
+
+    # the selector reports through upstream's info_once (#858), keyed by (message, args)
+    logger_mod._LOGGED_ONCE.clear()
     with caplog.at_level(logging.INFO, logger=method_mod.logger.name):
         for _ in range(5):
             method_mod.select_kernel((_Unusable, _Picked), "auto", None)

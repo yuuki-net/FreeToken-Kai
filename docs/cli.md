@@ -57,7 +57,7 @@ parsers all resolve automatically from the checkpoint and the GPU.
 | `--pp-layers` | even split | Layer boundaries of the `--pp-size` split, N-1 comma-separated values: `24` gives rank 0 layers [0,24) and rank 1 [24,48). For cards of different sizes |
 | `--spec-mtp` | 0 | Verify K drafts per step from the checkpoint's own MTP head. Single-request decode (`--max-running-req 1`); Qwen3.5-MoE family and Qwen3.8-Flash-Next NVFP4 checkpoints, and Qwen3.8-Flash-Next GGUFs with `--spec-mtp-gguf`. See [pipeline.md](pipeline.md) |
 | `--spec-mtp-gguf` | none | With `--spec-mtp`: read the draft head from a separate MTP GGUF instead of the checkpoint. The Qwen3.8-Flash-Next GGUFs carry no MTP layer; Unsloth ships the head on its own (`unsloth/Qwen3.8-Flash-Next-GGUF`, `MTP/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf`). Qwen3.8-Flash-Next only. See [kai.md](kai.md#the-head-from-a-separate-mtp-gguf---spec-mtp-gguf) |
-| `--speculative-algorithm`, `--spec-algo` | off | Upstream's speculative-decoding framework; no draft method is registered upstream yet. Refused together with `--spec-mtp` or `--pp-size`. See [kai.md](kai.md) |
+| `--speculative-algorithm`, `--spec-algo` | off | Upstream's speculative decoder (`mtp`, see [Speculative decoding](#speculative-decoding)), a separate code path from `--spec-mtp`. Refused together with `--spec-mtp` or `--pp-size`. See [kai.md](kai.md#speculative-decoding-with-the-checkpoints-mtp-head---spec-mtp-k) |
 
 ### Choosing a GPU
 
@@ -88,7 +88,7 @@ ft serve --model ... --gpu GPU-9e8d7c6b  # the same card by UUID (a unique prefi
 
 ### MoE offload
 
-See [models.md](models.md#moe-strategies) for what each strategy does, and [performance/prefill.md](performance/prefill.md) for prefill speed.
+See [models.md](models.md#moe-strategies) for what each strategy does, [performance/prefill.md](performance/prefill.md) for prefill speed, and [performance/decode.md](performance/decode.md) for decode speed.
 
 | Flag | Default | Meaning |
 |---|---|---|
@@ -108,7 +108,7 @@ See [models.md](models.md#moe-strategies) for what each strategy does, and [perf
 | `--pp-prefill-group` | 1 | Qwen3.8-Flash-Next with `--pp-size 2`, offloaded experts and `--max-running-req 1`: the second rank holds up to this many consecutive prefill chunks of a prompt and runs them layer by layer, so each layer's expert bank is copied to that GPU once per group instead of once per chunk. It cuts that rank's wait on its banks (0.27 to 0.08 s per 1k tokens measured), but on the two RTX 3060s of [pipeline.md](pipeline.md) the prefill came out no faster, so it stays off by default; it is here for a rank whose link is slower still. Costs one residual stream of VRAM per held chunk on that rank (98 MiB for a 5,120-token Flash-Next chunk). See [pipeline.md](pipeline.md#two-knobs-for-a-slow-second-rank) |
 | `--prefill-profile` | off | Log one line per prefill forward on every rank: its wall time split into waiting for the other pipeline rank, host copies of expert rows the GPU cannot read directly (the `--moe-bank-ram` remainder; page faults on the bank file land here), per-layer-embedding disk reads, and the GPU plus the rest; then the GiB those copies moved and their rate, major faults and storage reads, the page cache's share of the non-resident rows when the forward began, and the achieved PCIe rate of the registered rows. Go by the storage reads, not the share: a chunk can re-read nearly all of the rows while a third are cached, because reading one layer evicts the one before. On an RTX 2060 host with Ornith at `--moe-bank-ram 6G`: 0.7 s of a 4.5 s chunk with RAM to spare; with the server held to 13 GiB, 9.2 s of 13 s, 10.6 GiB re-read from the disk each chunk at 1.2 GiB/s. One device sync per prefill forward |
 | `--moe-cpu-threads` | physical cores | CPU worker threads for the cpu/hybrid executor |
-| `--moe-cpu-layers` | all on GPU | With `offload`: which MoE layers decode on CPU (`3,7,11`, a count, a fraction, or `auto`). `auto` is for Windows/WSL only, where CUDA pinned memory is capped; it splits against a cap `ft doctor pin` recorded for this host, which exists only where the driver has refused one; otherwise a 40%-of-guest-RAM estimate stands (see [kai.md](kai.md#known-limitations)). Every value needs an expert format the CPU executor serves (bf16, fp8_block, nvfp4, mxfp4, GGUF on x86 CPUs, and this fork's Q2_0 / Q4_0 expert banks). Upstream's load-time probe (pin the banks from the middle layers out until CUDA refuses one, OS-lock the rest; `FREETOKEN_PIN_BUDGET_GB` fixes the cap instead) is opt-in here with `FREETOKEN_PIN_PROBE=1`: a refused `cudaHostRegister` has taken down WSL hosts of this fork's size, so the recorded cap stays the default |
+| `--moe-cpu-layers` | all on GPU | With `offload`: which MoE layers decode on CPU (`3,7,11`, a count, a fraction, or `auto`). `auto` is for Windows/WSL only, where CUDA pinned memory is capped; it splits against a cap `ft doctor pin` recorded for this host, which exists only where the driver has refused one; otherwise a 40%-of-guest-RAM estimate stands (see [kai.md](kai.md#known-limitations)). Every value needs an expert format the CPU executor serves (bf16, fp8_block, nvfp4, mxfp4, GGUF on x86 CPUs except gpt-oss GGUF files, whose per-expert biases decode on the GPU only, and this fork's Q2_0 / Q4_0 expert banks). Upstream's load-time probe (pin the banks from the middle layers out until CUDA refuses one, OS-lock the rest; `FREETOKEN_PIN_BUDGET_GB` fixes the cap instead) is opt-in here with `FREETOKEN_PIN_PROBE=1`: a refused `cudaHostRegister` has taken down WSL hosts of this fork's size, so the recorded cap stays the default |
 | `--moe-hybrid-max-fetch` | auto | With `hybrid`: max experts fetched over PCIe per layer per step; rest computed on CPU |
 | `--moe-locked-fetch` | auto | With `hybrid` and locked layers: share of a locked layer's misses fetched per step into its GPU slots through pinned staging. Auto takes p / (2p + c) from the `ft bench bw` row of the layer's kind (at most 1 per step without a row); 0 = locked layers decode on CPU only |
 | `--moe-locked-max-fetch` | 8 | Most experts a locked layer fetches per step; sizes the staging (that many rows of the widest expert, per bank) |
@@ -125,6 +125,16 @@ See [models.md](models.md#moe-strategies) for what each strategy does, and [perf
 | `--moe-collect-stats` / `--no-moe-collect-stats` | on | Count decode routing device-side, inside the decode graph: miss/fetch counters, how often each expert is picked, and the last 1,024 steps' routing (the web console's heatmap, time breakdown and cache estimate). On an RTX 2060 the cost stayed within the run-to-run noise (about 0.06 ms of GPU work per step) |
 | `--disable-cuda-graph` | graphs on | Decode eagerly (debugging) |
 
+### Speculative decoding
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--speculative-algorithm`, `--spec-algo` | off | Draft method. `mtp` drafts with the checkpoint's multi-token-prediction layer: Qwen3.5 / Qwen3.6 HF or GGUF checkpoints, and Qwen3.8-Flash-Next HF or GGUF |
+| `--speculative-num-steps`, `--spec-num-steps` | the method's default (3 for `mtp`) | Draft tokens per decode step, 1 to 8 for `mtp` |
+| `--speculative-draft-model-path`, `--spec-draft-model` | the target checkpoint | Where the draft weights load from. A Qwen3.8-Flash-Next target also takes a Strata MTP pack (a GGUF that keeps the checkpoint's `mtp.*` tensors under their HF names), and a Qwen3.8-Flash-Next GGUF target needs one; a Qwen3.5 / Qwen3.6 GGUF target drafts from its own `nextn` MTP block (the block llama.cpp keeps after the last decoder layer), or from an `mtp-*.gguf` sidecar of the same model (unsloth's `MTP/` releases) given here; a separate checkpoint folder is an HF-target option, read with the target's quantization config, and a GGUF target refuses a folder draft |
+
+Speculative decoding needs `--tp 1` and runs without overlap scheduling (in this fork it is also refused together with `--spec-mtp` or `--pp-size`); targets with sliding-window or DSV4 window-tier KV are refused at startup. `mtp` refuses an FTW checkpoint as the draft source, since FTW drops the `mtp.*` tensors, and a Qwen3.5 / Qwen3.6 GGUF converted without its MTP layer (llama.cpp `--no-mtp`) when no `mtp-*.gguf` sidecar is given: such a trunk has no draft of its own to read, while a `--no-mtp` trunk plus a sidecar works (the trunk config's shapes, the sidecar's weights).
+
 ### API behaviour
 
 | Flag | Default | Meaning |
@@ -133,7 +143,22 @@ See [models.md](models.md#moe-strategies) for what each strategy does, and [perf
 | `--tool-call-parser` | auto | Tool-call format; auto-inferred from the model family |
 | `--reasoning-parser` | auto | Splits chain-of-thought into `reasoning_content`; auto-inferred; `off` disables |
 | `--enable-cache-report` | off | Report prefix-cache hits in each response's usage block |
+| `--enable-timings-report` | off | Attach a llama.cpp-shaped per-request `timings` object to responses |
 | `--anthropic-inline-system` | auto | Placement of late Anthropic system instructions: `auto`, `preserve`, or `fold` |
+
+With `--enable-timings-report` every chat completion, completion and Responses response
+also carries a llama.cpp-shaped `timings` object next to `usage` (`cache_n`, `prompt_n`,
+`prompt_ms`, `prompt_per_token_ms`, `prompt_per_second`, `predicted_n`, `predicted_ms`,
+`predicted_per_token_ms`, `predicted_per_second`, plus `queue_ms` as a FreeToken
+extension and `draft_n` / `draft_n_accepted` under speculative decoding), so frontends
+like llama-swap and Open Web UI show per-request prefill/decode rates. All spans are
+measured in the scheduler: `queue_ms` covers admission to the first prefill chunk,
+`prompt_ms` the first chunk to the first sampled token (chunk gaps included),
+`predicted_ms` the first to the last committed token; `prompt_n` counts only the
+evaluated tokens and the decode rates divide by `predicted_n - 1`, as in llama.cpp. On
+streams the object rides the final chunk; a multi-prompt `/v1/completions` request
+reports the first prompt's spans, as llama.cpp does. `/v1/messages` never carries it
+(llama.cpp emits no timings there either).
 
 ### Image input
 

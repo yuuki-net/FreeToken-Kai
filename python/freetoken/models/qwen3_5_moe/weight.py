@@ -38,7 +38,7 @@ _BANK_KINDS = {"weight": "weight", "weight_scale": "weight_scale", "weight_globa
 # leaves the model builds as Linear layers: only their tensors are read under the QuantConfig, the rest passes through as stored
 _LINEAR_LEAVES = frozenset({
     "q_proj", "k_proj", "v_proj", "o_proj", "in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a", "out_proj",
-    "gate_proj", "up_proj", "down_proj", "gate", "shared_expert_gate", "lm_head",
+    "gate_proj", "up_proj", "down_proj", "gate", "shared_expert_gate", "lm_head", "fc",
 })
 # activation scales of modules whose scheme carries no input_scale role
 _DROPPED_SUFFIXES = frozenset({"input_scale", "input_global_scale"})
@@ -46,8 +46,9 @@ _ELEM_DTYPES = {"e4m3": torch.float8_e4m3fn, "e2m1": torch.uint8}
 _QUANT_DTYPES = (torch.float8_e4m3fn, torch.float8_e5m2, torch.uint8, torch.int8)
 # The MTP draft head's routed experts. ``mtp*`` is off every quantizer's list, so these are
 # bf16 where the decoder's are NVFP4; ``_stack_mtp_experts`` turns them into the two tensors
-# the engine quantizes into a bank layer.
-_MTP_EXPERT_RE = re.compile(
+# the engine quantizes into a bank layer. (Kai's --spec-mtp; upstream's own draft reader below
+# has its own _MTP_EXPERT_RE, whose "proj" group is gate/up/down.)
+_SPEC_MTP_EXPERT_RE = re.compile(
     r"^mtp\.layers\.0\.mlp\.experts\.(?P<expert>\d+)\.(?P<proj>gate_proj|up_proj|down_proj)\.weight$"
 )
 _MTP_STACKED_GATE_UP = "mtp.layers.0.mlp.experts.gate_up_proj"
@@ -296,7 +297,7 @@ def _iter_shards(
                 if name is None:
                     continue
                 if _EXPERT_RE.search(name):
-                    m = _MTP_EXPERT_RE.match(name) if include_mtp else None
+                    m = _SPEC_MTP_EXPERT_RE.match(name) if include_mtp else None
                     if m is not None:
                         # the head's experts: off the GPU at once (1.6 GB for 256 x 512), stacked below
                         tensor = f.get_tensor(raw_name)
@@ -331,6 +332,51 @@ def _iter_shards(
         stacked_mtp = _stack_mtp_experts(mtp_experts)
         assert stacked_mtp, "--spec-mtp: the checkpoint has no mtp.layers.0.mlp.experts.* tensors"
         yield from stacked_mtp
+
+
+# routed experts: expert_pieces.iter_extra_layer_expert_pieces
+_MTP_EXPERTS_PREFIX = "mtp.layers.0.mlp.experts."
+_MTP_EXPERT_RE = re.compile(re.escape(_MTP_EXPERTS_PREFIX) + r"(?:(?P<expert>\d+)\.(?P<proj>gate|up|down)_proj\.(?P<kind>weight|weight_scale_inv)|(?P<stacked>gate_up|down)_proj)$")
+
+
+def iter_mtp_weights(model_path: str, device: torch.device) -> Iterator[tuple[str, torch.Tensor]]:
+    """The ``mtp.*`` head but its routed experts, named as Qwen3_5MTPDraft names it, projections fused like the target's."""
+    hf_config = cached_load_hf_config(model_path)
+    reader = _DenseReader(get_quant_config(), get_model_spec(hf_config.architectures[0]))
+    seen = False
+    for file in iter_weight_files(model_path):
+        with safetensors.safe_open(file, framework="pt", device=str(device)) as f:
+            for raw_name in f.keys():
+                if not raw_name.startswith("mtp.") or raw_name.endswith((".k_scale", ".v_scale", ".q_scale", ".prob_scale")):
+                    continue
+                seen = True
+                if raw_name.startswith(_MTP_EXPERTS_PREFIX):
+                    continue
+                tensor = f.get_tensor(raw_name)
+                emitted = reader.add(raw_name, tensor)
+                if emitted is None:
+                    yield raw_name[len("mtp."):], tensor
+                else:
+                    yield from ((n.removeprefix("mtp."), t) for n, t in emitted)
+    if not seen:
+        raise ValueError(f"{model_path} has no mtp.* weights")
+    if reader.pending:
+        raise ValueError(f"{model_path}: incomplete MTP projections: {reader.missing()}")
+
+
+def iter_mtp_expert_pieces(model_path: str):
+    """The MTP head's routed experts: the stacked bf16 pair, or per-expert projections with their block-fp8 scales."""
+    from freetoken.moe.expert_pieces import iter_extra_layer_expert_pieces
+
+    def locate(name: str):
+        m = _MTP_EXPERT_RE.match(name)
+        if m is None:
+            return None
+        if m["stacked"]:
+            return None, m["stacked"]
+        return int(m["expert"]), m["proj"] + ("_scale" if m["kind"] == "weight_scale_inv" else "")
+
+    return iter_extra_layer_expert_pieces(model_path, _MTP_EXPERTS_PREFIX, locate)
 
 
 def iter_vision_weights(model_path: str, device: torch.device) -> Iterator[tuple[str, torch.Tensor]]:
@@ -460,6 +506,8 @@ def nvfp4_expert_spec(model_path: str, config) -> Nvfp4ExpertSourceSpec:
 
 
 __all__ = [
+    "iter_mtp_expert_pieces",
+    "iter_mtp_weights",
     "iter_weights",
     "iter_weights_parallel",
     "iter_expert_pieces",
