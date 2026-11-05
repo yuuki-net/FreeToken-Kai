@@ -24,6 +24,9 @@ class RequestRecord:
     completion_tokens: int | None
     stream: bool | None
     error: str | None
+    # The stable class of a refused request (GenerationError.code, e.g. "context_length_exceeded"),
+    # so a viewer can name the reason without parsing ``error``. Kai: the web console's request table.
+    code: str | None = None
 
 
 class RequestRing:

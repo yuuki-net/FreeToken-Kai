@@ -223,9 +223,17 @@
         tps = `${(out / (r.duration_ms / 1000)).toFixed(1)}*`;
         title = t("dash_tps_total_hint");
       }
+      // a refused request names its reason: a short word for the known class, the server's whole
+      // message (which says the limit and the flags that raise it) on hover
+      let pill = "";
+      if (r.status >= 400) {
+        const label = r.code === "context_length_exceeded" ? t("dash_req_too_long") : String(r.status);
+        const why = r.error ? `${r.status}: ${homePath(r.error)}` : String(r.status);
+        pill = ` <span class="pill bad" title="${esc(why)}">${esc(label)}</span>`;
+      }
       return `<tr>
       <td>${fmt.time(r.ts)}</td>
-      <td>${esc(r.path.replace(/^\/v1\//, ""))}${r.status >= 400 ? ` <span class="pill bad">${r.status}</span>` : ""}</td>
+      <td>${esc(r.path.replace(/^\/v1\//, ""))}${pill}</td>
       <td class="num">${fmt.num(r.prompt_tokens)}</td><td class="num">${fmt.num(r.completion_tokens)}</td>
       <td class="num">${fmt.ms(r.ttft_ms)}</td><td class="num">${fmt.ms(r.duration_ms)}</td>
       <td class="num" title="${esc(title)}">${esc(tps)}</td></tr>`;

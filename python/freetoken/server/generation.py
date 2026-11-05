@@ -588,12 +588,18 @@ def _record_generation(
     prompt_tokens: int,
     completion_tokens: int,
     error: str | None,
+    code: str | None = None,
     first_token_at: float | None = None,
 ) -> None:
     """Log one generation request into the request ring. Every protocol adapter converges here,
     so token totals are captured whatever endpoint served the request — unlike the HTTP
     middleware, which for a stream records before the totals are known. `source is None` opts
-    out (those paths stay logged by the middleware)."""
+    out (those paths stay logged by the middleware).
+
+    ``error`` is a GenerationError — a request the server refused before producing output (an
+    over-length prompt, an unsupported image, a template it cannot render). Every adapter answers
+    those with a 400, so the row says 400 too; recording 500 made a too-long prompt read as a
+    server fault in the web console."""
     if source is None:
         return
     from .api_server import _served_model_name  # lazy: api_server imports this module
@@ -603,7 +609,7 @@ def _record_generation(
             ts=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             method="POST",
             path=source,
-            status=500 if error else 200,
+            status=400 if error else 200,
             model=_served_model_name(),
             duration_ms=int((time.monotonic() - start) * 1000),
             ttft_ms=int((first_token_at - start) * 1000) if first_token_at is not None else None,
@@ -611,6 +617,7 @@ def _record_generation(
             completion_tokens=completion_tokens,
             stream=stream,
             error=error,
+            code=code if error else None,
         )
     )
 
@@ -626,6 +633,7 @@ async def generate_events(
     completion_tokens = 0
     first_token_at: float | None = None
     error: str | None = None
+    code: str | None = None
     try:
         async for ev in _generate_events_impl(
             uid, spec, state, usage if usage is not None else GenUsage()
@@ -637,13 +645,13 @@ async def generate_events(
                 first_token_at = time.monotonic()
             yield ev
     except GenerationError as exc:
-        error = str(exc)
+        error, code = str(exc), exc.code
         raise
     finally:
         _record_generation(
             source=source, stream=True, start=start,
             prompt_tokens=prompt_tokens, completion_tokens=completion_tokens, error=error,
-            first_token_at=first_token_at,
+            code=code, first_token_at=first_token_at,
         )
 
 
@@ -655,18 +663,19 @@ async def generate_full(
     start = time.monotonic()
     result: GenResult | None = None
     error: str | None = None
+    code: str | None = None
     try:
         result = await _generate_full_impl(uid, spec, state)
         return result
     except GenerationError as exc:
-        error = str(exc)
+        error, code = str(exc), exc.code
         raise
     finally:
         _record_generation(
             source=source, stream=False, start=start,
             prompt_tokens=result.prompt_tokens if result else 0,
             completion_tokens=result.completion_tokens if result else 0,
-            error=error,
+            error=error, code=code,
         )
 
 

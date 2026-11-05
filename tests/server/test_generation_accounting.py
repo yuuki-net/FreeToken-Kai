@@ -21,6 +21,7 @@ from freetoken.message import UserReply  # noqa: E402
 from freetoken.server import api_server, request_ring  # noqa: E402
 from freetoken.server.generation import (  # noqa: E402
     GenDone,
+    GenerationError,
     GenSpec,
     generate_events,
     generate_full,
@@ -170,14 +171,41 @@ def test_stream_still_records_the_row_when_the_client_disconnects_mid_stream():
 
 
 def test_a_generation_error_records_the_row_as_failed():
+    """A GenerationError is a refused request, answered with a 400 by every adapter — the row
+    says 400 as well, not 500, so the web console does not show it as a server fault."""
     request_ring.reset()
     st = FakeState([UserReply(uid=42, incremental_output="", finished=True, error="boom")])
-    try:
+    with pytest.raises(GenerationError):
         asyncio.run(generate_full(42, _spec(), st, source="/v1/chat/completions"))
-    except Exception:
-        pass
     row = _last_row()
-    assert row["status"] == 500 and row["error"] == "boom"
+    assert row["status"] == 400 and row["error"] == "boom" and row["code"] is None
+
+
+def test_a_too_long_stream_prompt_records_its_code():
+    """The case seen on the 3060: a streamed prompt over the context limit is refused before any
+    output. The row carries the error's code, which the console turns into a word."""
+    request_ring.reset()
+    msg = "prompt is too long: 70000 tokens > 65536 maximum (prompt + generation)"
+    st = FakeState([UserReply(uid=42, incremental_output="", finished=True, error=msg,
+                              error_code="context_length_exceeded")])
+
+    async def drain():
+        async for _ev in generate_events(42, _spec(), st, source="/v1/chat/completions"):
+            pass
+
+    with pytest.raises(GenerationError):
+        asyncio.run(drain())
+    row = _last_row()
+    assert row["status"] == 400 and row["stream"] is True
+    assert row["code"] == "context_length_exceeded" and row["error"] == msg
+    assert row["prompt_tokens"] == 0 and row["completion_tokens"] == 0
+
+
+def test_a_successful_row_has_no_code():
+    request_ring.reset()
+    st = FakeState([_ack(prompt=1, completion=1, out="z", finished=True)])
+    asyncio.run(generate_full(42, _spec(), st, source="/v1/chat/completions"))
+    assert _last_row()["code"] is None
 
 
 def test_no_source_opts_out_of_recording():
