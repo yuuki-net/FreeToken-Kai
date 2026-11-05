@@ -24,18 +24,23 @@ def test_window_conv_matches_the_varlen_conv(seqlen):
     weight = torch.randn(dim, width, device=dev, dtype=torch.bfloat16) * 0.3
     state = torch.randn(slots, dim, width - 1, device=dev, dtype=torch.bfloat16)
     x = torch.randn(seqlen, dim, device=dev, dtype=torch.bfloat16)  # [total, conv_dim]
+    x_in = x.clone()
     idx = torch.tensor([1], dtype=torch.int32, device=dev)
     # varlen (the old window path)
     st_a = state.clone()
     cu = torch.tensor([0, seqlen], dtype=torch.int32, device=dev)
-    out_a = causal_conv1d_varlen(x.t().contiguous(), weight, st_a, cu, idx,
+    # each call gets its own copy: both write silu(conv) into their input, and for one token
+    # x.t().contiguous() is x itself (a [dim, 1] view counts as contiguous), so sgl_kernel's varlen
+    # would hand the window its output in place of x (申し送り 65: only [1], only on sgl_kernel)
+    out_a = causal_conv1d_varlen(x.t().contiguous().clone(), weight, st_a, cu, idx,
                                  torch.ones(1, dtype=torch.bool, device=dev), max_seq_len=seqlen)
     # update kernel over the window
     st_b = state.clone()
-    out_b = causal_conv1d_window(x.t().contiguous().unsqueeze(0), st_b, weight, idx)[0]
+    out_b = causal_conv1d_window(x.t().contiguous().clone().unsqueeze(0), st_b, weight, idx)[0]
     assert torch.allclose(out_a.float(), out_b.float(), atol=2e-2, rtol=2e-2), (out_a.float() - out_b.float()).abs().max()
     assert torch.allclose(st_a[1].float(), st_b[1].float(), atol=1e-2), (st_a[1].float() - st_b[1].float()).abs().max()
     assert torch.equal(st_a[0], st_b[0]) and torch.equal(st_a[2], st_b[2])  # other slots untouched
+    assert torch.equal(x, x_in)  # the inputs were copies
 
 
 def test_q4_0_quantizer_matches_the_vendored_dequantizer():
