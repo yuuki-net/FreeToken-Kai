@@ -21,6 +21,13 @@ way to run a model your GPUs could not otherwise hold. The GPU-side requirements
 On its own it also costs disk -- the bank file is a second copy of the experts -- until
 [`ft bank pack`](#5-optional-drop-the-second-copy-ft-bank-pack) takes them out of the checkpoint.
 
+Without the flag the banks are held whole in RAM. A boot whose banks cannot fit what is free right
+then (MemAvailable, or the cgroup memory limit when that is tighter) is refused before a byte of
+them is read, with this flag as the way out; one that fits only without the rest of the server
+(about 4.5 GiB per rank) is warned about and goes on. Before that check, a 64 GB host loading a
+GGUF's experts was stopped part-way by the system's memory-pressure kill with nothing in the log
+saying why.
+
 ## How it works
 
 The obvious design -- a small resident bank plus a cold tier read on demand -- runs into

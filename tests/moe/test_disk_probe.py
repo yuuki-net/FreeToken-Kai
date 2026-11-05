@@ -245,6 +245,53 @@ def test_auto_refuses_when_nothing_is_left(native):
         dp.auto_bank_ram({}, 1)
 
 
+# ----- banks held whole in host RAM (no --moe-bank-ram) --------------------------------
+def test_the_tightest_cgroup_limit_on_the_way_up_counts(tmp_path):
+    """systemd puts the limit on the slice / scope above the process; the root has no memory.max."""
+    proc, sysfs = str(tmp_path / "proc"), str(tmp_path / "cg")
+    _write(os.path.join(proc, "self/cgroup"), "0::/user.slice/user-1000.slice/session-2.scope\n")
+    os.makedirs(sysfs, exist_ok=True)
+    assert dp.cgroup_memory_headroom(proc, sysfs) is None  # nothing sets a limit
+    _write(os.path.join(sysfs, "user.slice/memory.max"), f"{60 * GiB}\n")
+    _write(os.path.join(sysfs, "user.slice/memory.current"), f"{10 * GiB}\n")
+    _write(os.path.join(sysfs, "user.slice/user-1000.slice/session-2.scope/memory.max"), "max\n")
+    assert dp.cgroup_memory_headroom(proc, sysfs) == 50 * GiB
+    _write(os.path.join(sysfs, "user.slice/user-1000.slice/memory.max"), f"{56 * GiB}\n")
+    _write(os.path.join(sysfs, "user.slice/user-1000.slice/memory.current"), f"{20 * GiB}\n")
+    assert dp.cgroup_memory_headroom(proc, sysfs) == 36 * GiB
+    assert dp.cgroup_memory_headroom(str(tmp_path / "noproc"), sysfs) is None
+
+
+def test_banks_that_cannot_fit_are_refused_and_name_the_bank_file():
+    """The external report's shape: 64 GB native Linux, a GGUF's experts across --pp-size 2."""
+    mem = {"MemTotal": 62 * GiB, "MemAvailable": 58 * GiB}
+    v = dp.host_ram_verdict(57 * GiB, 2, mem, None)
+    assert v.level == "short"
+    assert "57.0 GiB" in v.message and "2 ranks" in v.message and "--moe-bank-ram auto" in v.message
+    # the cgroup is the tighter of the two, and the message says so
+    v = dp.host_ram_verdict(40 * GiB, 1, mem, 41 * GiB)
+    assert v.level == "short" and "cgroup" in v.message
+
+
+def test_a_boot_that_only_lacks_the_usual_rest_of_the_server_is_warned_not_refused():
+    mem = {"MemTotal": 62 * GiB, "MemAvailable": 58 * GiB}
+    v = dp.host_ram_verdict(50 * GiB, 2, mem, None)  # 50 + 2 fits, 50 + 9 does not
+    assert v.level == "tight" and "may run out of memory" in v.message
+
+
+def test_the_2060_daily_server_is_left_alone():
+    """Ornith's 17 GiB of NVFP4 banks on the 23.5 GiB RTX 2060 host: no refusal, no warning."""
+    mem = {"MemTotal": int(23.5 * GiB), "MemAvailable": 22 * GiB}
+    assert dp.host_ram_verdict(17 * GiB, 1, mem, None).level == "ok"
+    # with less free it warns but still boots, as it did before this check
+    assert dp.host_ram_verdict(17 * GiB, 1, {"MemAvailable": 20 * GiB}, None).level == "tight"
+
+
+def test_nothing_known_means_no_verdict():
+    assert dp.host_ram_verdict(10 * GiB, 1, {}, None).level == "ok"
+    assert dp.host_ram_verdict(0, 1, {"MemAvailable": GiB}, None).level == "ok"
+
+
 # ----- storage warnings ---------------------------------------------------------------
 def test_no_warning_for_an_nvme(tree, tmp_path):
     sys, proc = tree

@@ -1805,6 +1805,10 @@ class Engine:
         banks_from_file = bank_tier is not None and not config.use_dummy_weight and bank_tier.prepare()
         expert_parallel = {"serial": False, "parallel": True}.get(config.expert_load, None)
         check_locked_fetch_config(config)
+        if bank_tier is None and not config.use_dummy_weight:
+            # Kai: banks held whole in host RAM that cannot fit are refused here, before a byte
+            # of them is read, instead of the OS stopping the load part-way
+            _check_host_ram(config, method=method, layer_methods=layer_methods)
         # --moe-cpu-layers auto without a manual pin budget: load unpinned, then pin layers until the driver refuses (settle_banks)
         # a model the CPU executor cannot serve takes the estimate path, which rejects it before the load when layers must lock
         probe = (
@@ -3901,6 +3905,36 @@ def _check_pin_budget(config: EngineConfig, *, reserved: int, method=None, layer
             f"{budget / 2**30:.1f} GiB, {_pin_source()} (WSL caps CUDA pinning; run \'ft doctor pin\' to "
             f"measure this host, or set FREETOKEN_PIN_BUDGET_GB); {_pin_hint(reserved)}"
         )
+
+
+def _check_host_ram(config: EngineConfig, *, method=None, layer_methods=None) -> None:
+    """Refuse a boot whose expert banks, held whole in host RAM, cannot fit what is free now; warn
+    when they fit only without the rest of the server (``disk_probe.host_ram_verdict``).
+
+    Under ``--pp-size`` every rank on this host loads its slice at once, so the comparison is of
+    the whole model's banks (this rank's, scaled by its share of the MoE layers) against the RAM
+    they all share. A size that cannot be estimated skips the check."""
+    from freetoken.moe import disk_probe
+    from freetoken.moe.expert_banks import bank_bytes_estimate, ftw_bank_bytes
+
+    ranks = config.tp_info.size if config.is_pp else 1
+    # an FTW checkpoint's metadata sizes the whole model already; the estimate is of this rank's layers
+    bank_bytes = ftw_bank_bytes(config.model_path)
+    if not bank_bytes:
+        bank_bytes = bank_bytes_estimate(config.model_config, method, layer_methods)
+        if not bank_bytes:
+            return
+        local = config.model_config.num_moe_layers
+        full = config.full_model_config.num_moe_layers if config.is_pp else local
+        if local and full and full != local:
+            bank_bytes = bank_bytes * full // local
+    verdict = disk_probe.host_ram_verdict(
+        bank_bytes, ranks, disk_probe.meminfo(), disk_probe.cgroup_memory_headroom()
+    )
+    if verdict.level == "short":
+        raise ValueError(verdict.message)
+    if verdict.level == "tight":
+        logger.warning_rank0(verdict.message)
 
 
 def _auto_cpu_layers(config: EngineConfig, num_moe_layers: int, *, reserved: int = 0, method=None) -> frozenset[int]:

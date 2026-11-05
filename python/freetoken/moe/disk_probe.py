@@ -551,6 +551,93 @@ def auto_bank_ram(mem: dict[str, int], ranks: int, proc: str = "/proc") -> AutoB
 
 
 # ---------------------------------------------------------------------------------------
+# will the banks fit in host RAM at all (without --moe-bank-ram)
+# ---------------------------------------------------------------------------------------
+
+# What a boot needs beyond the banks before it is hopeless: the smallest rest-of-server any
+# configuration here runs with. The refusal threshold is deliberately this low -- a boot that a
+# stricter rule would refuse may still have come up before this check existed -- and the
+# NONBANK_PER_RANK_BYTES figure only decides a warning.
+HOST_RAM_MIN_REST_BYTES = 2 * GiB
+
+
+def cgroup_memory_headroom(proc: str = "/proc", sysfs: str = "/sys/fs/cgroup") -> int | None:
+    """Free bytes under the tightest cgroup v2 ``memory.max`` of this process's cgroup and its
+    ancestors (``memory.max`` - ``memory.current``), or None when none of them sets a limit.
+
+    The ancestors count: a systemd user session puts the limit on the slice or scope above the
+    process, and the root cgroup has no ``memory.max`` file at all."""
+    rel = None
+    for line in (_read(os.path.join(proc, "self/cgroup")) or "").splitlines():
+        hier, _, path = line.partition("::")
+        if hier == "0" and path:
+            rel = path.strip()
+            break
+    if rel is None:
+        return None
+    best = None
+    parts = [p for p in rel.split("/") if p]
+    for depth in range(len(parts), -1, -1):
+        d = os.path.join(sysfs, *parts[:depth])
+        raw = (_read(os.path.join(d, "memory.max")) or "").strip()
+        if not raw or raw == "max":
+            continue
+        try:
+            limit = int(raw)
+            used = int((_read(os.path.join(d, "memory.current")) or "0").strip())
+        except ValueError:
+            continue
+        room = max(0, limit - used)
+        best = room if best is None else min(best, room)
+    return best
+
+
+@dataclass
+class HostRamVerdict:
+    level: str  # "ok", "tight" (warn and go on) or "short" (refuse before reading)
+    message: str = ""
+
+
+def host_ram_verdict(bank_bytes: int, ranks: int, mem: dict[str, int], cgroup_room: int | None) -> HostRamVerdict:
+    """Whether expert banks of ``bank_bytes`` (every rank on this host together) fit the host RAM
+    that is free now, for a boot that holds them all in RAM (no ``--moe-bank-ram``).
+
+    Against the smaller of MemAvailable and the cgroup headroom: a 64 GB native Linux host loading
+    a GGUF's experts was stopped part-way by systemd's memory-pressure kill at a 56 GB scope, with
+    nothing in the log about why. "short" when the banks plus the smallest rest of the server do
+    not fit -- the load cannot succeed; "tight" when the usual rest of the server
+    (``NONBANK_PER_RANK_BYTES`` per rank) does not fit on top -- it may still come up."""
+    avail = mem.get("MemAvailable")
+    if not avail or bank_bytes <= 0:
+        return HostRamVerdict("ok")
+    source = "MemAvailable"
+    if cgroup_room is not None and cgroup_room < avail:
+        avail, source = cgroup_room, "the cgroup memory limit"
+    ranks = max(1, int(ranks))
+    nonbank = NONBANK_PER_RANK_BYTES * ranks
+    across = f" across {ranks} ranks" if ranks > 1 else ""
+    fix = (
+        "--moe-bank-ram auto maps the banks from a file on a local disk and keeps only what fits in RAM "
+        "resident (docs/bank-ram.md)"
+    )
+    if bank_bytes + HOST_RAM_MIN_REST_BYTES > avail:
+        return HostRamVerdict(
+            "short",
+            f"the expert banks need {bank_bytes / GiB:.1f} GiB of host RAM{across}, but {source} leaves "
+            f"{avail / GiB:.1f} GiB, so the load would be stopped part-way (out of memory, or the "
+            f"system's memory-pressure kill); {fix}",
+        )
+    if bank_bytes + nonbank > avail:
+        return HostRamVerdict(
+            "tight",
+            f"the expert banks need {bank_bytes / GiB:.1f} GiB of host RAM{across} and the rest of the "
+            f"server about {nonbank / GiB:.1f} GiB more, but {source} leaves {avail / GiB:.1f} GiB; "
+            f"the load may run out of memory part-way. If it does, {fix}",
+        )
+    return HostRamVerdict("ok")
+
+
+# ---------------------------------------------------------------------------------------
 # who has the file open
 # ---------------------------------------------------------------------------------------
 

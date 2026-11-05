@@ -97,6 +97,48 @@ def test_cpu_moe_graph_fallback_agrees_across_tp_ranks(monkeypatch, local_safe, 
     assert config.cuda_graph_max_bs == (4 if local_safe and remote_safe else 0)
 
 
+def _ram_cfg(*, pp: bool, local: int = 20, full: int = 40):
+    return SimpleNamespace(
+        is_pp=pp,
+        tp_info=SimpleNamespace(size=2 if pp else 1),
+        model_path="/nonexistent",
+        model_config=SimpleNamespace(num_moe_layers=local),
+        full_model_config=SimpleNamespace(num_moe_layers=full),
+    )
+
+
+def test_host_ram_check_compares_the_whole_models_banks_under_pp(monkeypatch, caplog):
+    """A pp rank estimates its own slice; the RAM is shared by both, so the slice is scaled up."""
+    import freetoken.engine.engine as engine
+    import freetoken.moe.disk_probe as dp
+    import freetoken.moe.expert_banks as eb
+
+    GiB = 2**30
+    monkeypatch.setattr(eb, "ftw_bank_bytes", lambda path: None)
+    monkeypatch.setattr(eb, "bank_bytes_estimate", lambda mc, method=None, layer_methods=None: 28 * GiB)
+    monkeypatch.setattr(dp, "cgroup_memory_headroom", lambda: None)
+    monkeypatch.setattr(dp, "meminfo", lambda: {"MemTotal": 62 * GiB, "MemAvailable": 57 * GiB})
+    # 28 GiB for this rank's 20 of 40 layers -> 56 GiB for the model, + 2 GiB > 57 GiB free
+    with pytest.raises(ValueError, match="56.0 GiB of host RAM across 2 ranks"):
+        engine._check_host_ram(_ram_cfg(pp=True))
+    # the same slice on one GPU is the whole model: 28 GiB fits
+    engine._check_host_ram(_ram_cfg(pp=False, local=40, full=40))
+    # an FTW checkpoint's metadata is the whole model already: not scaled again
+    monkeypatch.setattr(eb, "ftw_bank_bytes", lambda path: 28 * GiB)
+    engine._check_host_ram(_ram_cfg(pp=True))
+
+
+def test_host_ram_check_skips_what_it_cannot_size(monkeypatch):
+    import freetoken.engine.engine as engine
+    import freetoken.moe.disk_probe as dp
+    import freetoken.moe.expert_banks as eb
+
+    monkeypatch.setattr(eb, "ftw_bank_bytes", lambda path: None)
+    monkeypatch.setattr(eb, "bank_bytes_estimate", lambda mc, method=None, layer_methods=None: None)
+    monkeypatch.setattr(dp, "meminfo", lambda: (_ for _ in ()).throw(AssertionError("must not read")))
+    engine._check_host_ram(_ram_cfg(pp=False))
+
+
 if __name__ == "__main__":
     import sys
 
