@@ -282,7 +282,9 @@ def _adjust_spec_config(config, override, windowed_kv: bool) -> None:
         raise ValueError("--speculative-algorithm and --spec-mtp are two speculative decoders; pick one")
     if getattr(config, "is_pp", False):
         raise ValueError("--speculative-algorithm does not run under --pp-size (use --spec-mtp there)")
-    _spec_runner().adjust_config(config, override)
+    runner = _spec_runner()
+    runner.adjust_config(config, override)
+    override("spec_slot_states", runner.slot_states(config))
     if windowed_kv:
         raise ValueError(
             "speculative decoding does not support targets with sliding-window or DSV4 window-tier KV yet: "
@@ -1028,7 +1030,7 @@ class Engine:
                 dtype=self.dtype,
                 device=self.device,
                 tp_size=config.tp_size,
-                slot_states=config.model_config.slot_states,
+                slot_states=config.slot_states,
             )
             host_slots = _linear_state_host_slots(config)
             if host_slots:
@@ -3797,7 +3799,8 @@ def _linear_state_host_bytes(config) -> int:
 
     per = linear_state_bytes_per_req(
         config.model_config.linear_attention_group(), config.tp_size, config.dtype,
-        getattr(config.model_config, "slot_states", ()),
+        # the model's states and a proposer's (--speculative-algorithm): the host slots hold both
+        getattr(config, "slot_states", getattr(config.model_config, "slot_states", ())),
     )
     return n * per
 

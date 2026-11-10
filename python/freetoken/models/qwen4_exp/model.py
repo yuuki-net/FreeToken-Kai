@@ -298,11 +298,16 @@ class Qwen4ExpModel(BaseOP):
             pieces = plan_prefill_pieces(
                 batch, ctx.prefill_mixer_pieces, ctx.attn_backend, hidden.device, ctx.linear_state_pool
             )
+        # upstream's drafts (--speculative-algorithm) read chosen layers' outputs; one process only
+        features = getattr(batch, "features", None)
+        wanted = features.wanted_layers if features is not None else ()
         for i in self._local_ids:
             if pieces is not None:
                 hidden = layers[i].forward_pieces(hidden, batch, pieces, ctx)
             else:
                 hidden = layers[i].forward(hidden, batch)
+            if i in wanted:
+                features.layer_output(i, hidden, num_streams=self.hc_count)
             if dbg is not None:
                 dbg.append((i, hidden.detach().clone()))
         if meta is not None and meta.is_verify:
@@ -318,7 +323,7 @@ class Qwen4ExpModel(BaseOP):
             return hidden
         # the MTP draft head reads the final residual streams (before the mixer)
         self._last_residual = hidden
-        if (features := getattr(batch, "features", None)) is not None:
+        if features is not None:
             # upstream's draft reads the residual streams before the final mix
             features.final_hidden(hidden)
         return self.hyper_connection_mixer.mix(hidden)[0]

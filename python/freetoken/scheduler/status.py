@@ -32,6 +32,8 @@ class SchedulerStatusReporter:
     # stepped and tokens they committed
     _spec_req_steps: int = field(default=0, init=False)
     _spec_tokens: int = field(default=0, init=False)
+    # the same since the last take_spec_counts(), which the decode log leaves alone
+    _spec_counts: tuple[int, int] = field(default=(0, 0), init=False)
 
     def __post_init__(self) -> None:
         now = self.clock()
@@ -89,6 +91,11 @@ class SchedulerStatusReporter:
                 generated=generated,
             )
 
+    def take_spec_counts(self) -> tuple[int, int]:
+        """Requests stepped and tokens they committed over the speculative decode steps since the last call."""
+        counts, self._spec_counts = self._spec_counts, (0, 0)
+        return counts
+
     def _report_prefill(
         self,
         batch: Batch,
@@ -144,6 +151,8 @@ class SchedulerStatusReporter:
         if generated is not None:
             self._spec_req_steps += len(batch.reqs)
             self._spec_tokens += generated
+            steps, tokens = self._spec_counts
+            self._spec_counts = (steps + len(batch.reqs), tokens + generated)
         if self._decode_forward_count % self.decode_log_interval != 0:
             return
 

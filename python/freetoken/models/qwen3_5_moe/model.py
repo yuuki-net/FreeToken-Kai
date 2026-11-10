@@ -232,11 +232,17 @@ class Qwen3_5Model(BaseOP):
             pieces = plan_prefill_pieces(
                 ctx.batch, n_pieces, ctx.attn_backend, x.device, ctx.linear_state_pool
             )
+        # upstream's drafts (--speculative-algorithm) read chosen layers' outputs; one process only
+        features = getattr(ctx.batch, "features", None)
+        wanted = features.wanted_layers if features is not None else ()
         for i in self._local_ids:
             if pieces is not None:
                 x, residual = layers[i].forward_pieces(x, residual, pieces, ctx)
             else:
                 x, residual = layers[i].forward(x, residual)
+            if i in wanted:
+                # the layer's output is the sum the next fused add forms
+                features.layer_output(i, x, residual)
             if dbg is not None:  # FT_SPEC_CHECK_STEP: the residual stream after layer i
                 dbg.append((i, (residual + x).detach().clone()))
         if not self._window.last:
