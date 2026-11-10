@@ -117,6 +117,7 @@ def test_host_ram_check_compares_the_whole_models_banks_under_pp(monkeypatch, ca
     monkeypatch.setattr(eb, "ftw_bank_bytes", lambda path: None)
     monkeypatch.setattr(eb, "bank_bytes_estimate", lambda mc, method=None, layer_methods=None: 28 * GiB)
     monkeypatch.setattr(dp, "cgroup_memory_headroom", lambda: None)
+    monkeypatch.setattr(dp, "process_held_bytes", lambda: 0)  # not the test runner's own memory
     monkeypatch.setattr(dp, "meminfo", lambda: {"MemTotal": 62 * GiB, "MemAvailable": 57 * GiB})
     # 28 GiB for this rank's 20 of 40 layers -> 56 GiB for the model, + 2 GiB > 57 GiB free
     with pytest.raises(ValueError, match="56.0 GiB of host RAM across 2 ranks"):

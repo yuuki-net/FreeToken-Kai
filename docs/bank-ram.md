@@ -24,7 +24,9 @@ On its own it also costs disk -- the bank file is a second copy of the experts -
 Without the flag the banks are held whole in RAM. A boot whose banks cannot fit what is free right
 then (MemAvailable, or the cgroup memory limit when that is tighter) is refused before a byte of
 them is read, with this flag as the way out; one that fits only without the rest of the server
-(about 4.5 GiB per rank) is warned about and goes on. Before that check, a 64 GB host loading a
+(about 4.5 GiB per rank) or only with the help of free swap is warned about and goes on. What the
+process holds by then (the dense weights are already loaded) counts as part of that rest, not on
+top of it. Before that check, a 64 GB host loading a
 GGUF's experts was stopped part-way by the system's memory-pressure kill with nothing in the log
 saying why.
 

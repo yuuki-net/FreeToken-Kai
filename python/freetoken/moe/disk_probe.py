@@ -561,6 +561,19 @@ def auto_bank_ram(mem: dict[str, int], ranks: int, proc: str = "/proc") -> AutoB
 HOST_RAM_MIN_REST_BYTES = 2 * GiB
 
 
+def process_held_bytes(proc: str = "/proc") -> int:
+    """Anonymous and shared memory this process already holds (``RssAnon`` + ``RssShmem``), 0 when
+    unreadable. File-backed pages are left out: MemAvailable still counts them as reclaimable."""
+    held = 0
+    for line in (_read(os.path.join(proc, "self/status")) or "").splitlines():
+        key, _, rest = line.partition(":")
+        if key in ("RssAnon", "RssShmem"):
+            parts = rest.split()
+            if parts and parts[0].isdigit():
+                held += int(parts[0]) * 1024
+    return held
+
+
 def cgroup_memory_headroom(proc: str = "/proc", sysfs: str = "/sys/fs/cgroup") -> int | None:
     """Free bytes under the tightest cgroup v2 ``memory.max`` of this process's cgroup and its
     ancestors (``memory.max`` - ``memory.current``), or None when none of them sets a limit.
@@ -598,7 +611,9 @@ class HostRamVerdict:
     message: str = ""
 
 
-def host_ram_verdict(bank_bytes: int, ranks: int, mem: dict[str, int], cgroup_room: int | None) -> HostRamVerdict:
+def host_ram_verdict(
+    bank_bytes: int, ranks: int, mem: dict[str, int], cgroup_room: int | None, held: int = 0
+) -> HostRamVerdict:
     """Whether expert banks of ``bank_bytes`` (every rank on this host together) fit the host RAM
     that is free now, for a boot that holds them all in RAM (no ``--moe-bank-ram``).
 
@@ -606,25 +621,38 @@ def host_ram_verdict(bank_bytes: int, ranks: int, mem: dict[str, int], cgroup_ro
     a GGUF's experts was stopped part-way by systemd's memory-pressure kill at a 56 GB scope, with
     nothing in the log about why. "short" when the banks plus the smallest rest of the server do
     not fit -- the load cannot succeed; "tight" when the usual rest of the server
-    (``NONBANK_PER_RANK_BYTES`` per rank) does not fit on top -- it may still come up."""
+    (``NONBANK_PER_RANK_BYTES`` per rank) does not fit on top -- it may still come up.
+
+    ``held`` is what the calling process holds already (``process_held_bytes``). The engine asks
+    after the dense weights are in, so that much of "the rest of the server" has left MemAvailable
+    and must not be asked for a second time: the 23.5 GiB RTX 2060 host has 22.4 GiB free before a
+    boot and 18.1 GiB at this point, and its 17.0 GiB of banks were refused for 2 GiB the process
+    was already sitting on. Free swap counts toward what a refusal compares against (MemAvailable
+    only, a cgroup limit is not helped by it): a load that swaps is slow, not stopped, and such
+    boots came up before this check existed."""
     avail = mem.get("MemAvailable")
     if not avail or bank_bytes <= 0:
         return HostRamVerdict("ok")
     source = "MemAvailable"
+    limit = avail + max(0, mem.get("SwapFree") or 0)
     if cgroup_room is not None and cgroup_room < avail:
         avail, source = cgroup_room, "the cgroup memory limit"
+        limit = avail
     ranks = max(1, int(ranks))
-    nonbank = NONBANK_PER_RANK_BYTES * ranks
+    held = max(0, int(held))
+    nonbank = max(0, NONBANK_PER_RANK_BYTES * ranks - held)
     across = f" across {ranks} ranks" if ranks > 1 else ""
     fix = (
         "--moe-bank-ram auto maps the banks from a file on a local disk and keeps only what fits in RAM "
         "resident (docs/bank-ram.md)"
     )
-    if bank_bytes + HOST_RAM_MIN_REST_BYTES > avail:
+    if bank_bytes + max(0, HOST_RAM_MIN_REST_BYTES - held) > limit:
         return HostRamVerdict(
             "short",
             f"the expert banks need {bank_bytes / GiB:.1f} GiB of host RAM{across}, but {source} leaves "
-            f"{avail / GiB:.1f} GiB, so the load would be stopped part-way (out of memory, or the "
+            f"{avail / GiB:.1f} GiB"
+            + (f" and free swap {(limit - avail) / GiB:.1f} GiB" if limit > avail else "")
+            + ", so the load would be stopped part-way (out of memory, or the "
             f"system's memory-pressure kill); {fix}",
         )
     if bank_bytes + nonbank > avail:
@@ -632,7 +660,8 @@ def host_ram_verdict(bank_bytes: int, ranks: int, mem: dict[str, int], cgroup_ro
             "tight",
             f"the expert banks need {bank_bytes / GiB:.1f} GiB of host RAM{across} and the rest of the "
             f"server about {nonbank / GiB:.1f} GiB more, but {source} leaves {avail / GiB:.1f} GiB; "
-            f"the load may run out of memory part-way. If it does, {fix}",
+            f"the load may run out of memory part-way{' or lean on swap' if limit > avail else ''}. "
+            f"If it does, {fix}",
         )
     return HostRamVerdict("ok")
 

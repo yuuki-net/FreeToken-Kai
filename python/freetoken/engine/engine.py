@@ -3932,7 +3932,9 @@ def _check_host_ram(config: EngineConfig, *, method=None, layer_methods=None) ->
         if local and full and full != local:
             bank_bytes = bank_bytes * full // local
     verdict = disk_probe.host_ram_verdict(
-        bank_bytes, ranks, disk_probe.meminfo(), disk_probe.cgroup_memory_headroom()
+        bank_bytes, ranks, disk_probe.meminfo(), disk_probe.cgroup_memory_headroom(),
+        # the dense weights are loaded by now: that part of the rest of the server is already out of MemAvailable
+        held=disk_probe.process_held_bytes(),
     )
     if verdict.level == "short":
         raise ValueError(verdict.message)

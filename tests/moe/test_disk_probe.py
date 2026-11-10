@@ -287,6 +287,40 @@ def test_the_2060_daily_server_is_left_alone():
     assert dp.host_ram_verdict(17 * GiB, 1, {"MemAvailable": 20 * GiB}, None).level == "tight"
 
 
+def test_what_the_process_already_holds_is_not_asked_for_twice():
+    """The 2060's real boot: 22.4 GiB free before it, 18.1 GiB when the engine asks, because the
+    dense weights and the host embedding (4.3 GiB here) are loaded by then. Counting the rest of
+    the server again on top of what is left refused the daily server."""
+    mem = {"MemTotal": int(23.5 * GiB), "MemAvailable": int(18.1 * GiB)}
+    assert dp.host_ram_verdict(17 * GiB, 1, mem, None).level == "short"  # what the check did
+    assert dp.host_ram_verdict(17 * GiB, 1, mem, None, held=int(4.3 * GiB)).level == "ok"
+    # holding little, the usual rest of the server is still owed: warned, not refused
+    assert dp.host_ram_verdict(17 * GiB, 1, mem, None, held=3 * GiB).level == "tight"
+    # banks that do not fit at all stay refused however much is held
+    assert dp.host_ram_verdict(19 * GiB, 1, mem, None, held=8 * GiB).level == "short"
+
+
+def test_free_swap_turns_a_refusal_into_a_warning_but_not_under_a_cgroup_limit():
+    mem = {"MemTotal": int(23.5 * GiB), "MemAvailable": 16 * GiB, "SwapFree": 32 * GiB}
+    v = dp.host_ram_verdict(17 * GiB, 1, mem, None)
+    assert v.level == "tight" and "swap" in v.message
+    assert dp.host_ram_verdict(17 * GiB, 1, {**mem, "SwapFree": 0}, None).level == "short"
+    # more than RAM and swap together is refused, and the message names both
+    v = dp.host_ram_verdict(60 * GiB, 1, mem, None)
+    assert v.level == "short" and "free swap 32.0 GiB" in v.message
+    # a cgroup limit stops the load whatever swap the host has
+    assert dp.host_ram_verdict(17 * GiB, 1, {**mem, "MemAvailable": 40 * GiB}, 16 * GiB).level == "short"
+
+
+def test_process_held_bytes_reads_anonymous_and_shared_rss(tmp_path):
+    (tmp_path / "self").mkdir()
+    (tmp_path / "self" / "status").write_text(
+        "Name:\tpython\nVmRSS:\t 5000000 kB\nRssAnon:\t 3000000 kB\nRssFile:\t 1900000 kB\nRssShmem:\t  100000 kB\n"
+    )
+    assert dp.process_held_bytes(str(tmp_path)) == 3100000 * 1024
+    assert dp.process_held_bytes(str(tmp_path / "missing")) == 0
+
+
 def test_nothing_known_means_no_verdict():
     assert dp.host_ram_verdict(10 * GiB, 1, {}, None).level == "ok"
     assert dp.host_ram_verdict(0, 1, {"MemAvailable": GiB}, None).level == "ok"
