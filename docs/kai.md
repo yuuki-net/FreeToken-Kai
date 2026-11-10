@@ -1,7 +1,7 @@
 # FreeToken Kai (改)
 
 An unofficial fork of [FlashML-org/FreeToken](https://github.com/FlashML-org/FreeToken),
-merged with upstream `main` at commit `4503c42` (2026-11-04). It is not affiliated with, endorsed
+merged with upstream `main` at commit `fff1022` (2026-11-10). It is not affiliated with, endorsed
 by, or supported by FlashML. The license is unchanged (Apache-2.0).
 
 The fork adds eleven things upstream does not have:
@@ -499,7 +499,8 @@ full-attention decoder layer plus `fc` / norms; Ornith-1.5-35B-A3B-NVFP4 carries
 
 Upstream has since built its own (`--speculative-algorithm mtp`: multi-row "verify" decode steps,
 #833/#836, and MTP drafts for the Qwen3.5 family and Qwen3.8-Flash-Next from the checkpoint, a
-Strata MTP pack or a GGUF's `nextn` block / `mtp-*.gguf` sidecar, #844/#856). The two are
+Strata MTP pack or a GGUF's `nextn` block / `mtp-*.gguf` sidecar, #844/#856; and `dflash`, a
+separate DFlash 2 draft checkpoint, #857). The two are
 separate code paths here: `--spec-mtp` runs its window as an extend batch and keeps working on
 `--pp-size`, and the server refuses `--speculative-algorithm` together with `--spec-mtp` or
 `--pp-size`. This fork has not compared the two on its cards yet.
