@@ -1,7 +1,7 @@
 # FreeToken Kai (改)
 
 An unofficial fork of [FlashML-org/FreeToken](https://github.com/FlashML-org/FreeToken),
-merged with upstream `main` at commit `fff1022` (2026-11-10). It is not affiliated with, endorsed
+merged with upstream `main` at commit `27740fe` (2026-11-12). It is not affiliated with, endorsed
 by, or supported by FlashML. The license is unchanged (Apache-2.0).
 
 The fork adds eleven things upstream does not have:
@@ -834,6 +834,13 @@ that survives the container:
   attention geometry is checked. The DSA index tiers and MLA latents are still 16-bit, so
   GLM-5.3-Flash, DeepSeek-V4-Flash, MiniMax-M3 and MLA checkpoints are refused. Flash-Next's
   own index tiers stay 16-bit too, but only its paged K/V is quantized, so it is supported.
+- The same flag also takes upstream's `fp8_per_token_head` / `int8_per_token_head` (8-bit
+  elements plus one scale per token and head; bf16 and no tensor parallelism; the triton,
+  qsa_sparse, m3_sparse and dsa backends read them). They are a separate path from `q8_0` /
+  `q4_0` -- one or the other is on -- and the fork's own pieces built for its block formats do
+  not take them: the cuBLAS prefill on Turing falls back to the fused kernel, and
+  `--prefix-disk-cache` is refused. `--dense-quant` and upstream's `--online-quant df11` both
+  rewrite the dense weights at load, so the two are refused together.
   `q4_0` has not been measured on a benchmark suite.
 - `--mm-encoder-weights cpu` serves the Qwen3.5/3.6 and Qwen3.8-Flash-Next vision towers only.
   DeepStack vision checkpoints (Qwen3-VL proper) and the other image families (Gemma-4,
