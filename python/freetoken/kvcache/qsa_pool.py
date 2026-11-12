@@ -27,6 +27,7 @@ from typing import Sequence
 
 import torch
 
+from .format import NONE, KVFormat
 from .mha_pool import MHAKVCache
 
 # The index tiers are always 2-byte (compute dtype); spec_kv_bytes_per_token budgets the same.
@@ -72,6 +73,7 @@ class QSAKVCache(MHAKVCache):
         layer_ids: Sequence[int] | None = None,
         kv_quant=None,
         mrope: bool = False,
+        kv_format: KVFormat = NONE,
     ) -> None:
         if index_ratio < 1 or page_size % index_ratio != 0:
             # slot // index_ratio only names one group when a group never straddles a page.
@@ -113,6 +115,7 @@ class QSAKVCache(MHAKVCache):
             device=device,
             layer_ids=layer_ids,
             kv_quant=kv_quant,
+            kv_format=kv_format,
         )
         self._zero_kv_slabs()
         self._alloc_index_tiers(num_pages)
@@ -167,6 +170,10 @@ class QSAKVCache(MHAKVCache):
             self._kv_buffer = None
             self._k_buffer = None
             self._v_buffer = None
+            self._scale_buffer = None
+            self._k_scale_buffer = None
+            self._v_scale_buffer = None
+            self._row_scale_buffer = None
             raise
 
     @classmethod
@@ -180,7 +187,7 @@ class QSAKVCache(MHAKVCache):
         for spec in config.model_config.kv_cache_group_specs():
             if spec.is_swa:
                 continue
-            per_token += spec_kv_bytes_per_token(spec, config)
+            per_token += spec_kv_bytes_per_token(spec, config, getattr(config, "kv_format", NONE))
             if spec.attn_type is AttnType.QSA:
                 # One index-key row = all index layers at one position.
                 row = spec.index_head_dim * spec.num_index_layers * _INDEX_DTYPE_BYTES

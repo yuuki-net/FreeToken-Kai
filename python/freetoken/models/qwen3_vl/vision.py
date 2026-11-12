@@ -16,6 +16,7 @@ from freetoken.layers import (
     LinearRowParallel,
     OPList,
 )
+from freetoken.layers.quantization import without_online
 from freetoken.utils import div_even, init_logger
 
 from freetoken.models.weight_stream import BlockWeightStreamer
@@ -214,6 +215,8 @@ class Qwen3VLVisionModel(BaseOP):
     """
 
     def __init__(self, vc: VisionConfig, *, quant_config: QuantConfig | None = None, prefix: str = "visual"):
+        # the blocks stream to the GPU in one shared layout, which entropy-sized online buffers break
+        quant_config = without_online(quant_config)
         if getattr(vc, "dtype", None) is not None:
             from freetoken.utils.torch_utils import torch_dtype
 

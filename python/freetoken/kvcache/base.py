@@ -7,6 +7,8 @@ from typing import ClassVar, NamedTuple
 import torch
 from freetoken.utils import div_even, init_logger, mem_GB
 
+from .format import NONE, KVFormat
+
 logger = init_logger(__name__)
 
 
@@ -22,8 +24,8 @@ class CacheRebuildRejected(Exception):
     this is recoverable, unlike a failure after the free."""
 
 
-def spec_kv_bytes_per_token(spec, config) -> int:
-    """One paged-KV group's bytes per token: (1|2 slabs) x head_dim x local kv heads x dtype
+def spec_kv_bytes_per_token(spec, config, fmt: KVFormat = NONE) -> int:
+    """One paged-KV group's bytes per token: (1|2 slabs) x row bytes of ``fmt`` x local kv heads
     x layers, plus the bf16 DSA index-key slab when the spec carries indexer dims. Pure
     per-spec arithmetic -- pool families compose it over THEIR OWN groups; no family
     branching here. (2 bytes/elem == the torch.bfloat16 dsa_pool.DSAKVCache._alloc
@@ -35,9 +37,11 @@ def spec_kv_bytes_per_token(spec, config) -> int:
     # fp16 scale per block. The indexer slab below stays 16-bit, so it is priced unchanged.
     from .kv_quant import resolve as _resolve_kv_quant
 
+    # Upstream's per-token-head formats (``fmt``) are the other family of the same flag: 8-bit
+    # rows plus one scale per token and head (two per MLA latent row).
     quant = _resolve_kv_quant(getattr(config, "kv_cache_dtype", None))
     row_bytes = (
-        spec.head_dim * config.dtype.itemsize
+        fmt.row_bytes(spec.head_dim, config.dtype, segments=2 if spec.mla else 1)
         if quant is None
         else quant.code_bytes_per_row(spec.head_dim) + quant.blocks_per_row(spec.head_dim) * 2
     )
@@ -67,6 +71,9 @@ class BaseKVCachePool(ABC):
     # Pools whose buffers are bound into per-forward model scratch (DSV4's tiers) need the
     # model re-bound after a rebuild; the engine asks before it resizes.
     needs_rebind_on_rebuild: ClassVar[bool] = False
+    # KV formats this pool family can store
+    kv_formats: ClassVar[frozenset[str]] = frozenset({NONE.name})
+    kv_format: KVFormat = NONE
 
     @classmethod
     def window_spec(cls, config) -> WindowPoolSpec | None:
@@ -177,6 +184,12 @@ class BaseKVCachePool(ABC):
 
     @abstractmethod
     def v_cache(self, index: int) -> torch.Tensor: ...
+
+    def k_scale(self, index: int) -> torch.Tensor | None:
+        return None
+
+    def v_scale(self, index: int) -> torch.Tensor | None:
+        return None
 
     @abstractmethod
     def store_kv(

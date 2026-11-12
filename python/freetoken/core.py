@@ -29,6 +29,9 @@ class SamplingParams:
     # Reasoning budget (Kai): tokens the model may spend between <think> and </think> before
     # </think> is forced. None = the server's --reasoning-budget, 0 = unlimited.
     reasoning_budget: int | None = None
+    # Stamp the ReqStats snapshot on every reply, not just the terminal one (llama.cpp's
+    # timings_per_token; the API layer has already ANDed it with --enable-timings-report).
+    timings_per_token: bool = False
 
     @property
     def is_greedy(self) -> bool:

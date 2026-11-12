@@ -1,5 +1,5 @@
 from .scheme import GroupShape, QuantKind, QuantScheme, WeightDesc
-from .registry import LayerKind, dialects, method_class, methods_for, register_dialect, register_method
+from .registry import LayerKind, dialects, method_class, methods_for, online_kinds, register_dialect, register_method
 from .method import KernelSelectionError, QuantMethod, finalize_quant, select_kernel
 from .embedding import EmbeddingConfig, EmbeddingKernel, EmbeddingMethod, GGUFEmbeddingMethod, UnquantizedEmbeddingMethod
 from .linear import (
@@ -40,11 +40,12 @@ from .configs import (
     quant_method_for,
     quantization_config_of,
     set_quant_config,
+    without_online,
 )
 
 __all__ = [
     "QuantKind", "GroupShape", "QuantScheme", "WeightDesc",
-    "LayerKind", "dialects", "method_class", "methods_for", "register_dialect", "register_method",
+    "LayerKind", "dialects", "method_class", "methods_for", "online_kinds", "register_dialect", "register_method",
     "KernelSelectionError", "select_kernel", "QuantMethod",
     "EmbeddingConfig", "EmbeddingKernel", "EmbeddingMethod", "UnquantizedEmbeddingMethod", "GGUFEmbeddingMethod",
     "LinearConfig", "LinearKernel", "LinearMethod",
@@ -54,6 +55,6 @@ __all__ = [
     "UnquantizedMoEMethod", "Fp8BlockMoEMethod", "Nvfp4MoEMethod", "Mxfp4MoEMethod", "Mxfp8MoEMethod",
     "QuantBackend", "set_quant_backend", "get_quant_backend", "NameMap",
     "QuantConfig", "NoQuantConfig", "ModelOptConfig", "CompressedTensorsConfig", "Fp8BlockConfig", "GGUFConfig", "Mxfp4Config",
-    "quant_method_for", "quantization_config_of", "set_quant_config", "get_quant_config", "finalize_quant",
+    "quant_method_for", "without_online", "quantization_config_of", "set_quant_config", "get_quant_config", "finalize_quant",
     "LoadTimeFp8Config", "AT_LOAD_FP8", "LoadTimeQ8Config", "AT_LOAD_Q8_0", "LoadTimeQuantConfig",
 ]

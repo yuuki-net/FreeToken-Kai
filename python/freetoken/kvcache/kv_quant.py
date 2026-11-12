@@ -90,14 +90,22 @@ SPECS = {spec.name: spec for spec in (Q8_0, Q4_0)}
 
 
 def resolve(name: str | None) -> KVQuantSpec | None:
-    """``None``/``auto``/``bf16``/``fp16`` -> unquantized (None); otherwise the spec."""
+    """``None``/``auto``/``bf16``/``fp16`` -> unquantized (None); otherwise the spec.
+
+    Upstream's per-token-head formats (``kvcache/format.py``) are the other family of the
+    same flag and resolve to None here: this module's block codes are not in play then."""
     if name in (None, "auto", "bf16", "fp16"):
         return None
     try:
         return SPECS[name]
     except KeyError:
+        from .format import KV_FORMATS
+
+        if name in KV_FORMATS:
+            return None
         raise ValueError(
-            f"unknown --kv-cache-dtype {name!r}; choose from auto, {', '.join(SPECS)}"
+            f"unknown --kv-cache-dtype {name!r}; choose from auto, {', '.join(SPECS)}, "
+            f"{', '.join(n for n in KV_FORMATS if n != 'none')}"
         ) from None
 
 

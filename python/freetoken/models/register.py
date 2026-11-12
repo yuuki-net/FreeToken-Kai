@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import importlib
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Callable
 
 if TYPE_CHECKING:
     from .config import ModelConfig
@@ -13,6 +13,8 @@ class EncoderSpec:
     kind: str  # "vision" | "audio", the name --mm-disable takes
     config_key: str  # the checkpoint config section that builds the tower
     modalities: tuple[str, ...]  # inputs it serves, as implemented
+    # why a checkpoint's section builds no tower although the family registers one, or None; such a checkpoint serves the other modalities
+    unserved: Callable[[Any], str | None] | None = None
 
 
 @dataclass(frozen=True)
@@ -85,7 +87,13 @@ _GEMMA4_SEGMENTS = (
 _GEMMA4_PACKED = _DENSE_PACKED + _EXPERTS_PACKED
 _GEMMA4_PROCESSOR = "freetoken.mm.processors.gemma4:Gemma4MMProcessor"
 _GEMMA4_UNIFIED_PROCESSOR = "freetoken.mm.processors.gemma4:Gemma4UnifiedMMProcessor"
-_GEMMA4_ENCODERS = (EncoderSpec("vision", "vision_config", ("image",)),)
+
+
+def _gemma4_vision_unserved(section: Any) -> str | None:
+    return "the tower does not apply clipped linears" if getattr(section, "use_clipped_linears", False) else None
+
+
+_GEMMA4_ENCODERS = (EncoderSpec("vision", "vision_config", ("image",), unserved=_gemma4_vision_unserved),)
 _MUSE_GLIMMER_PROCESSOR = "freetoken.mm.processors.muse_glimmer:MuseGlimmerMMProcessor"
 _MUSE_GLIMMER_ENCODERS = (EncoderSpec("vision", "vision_config", ("image",)),)
 _MINIMAX_M3_PACKED = _DENSE_PACKED + (
@@ -555,11 +563,13 @@ def _load_attr(module_path: str, attr_name: str) -> Any:
     return getattr(module, attr_name)
 
 
-def checkpoint_quant_config(model_path: str, hf_config: Any, spec: ModelSpec):
-    """The checkpoint's QuantConfig under the family's naming.
+def checkpoint_quant_config(
+    model_path: str, hf_config: Any, spec: ModelSpec, *, online: str | None = None, online_modules: tuple[str, ...] = ()
+):
+    """The checkpoint's QuantConfig under the family's naming, serving its bf16 layers (those ``online_modules`` names, when given) as the ``online`` kind.
 
     A GGUF family gets the GGUF dialect over the file's tensor table, named through the ``to_gguf`` its module exports."""
-    from freetoken.layers.quantization import GGUFConfig, NameMap, QuantConfig
+    from freetoken.layers.quantization import GGUFConfig, NameMap, QuantConfig, QuantKind
 
     name_map = NameMap(roots=spec.checkpoint_roots, segments=spec.checkpoint_segments, packed=spec.packed_modules_mapping)
     if spec.parse_config == "parse_gguf_config":
@@ -567,8 +577,10 @@ def checkpoint_quant_config(model_path: str, hf_config: Any, spec: ModelSpec):
         from freetoken.models.gguf.reader import gguf_tensor_index
 
         types = {name: info.ggml_type for name, info in gguf_tensor_index(hf_config.model_path).items()}
-        return GGUFConfig(types, to_gguf, name_map=name_map, unquantized=spec.unquantized_modules)
-    return QuantConfig.from_hf(hf_config, name_map=name_map, unquantized=spec.unquantized_modules)
+        quant = GGUFConfig(types, to_gguf, name_map=name_map, unquantized=spec.unquantized_modules)
+    else:
+        quant = QuantConfig.from_hf(hf_config, name_map=name_map, unquantized=spec.unquantized_modules)
+    return quant.with_online(QuantKind(online), online_modules) if online else quant
 
 
 def get_model_class(model_architecture: str, model_config: ModelConfig):

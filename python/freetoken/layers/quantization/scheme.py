@@ -22,6 +22,7 @@ class QuantKind(Enum):
     MXFP4 = "mxfp4"
     GGUF = "gguf"
     Q8_0 = "q8_0"  # ggml Q8_0 (--dense-quant q8_0): int8 blocks of 32 with an fp16 scale
+    DF11 = "df11"
 
     def __str__(self) -> str:
         return self.value

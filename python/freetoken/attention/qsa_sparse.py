@@ -313,6 +313,9 @@ class QSASparseAttnBackend(BaseAttnBackend):
             k_scales=None if kv_quant is None else self.kvcache.k_scales(layer_id),
             v_scales=None if kv_quant is None else self.kvcache.v_scales(layer_id),
             kv_quant=kv_quant,
+            kv_format=self.kvcache.kv_format,
+            k_scale=self.kvcache.k_scale(layer_id),
+            v_scale=self.kvcache.v_scale(layer_id),
         )
 
     def _plan_index_writes(self, md: QSASparseMetadata, batch: Batch) -> None:

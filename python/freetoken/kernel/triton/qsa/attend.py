@@ -11,6 +11,8 @@ import triton
 import triton.language as tl
 
 from freetoken.kernel.triton.attention import _dequant_tile
+from freetoken.kernel.triton.kv_rows import kv_row_scale, kv_scale_args, kv_tile
+from freetoken.kvcache.format import NONE, KVFormat
 from freetoken.utils import init_logger
 from freetoken.utils.torch_utils import clear_cuda_error
 
@@ -175,8 +177,9 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
     q_ptr,
     k_cache_ptr,
     v_cache_ptr,
-    ks_cache_ptr,
-    vs_cache_ptr,
+    # Kai's block scales (QBITS > 0) or upstream's row scales (KV_FMT != "none"); never both
+    k_scale_ptr,
+    v_scale_ptr,
     indices_ptr,
     block_table_ptr,
     token_to_req_ptr,
@@ -197,6 +200,8 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
     stride_vs_block,
     stride_vs_token,
     stride_vs_head,
+    stride_k_scale,
+    stride_v_scale,
     stride_indices_row,
     stride_table_req,
     stride_output_row,
@@ -216,6 +221,7 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
     NUM_TILES: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    KV_FMT: tl.constexpr,
 ) -> None:
     # row * stride can overflow int32 for large row counts.
     row = tl.program_id(0).to(tl.int64)
@@ -271,7 +277,51 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
         valid &= (physical_page >= 0) & (physical_page < num_cache_blocks)
         # physical_page * block stride can overflow int32 for large caches.
         safe_page = tl.maximum(physical_page, 0).to(tl.int64)
-        if QBITS == 0:
+        if QBITS != 0:
+            # Code bytes: 8-bit is one per element, 4-bit packs a pair low nibble first.
+            byte_off = dim_offsets // 2 if QBITS == 4 else dim_offsets
+            scale_off = dim_offsets // QBLOCK
+            nib_hi = (dim_offsets % 2) == 1
+            row_k = (
+                safe_page[None, :] * stride_k_block
+                + page_offset[None, :] * stride_k_token
+                + kv_head * stride_k_head
+            )
+            row_ks = (
+                safe_page[None, :] * stride_ks_block
+                + page_offset[None, :] * stride_ks_token
+                + kv_head * stride_ks_head
+            )
+            keys = _dequant_tile(
+                k_cache_ptr,
+                row_k + byte_off[:, None],
+                k_scale_ptr,
+                row_ks + scale_off[:, None],
+                nib_hi[:, None],
+                valid[None, :],
+                QBITS,
+            ).to(query.dtype)
+            row_v = (
+                safe_page[:, None] * stride_v_block
+                + page_offset[:, None] * stride_v_token
+                + kv_head * stride_v_head
+            )
+            row_vs = (
+                safe_page[:, None] * stride_vs_block
+                + page_offset[:, None] * stride_vs_token
+                + kv_head * stride_vs_head
+            )
+            values = _dequant_tile(
+                v_cache_ptr,
+                row_v + byte_off[None, :],
+                v_scale_ptr,
+                row_vs + scale_off[None, :],
+                nib_hi[None, :],
+                valid[:, None],
+                QBITS,
+            ).to(query.dtype)
+        # bf16 loads directly: through kv_tile the 64-row tile is scheduled differently and its register use changes
+        elif KV_FMT == "none":
             keys = tl.load(
                 k_cache_ptr
                 + safe_page[None, :] * stride_k_block
@@ -291,59 +341,39 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
                 other=0.0,
             )
         else:
-            # Code bytes: 8-bit is one per element, 4-bit packs a pair low nibble first.
-            byte_off = dim_offsets // 2 if QBITS == 4 else dim_offsets
-            scale_off = dim_offsets // QBLOCK
-            nib_hi = (dim_offsets % 2) == 1
-            row_k = (
-                safe_page[None, :] * stride_k_block
+            keys = kv_tile(
+                k_cache_ptr
+                + safe_page[None, :] * stride_k_block
                 + page_offset[None, :] * stride_k_token
                 + kv_head * stride_k_head
-            )
-            row_ks = (
-                safe_page[None, :] * stride_ks_block
-                + page_offset[None, :] * stride_ks_token
-                + kv_head * stride_ks_head
-            )
-            keys = _dequant_tile(
-                k_cache_ptr,
-                row_k + byte_off[:, None],
-                ks_cache_ptr,
-                row_ks + scale_off[:, None],
-                nib_hi[:, None],
+                + dim_offsets[:, None],
                 valid[None, :],
-                QBITS,
-            ).to(query.dtype)
-            row_v = (
-                safe_page[:, None] * stride_v_block
+                KV_FMT,
+            )
+            values = kv_tile(
+                v_cache_ptr
+                + safe_page[:, None] * stride_v_block
                 + page_offset[:, None] * stride_v_token
                 + kv_head * stride_v_head
-            )
-            row_vs = (
-                safe_page[:, None] * stride_vs_block
-                + page_offset[:, None] * stride_vs_token
-                + kv_head * stride_vs_head
-            )
-            values = _dequant_tile(
-                v_cache_ptr,
-                row_v + byte_off[None, :],
-                vs_cache_ptr,
-                row_vs + scale_off[None, :],
-                nib_hi[None, :],
+                + dim_offsets[None, :],
                 valid[:, None],
-                QBITS,
-            ).to(query.dtype)
+                KV_FMT,
+            )
+        # Kai's block formats are already scaled in the tile: KV_FMT is "none" there and these are ones
+        scale_rows = safe_page * PAGE_SIZE + page_offset
+        key_scales = kv_row_scale(k_scale_ptr + scale_rows * stride_k_scale + kv_head, valid, KV_FMT)
+        value_scales = kv_row_scale(v_scale_ptr + scale_rows * stride_v_scale + kv_head, valid, KV_FMT)
         scores = tl.dot(query, keys)
         # Scaling scores avoids re-quantizing a scaled query to BF16.
         scores *= softmax_scale_log2
-        scores = tl.where(valid[None, :], scores, -1.0e20)
+        scores = tl.where(valid[None, :], scores * key_scales[None, :], -1.0e20)
         next_max = tl.maximum(max_value, tl.max(scores, axis=1))
         alpha = tl.math.exp2(max_value - next_max)
         probabilities = tl.where(
             valid[None, :], tl.math.exp2(scores - next_max[:, None]), 0.0
         )
         accumulator = tl.dot(
-            probabilities.to(values.dtype),
+            (probabilities * value_scales[None, :]).to(values.dtype),
             values,
             acc=accumulator * alpha[:, None],
         )
@@ -449,15 +479,21 @@ def qsa_sparse_paged_attention(
     k_scales: torch.Tensor | None = None,
     v_scales: torch.Tensor | None = None,
     kv_quant=None,
+    kv_format: KVFormat = NONE,
+    k_scale: torch.Tensor | None = None,
+    v_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Run sparse GQA directly over paged K/V caches.
 
-    With ``kv_quant`` (``--kv-cache-dtype``) the caches hold block-quantized codes and
-    ``k_scales``/``v_scales`` their fp16 block scales; the tiles are dequantized inside the
-    kernel, except for prefill shapes (off Hopper and datacenter Blackwell), whose pages are dequantized into a 16-bit
-    copy first (``_dequantized_pages``). Only the paged K/V is quantized -- the compressed index slab, the pending ring
-    and the scratch rows stay 16-bit, because they decide *which* blocks get read and an
-    error there changes the selection rather than blurring a value.
+    --kv-cache-dtype has two families here, at most one of them on. Kai's q8_0 / q4_0
+    (``kv_quant``): the caches hold block-quantized codes and ``k_scales``/``v_scales`` their
+    fp16 block scales; the tiles are dequantized inside the kernel, except for prefill shapes
+    (off Hopper and datacenter Blackwell), whose pages are dequantized into a 16-bit copy first
+    (``_dequantized_pages``). Upstream's per-token-head formats (``kv_format``): 8-bit rows with
+    one scale per token and head in ``k_scale``/``v_scale``. Only the paged K/V is quantized --
+    the compressed index slab, the pending ring and the scratch rows stay 16-bit, because they
+    decide *which* blocks get read and an error there changes the selection rather than
+    blurring a value.
     """
 
     if q.ndim != 3 or k_cache.ndim != 4 or v_cache.shape != k_cache.shape:
@@ -472,8 +508,10 @@ def qsa_sparse_paged_attention(
     if kv_quant is None:
         if q.shape[2] != k_cache.shape[3] or q.shape[1] % k_cache.shape[2]:
             raise ValueError("QSA sparse attention requires valid grouped-query heads")
-        assert q.dtype == k_cache.dtype == v_cache.dtype
+        if not kv_format.quantized:
+            assert q.dtype == k_cache.dtype == v_cache.dtype
     else:
+        assert not kv_format.quantized, "--kv-cache-dtype names one format"
         if k_scales is None or v_scales is None:
             raise ValueError("QSA sparse attention got a quantized slab without scales")
         if k_cache.shape[3] != kv_quant.code_bytes_per_row(head_dim):
@@ -481,6 +519,12 @@ def qsa_sparse_paged_attention(
         if q.shape[1] % k_cache.shape[2]:
             raise ValueError("QSA sparse attention requires valid grouped-query heads")
     assert head_dim >= 16 and (head_dim & (head_dim - 1)) == 0
+    # upstream's row scales; Kai's block scales go in below, after the prefill dequant may drop them
+    k_scale_arg, v_scale_arg, stride_k_scale, stride_v_scale = (q, q, 0, 0)
+    if kv_quant is None:
+        k_scale_arg, v_scale_arg, stride_k_scale, stride_v_scale = kv_scale_args(
+            kv_format, k_cache, v_cache, k_scale, v_scale, q, shape=(k_cache.shape[0] * k_cache.shape[1], k_cache.shape[2])
+        )
     assert logical_indices.dtype == block_table.dtype == torch.int32
     assert token_to_req.dtype == torch.int32
     assert q.stride(2) == 1 and k_cache.stride(3) == v_cache.stride(3) == 1
@@ -526,9 +570,13 @@ def qsa_sparse_paged_attention(
     if torch.version.hip is not None:
         _props = torch.cuda.get_device_properties(q.device)
         _lds_budget = getattr(_props, "shared_memory_per_block", 64 * 1024) or 64 * 1024
-        _kv_bytes = k_cache.element_size()
+        _kv_bytes = q.element_size()
         while block_n > 16 and 2 * block_n * q.shape[2] * _kv_bytes + 2048 > _lds_budget:
             block_n //= 2
+
+    if kv_format.quantized:
+        # wider tiles spill registers once upstream's decode arms are in (sm_80 to sm_120)
+        block_n = 16
 
     # ...and GB300 has 227 KiB of shared memory per block. A 3060 has 99, and the prefill
     # profile above wants more than that for some shapes: Triton refuses the launch with
@@ -543,7 +591,7 @@ def qsa_sparse_paged_attention(
     # paying an exception each time would cost more than the tile ever saved.
     key = (
         q.device.index,
-        0 if kv_quant is None else kv_quant.bits,
+        kv_quant.bits if kv_quant is not None else (kv_format.name if kv_format.quantized else 0),
         q.shape[1],
         q.shape[2],
         k_cache.shape[1],
@@ -583,9 +631,9 @@ def qsa_sparse_paged_attention(
                 q,
                 k_cache,
                 v_cache,
-                # unquantized: the slab stands in for the scale pointer (QBITS == 0 prunes every use)
-                k_scales if k_scales is not None else k_cache,
-                v_scales if v_scales is not None else v_cache,
+                # Kai's block scales, or upstream's row scales (a placeholder when neither is on)
+                k_scales if k_scales is not None else k_scale_arg,
+                v_scales if v_scales is not None else v_scale_arg,
                 logical_indices,
                 block_table,
                 token_to_req,
@@ -606,6 +654,8 @@ def qsa_sparse_paged_attention(
                 v_scales.stride(0) if v_scales is not None else 0,
                 v_scales.stride(1) if v_scales is not None else 0,
                 v_scales.stride(2) if v_scales is not None else 0,
+                stride_k_scale,
+                stride_v_scale,
                 logical_indices.stride(0),
                 block_table.stride(0),
                 out.stride(0),
@@ -625,6 +675,7 @@ def qsa_sparse_paged_attention(
                 NUM_TILES=num_tiles,
                 BLOCK_M=block_m,
                 BLOCK_N=block_n,
+                KV_FMT=kv_format.name,
                 num_warps=partial_warps,
                 num_stages=num_stages,
             )

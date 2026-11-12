@@ -15,6 +15,7 @@ from .base import (
     MatchResult,
     SizeInfo,
 )
+from .format import NONE, KVFormat
 
 
 class CacheManagerCreator(Protocol):
@@ -143,6 +144,7 @@ def create_kv_pool(config, num_pages: int, device: torch.device, dtype: torch.dt
         num_req_slots=config.max_running_req + 1,  # + 1 for the dummy request row
         kv_quant=_resolve_kv_quant(getattr(config, "kv_cache_dtype", None)),
         num_speculative_tokens=getattr(config, "decode_rows_per_req", 1) - 1,
+        kv_format=getattr(config, "kv_format", NONE),
     )
 
 
@@ -156,6 +158,7 @@ def create_kvcache_pool(
     num_req_slots: int | None = None,
     kv_quant=None,
     num_speculative_tokens: int = 0,
+    kv_format: KVFormat = NONE,
 ) -> BaseKVCachePool:
     if kv_quant is not None:
         # Refuse at startup rather than serve a pool whose secondary tiers (sparse index
@@ -210,6 +213,7 @@ def create_kvcache_pool(
             device=device,
             dtype=dtype,
             kv_quant=kv_quant,
+            kv_format=kv_format,
         )
 
     from .mha_pool import MHAKVCache
@@ -249,6 +253,7 @@ def create_kvcache_pool(
             device=device,
             index_head_dim=spec.index_head_dim,
             num_index_layers=spec.num_index_layers,
+            kv_format=kv_format,
         )
 
     # QSA (Qwen3.8-Flash-Next): the same GQA group, but it stores one index key per
@@ -277,6 +282,7 @@ def create_kvcache_pool(
             layer_ids=spec.layer_ids,
             kv_quant=kv_quant,
             mrope=model_config.model_is_mrope,
+            kv_format=kv_format,
         )
 
     if len(kv_specs) == 1 and kv_specs[0].mla:
@@ -297,6 +303,7 @@ def create_kvcache_pool(
                 index_head_dim=spec.index_head_dim,
                 num_index_layers=spec.num_index_layers,
                 layer_ids=layer_ids,
+                kv_format=kv_format,
             )
             if spec.index_ratio > 1:
                 # kpool tail rings are keyed by Req.table_idx; + 1 covers the dummy request row.
@@ -316,6 +323,7 @@ def create_kvcache_pool(
             dtype=dtype,
             device=device,
             layer_ids=layer_ids,
+            kv_format=kv_format,
         )
 
     spec = kv_specs[0] if len(kv_specs) == 1 else None
@@ -334,6 +342,7 @@ def create_kvcache_pool(
         dtype=dtype,
         layer_ids=layer_ids,
         kv_quant=kv_quant,
+        kv_format=kv_format,
     )
 
 

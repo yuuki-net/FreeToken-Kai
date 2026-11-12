@@ -103,6 +103,14 @@ class PoolLayout:
                 f"the KV pool is {kind.__name__}; the prefix disk cache knows how to store the "
                 f"plain paged pool (Qwen3.5-MoE) and the QSA pool (Qwen3.8-Flash-Next) only"
             )
+        fmt = getattr(kv_pool, "kv_format", None)
+        if fmt is not None and fmt.quantized:
+            # upstream's per-token-head scales are row-flat ([2, layers, rows, heads, n]), not
+            # paged like the slabs and Kai's block scales below; q8_0 / q4_0 are stored
+            raise PrefixDiskUnsupported(
+                f"--kv-cache-dtype {fmt.name} keeps its scales in a layout the prefix disk cache "
+                f"does not copy; q8_0 and q4_0 are supported"
+            )
         if linear_pool is None:
             raise PrefixDiskUnsupported("the model has no GDN state pool (not a hybrid model)")
         self.kv_pool = kv_pool

@@ -153,6 +153,11 @@ class TritonAttentionBackend(BaseAttnBackend):
             k_scales = self.kvcache.k_scales(layer_id).view(-1, kv_heads, nb)
             v_scales = self.kvcache.v_scales(layer_id).view(-1, kv_heads, nb)
 
+        kv_args = {
+            "kv_format": self.kvcache.kv_format,
+            "k_scale": self.kvcache.k_scale(layer_id),
+            "v_scale": self.kvcache.v_scale(layer_id),
+        }
         spec = attn_spec or AttentionSpec()
         block_ends = batch.mm_block_ends if spec.bidirectional_mm_blocks else None
         indices = metadata.indices
@@ -179,6 +184,7 @@ class TritonAttentionBackend(BaseAttnBackend):
                 k_scales=k_scales,
                 v_scales=v_scales,
                 kv_quant=kv_quant,
+                **kv_args,
             )
         if (
             (not metadata.is_decode)
@@ -203,6 +209,7 @@ class TritonAttentionBackend(BaseAttnBackend):
                 v_scales=v_scales,
                 kv_quant=kv_quant,
                 block_ends=block_ends,
+                **kv_args,
             )
         if block_ends is not None:
             raise NotImplementedError("bidirectional multimodal blocks need the extend kernel path")
@@ -220,6 +227,7 @@ class TritonAttentionBackend(BaseAttnBackend):
             k_scales=k_scales,
             v_scales=v_scales,
             kv_quant=kv_quant,
+            **kv_args,
         )
 
     def prepare_metadata(self, batch: Batch) -> None:
