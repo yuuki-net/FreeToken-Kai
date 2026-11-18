@@ -1,7 +1,7 @@
 # FreeToken Kai (改)
 
 An unofficial fork of [FlashML-org/FreeToken](https://github.com/FlashML-org/FreeToken),
-merged with upstream `main` at commit `27740fe` (2026-11-12). It is not affiliated with, endorsed
+merged with upstream `main` at commit `1ba3e71` (2026-11-18). It is not affiliated with, endorsed
 by, or supported by FlashML. The license is unchanged (Apache-2.0).
 
 The fork adds eleven things upstream does not have:
