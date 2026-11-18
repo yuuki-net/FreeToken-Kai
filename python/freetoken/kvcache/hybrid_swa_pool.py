@@ -111,6 +111,7 @@ class HybridSWAKVCache(BaseKVCachePool):
             "swa": self.swa_kv_pool,
         }
         self.layers_mapping = self._build_layers_mapping(num_layers, specs)
+        self._shared_layers = frozenset(layer_id for spec in specs.values() for layer_id, _ in spec.shared_layers)
         if self._swa_paged:
             self._init_swa_paged_state()
 
@@ -141,6 +142,11 @@ class HybridSWAKVCache(BaseKVCachePool):
                 if mapping[layer_id] is not None:
                     raise ValueError(f"KV layer id {layer_id} appears in more than one group")
                 mapping[layer_id] = _LayerRef(group=group_name, index=local_index)
+        for group_name in ("full", "swa"):
+            for layer_id, source in specs[group_name].shared_layers:
+                if source not in specs[group_name].layer_ids or mapping[layer_id] is not None:
+                    raise ValueError(f"KV-shared layer {layer_id} cannot read layer {source}'s {group_name} slab")
+                mapping[layer_id] = mapping[source]
 
         missing = [layer_id for layer_id, ref in enumerate(mapping) if ref is None]
         if missing:
@@ -266,6 +272,8 @@ class HybridSWAKVCache(BaseKVCachePool):
         out_loc: torch.Tensor,
         layer_id: int,
     ) -> None:
+        if layer_id in self._shared_layers:
+            return  # its source layer stored these rows earlier in the same forward
         ref = self.layers_mapping[layer_id]
         storage = self._storages[ref.group]
         indices = out_loc
@@ -520,9 +528,9 @@ def _swa_per_req_swa_floor(config) -> int:
 
       - the trailing window the prefill-boundary commit locks -- window + retain gap, page-rounded
         (_cache_req_swa splits the committed node there so inc_lock pins that and no more);
-      - its own decode tail up to the first out-of-window free: the driver runs only every
-        _SWA_EVICTION_INTERVAL forwards and floors its frees at the committed length, so the
-        request grows window + 2 pages + one interval before it can reclaim anything.
+      - its own decode tail: window + 2 pages + interval * decode_rows_per_req +
+        decode_rows_per_req, the most that slides out between two frees plus one verify step's
+        rows;
 
     Neither is reachable by evict_swa, so the pool must hold both for every running request."""
     from freetoken.scheduler.cache import _SWA_EVICTION_INTERVAL, _SWA_RETAIN_GAP
@@ -530,9 +538,10 @@ def _swa_per_req_swa_floor(config) -> int:
     window = next(g.sliding_window for g in config.model_config.kv_cache_group_specs() if g.is_swa)
     ps = config.page_size
     locked = ((window + _SWA_RETAIN_GAP + ps - 1) // ps) * ps
-    floor = locked + window + _SWA_EVICTION_INTERVAL + 2 * ps
+    rows = getattr(config, "decode_rows_per_req", 1)
+    floor = locked + window + _SWA_EVICTION_INTERVAL * rows + rows + 2 * ps
     if getattr(config, "special_token_ckpt", False):
-        floor += window + _SWA_RETAIN_GAP + _SWA_EVICTION_INTERVAL
+        floor += window + _SWA_RETAIN_GAP + _SWA_EVICTION_INTERVAL * rows
     return floor
 
 

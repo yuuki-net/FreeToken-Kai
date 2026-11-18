@@ -157,6 +157,15 @@ unset on PCIe GPUs: wider grids add no bandwidth there.
   `deepseek4v` mmproj; the text-only 0731 release has no image token and refuses the
   mmproj. ggml-org's Vision-Exp text GGUF ships a chat template that renders no image
   placeholder; serve unsloth's release for image requests.
+- A DeepSeek-V4.1 GGUF (llama.cpp's `deepseek41` layout, such as
+  [unsloth/DeepSeek-V4.1-Flash-1017-GGUF](https://huggingface.co/unsloth/DeepSeek-V4.1-Flash-1017-GGUF))
+  serves text; its `deepseek41v` mmproj and DSpark draft are not read. The Engram tables
+  stream from the file's `per_layer_token_embd` tensor, so keep that file on a fast NVMe.
+  A build that ships the tables as a separate shard needs it linked next to the others under
+  its shard name, as llama.cpp does. A file converted for an earlier llama.cpp branch has
+  no `ple.layers` key and is refused, and so are unsloth's UD-Q3_K_XL, UD-Q4_K_XL and UD-Q8_K_XL,
+  whose MXFP8 tables only unsloth's llama.cpp PR reads. `ft checkpoint` does not convert these
+  GGUFs: serve the `.gguf`.
 - DeepSeek-V4.1-Flash serves text and images from the HF checkpoint as shipped (fp8 block-32
   dense weights, fp4 experts on the offload cache, 890 B/token global KV in packed
   fp4/fp8 pools). Its two 98 GiB Engram tables stream from the checkpoint shards on
@@ -188,3 +197,4 @@ unset on PCIe GPUs: wider grids add no bandwidth there.
   "reasoning_effort": 37}`, and the checkpoint's encoder validates it. Runtime window-cache
   controls use 128-token pages.
 - Qwen3.8-Flash-Next keeps a 47.7 GiB PLE n-gram table pinned in host RAM.
+- Gemma-4 serves MTP speculative decoding from an assistant sidecar: unsloth's GGUF repos ship `mtp-*.gguf` files for it; upstream's `google/gemma-4-*-it-assistant` HF release must first go through llama.cpp's `convert_hf_to_gguf.py`, then pass the resulting GGUF with `--spec-draft-model`, see [CLI reference](cli.md#speculative-decoding).

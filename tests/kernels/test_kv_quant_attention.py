@@ -389,3 +389,59 @@ def test_the_paged_fallback_with_sinks_and_window_reads_back_what_the_slab_holds
     )
     assert torch.isfinite(got).all()
     torch.testing.assert_close(got, want, atol=2e-3, rtol=2e-3)
+
+
+@pytest.mark.parametrize("spec", [Q8_0, Q4_0], ids=lambda s: s.name)
+@pytest.mark.parametrize(
+    ("num_q_heads", "num_kv_heads", "head_dim", "cached_lens", "q_lens", "window", "use_sinks"),
+    [
+        (16, 2, 128, [0, 129, 1017], [4, 1, 8], None, False),
+        (16, 2, 256, [300, 2000, 70], [4, 8, 2], 3, True),
+        (24, 4, 256, [500, 33], [5, 2], 48, False),
+        (8, 1, 512, [700, 64], [8, 8], None, True),
+    ],
+)
+def test_multi_row_decode_reads_back_what_the_slab_holds(
+    spec, num_q_heads, num_kv_heads, head_dim, cached_lens, q_lens, window, use_sinks
+):
+    """Up to 8 query rows per request take the decode kernel (a short extend: a verify window,
+    a few-token prefill tail), so its q8_0 / q4_0 arm sees a rows x heads M axis: rows that see
+    no key of a split, a window shorter than the rows, a non-power-of-two group, head_dim 512."""
+    from freetoken.kernel.triton.attention import decode_paged_attention
+
+    torch.manual_seed(11)
+    dev = torch.device("cuda")
+    dtype = torch.bfloat16
+    kv_lens = [c + r for c, r in zip(cached_lens, q_lens)]
+    total_kv, num_rows = sum(kv_lens), sum(q_lens)
+    q = torch.randn(num_rows, num_q_heads, head_dim, device=dev, dtype=dtype)
+    k = torch.randn(total_kv, num_kv_heads, head_dim, device=dev, dtype=dtype)
+    v = torch.randn(total_kv, num_kv_heads, head_dim, device=dev, dtype=dtype)
+    kc, ks = quantize_rows(k.float(), spec)
+    vc, vs = quantize_rows(v.float(), spec)
+    k_oracle = dequantize_rows(kc.cpu(), ks.cpu(), spec, dtype).to(dev)
+    v_oracle = dequantize_rows(vc.cpu(), vs.cpu(), spec, dtype).to(dev)
+    kc, ks, vc, vs = kc.to(dev), ks.to(dev), vc.to(dev), vs.to(dev)
+
+    indptr = torch.tensor([0, *kv_lens], device=dev).cumsum(0).to(torch.int32)
+    qo_indptr = torch.tensor([0, *q_lens], device=dev).cumsum(0).to(torch.int32)
+    indices = torch.arange(total_kv, dtype=torch.int32, device=dev)
+    q_positions = torch.cat([torch.arange(c, c + r, device=dev) for c, r in zip(cached_lens, q_lens)])
+    sinks = torch.randn(num_q_heads, dtype=torch.float32, device=dev) if use_sinks else None
+
+    def run(k_cache, v_cache, **quant):
+        splits = 64
+        attn_logits = torch.empty(num_rows, num_q_heads, splits, head_dim, dtype=torch.float32, device=dev)
+        attn_lse = torch.empty(num_rows, num_q_heads, splits, dtype=torch.float32, device=dev)
+        return decode_paged_attention(
+            q, k_cache, v_cache, indptr, indices, q_positions, attn_logits, attn_lse, head_dim**-0.5,
+            sliding_window=window, sinks=sinks, qo_indptr=qo_indptr, max_q_len=max(q_lens), **quant,
+        )
+
+    want = run(k_oracle, v_oracle)
+    got = run(kc, vc, k_scales=ks, v_scales=vs, kv_quant=spec)
+
+    assert torch.isfinite(got).all()
+    torch.testing.assert_close(got.float(), want.float(), atol=2e-2, rtol=2e-2)
+    cos = torch.nn.functional.cosine_similarity(got.float().flatten(), want.float().flatten(), dim=0)
+    assert cos > 0.9999, f"cosine {cos:.6f}"
